@@ -1,0 +1,14 @@
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data: ignore all .rds EXCEPT the small bundled demo object
+*.rds
+!inst/app/example_data/seurat_example.rds

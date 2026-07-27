@@ -1,0 +1,24 @@
+Package: scexplorer
+Title: Interactive Explorer for Seurat Objects
+Version: 0.1.0
+Authors@R:
+    person("Klaudia", "Zieba", email = "ziebaklaudia4@gmail.com", role = c("aut", "cre"))
+Description: A Shiny application for interactively exploring any Seurat object:
+    UMAP embeddings coloured by metadata, per-gene expression plots, and
+    (when present) cluster-marker and contrast tables stored in the object's
+    misc slot. Works with plain Seurat objects and with objects produced by
+    the scdrake pipeline.
+License: MIT
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1
+Imports:
+    shiny,
+    Seurat,
+    ggplot2,
+    DT,
+    shinycssloaders,
+    patchwork,
+    plotly,
+    scales,
+    Matrix
