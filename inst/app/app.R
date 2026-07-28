@@ -12,9 +12,9 @@
 #
 # WHAT THE OBJECT NEEDS
 #   * A reduction named "umap"  (accessed via Embeddings(obj, "umap")).
-#   * meta.data columns to colour by. By default only columns matching
-#     ^batch$, ^phase$ or *_labels_pruned are offered (see `useful_patterns`
-#     in output$app_body -- edit it to expose more/other columns).
+#   * meta.data columns to colour by. Every categorical column (factor /
+#     character / logical) plus low-cardinality numerics (e.g. cluster numbers)
+#     is offered; see `grouping_cols` in output$app_body to change the rule.
 #   * Optional obj@misc$cluster_markers / obj@misc$contrasts data frames
 #     (scdrake format) enable the last two tabs; they auto-hide when absent.
 #   * Optional rowData SYMBOL/ENSEMBL columns give nicer gene labels.
@@ -35,10 +35,8 @@
 # ---- Packages ----
 library(shiny)             # web-app framework
 library(Seurat)            # single-cell object (Embeddings, FetchData, ...)
-library(ggplot2)           # gene-expression plots (converted to plotly)
 library(DT)                # interactive marker / contrast tables
 library(shinycssloaders)   # the "Rendering plot..." loading spinners
-library(patchwork)         # (kept for compatibility; combines ggplots)
 library(plotly)            # interactive UMAPs + colorbars
 
 # Raise the upload size limit (default is 5MB; Seurat objects are much bigger)
@@ -74,6 +72,14 @@ get_example_seu <- function() {
   obj <- readRDS(example_path)
   assign(".seurat_example_obj", obj, envir = globalenv())
   obj
+}
+
+# Turn a meta.data column name into a friendly label for the UI: underscores ->
+# spaces, first letter capitalised (e.g. "immgen_labels_pruned" -> "Immgen labels
+# pruned"). Only the DISPLAY changes -- the selected value stays the real name.
+pretty_label <- function(x) {
+  x <- gsub("_", " ", x)
+  sub("^(\\w)", "\\U\\1", x, perl = TRUE)
 }
 
 ui <- fluidPage(
@@ -251,8 +257,8 @@ server <- function(input, output, session) {
       # Fall back to the gene's rowname whenever SYMBOL/ENSEMBL is missing (NA),
       # so a label never reads "NA (NA)".
       label <- ifelse(!is.na(sym) & !is.na(ens), paste0(sym, " (", ens, ")"),
-                ifelse(!is.na(sym), sym,
-                 ifelse(!is.na(ens), ens, genes)))
+                      ifelse(!is.na(sym), sym,
+                             ifelse(!is.na(ens), ens, genes)))
       data.frame(value = genes, label = label, stringsAsFactors = FALSE)
     } else {
       data.frame(value = genes, label = genes, stringsAsFactors = FALSE)
@@ -299,15 +305,21 @@ server <- function(input, output, session) {
   # (Server-side selectize so it stays fast even with tens of thousands of genes.)
   observeEvent(list(seu(), input$gene_sort), {
     req(seu(), input$gene_sort)
-    avg_expr <- gene_avg_expr()
     lookup <- gene_lookup()
-    ascending_order <- order(avg_expr, names(avg_expr), na.last = TRUE, method = "radix")
-    genes_low_to_high <- names(avg_expr)[ascending_order]
-
-    ordered_values <- switch(input$gene_sort,
-                             "Alphabetical" = sort(lookup$value),
-                             "Highest average expression" = rev(genes_low_to_high),
-                             "Lowest average expression" = genes_low_to_high)
+    if (identical(input$gene_sort, "Alphabetical")) {
+      # Fast path: sorting A-Z needs no expression computation, so the list is
+      # ready almost instantly (avoids the slow rowMeans over all cells).
+      ordered_values <- sort(lookup$value)
+    } else {
+      avg_expr <- gene_avg_expr()   # only computed when sorting by expression
+      ascending_order <- order(avg_expr, names(avg_expr), na.last = TRUE, method = "radix")
+      genes_low_to_high <- names(avg_expr)[ascending_order]
+      ordered_values <- if (identical(input$gene_sort, "Highest average expression")) {
+        rev(genes_low_to_high)
+      } else {
+        genes_low_to_high
+      }
+    }
     lookup_ordered <- lookup[match(ordered_values, lookup$value), ]
     choices <- setNames(lookup_ordered$value, lookup_ordered$label)
     updateSelectizeInput(session, "genes", choices = choices, server = TRUE)
@@ -325,11 +337,22 @@ server <- function(input, output, session) {
     if (input$data_source == "upload" && is.null(input$seurat_file)) return(NULL)
     req(seu())
     all_cols <- colnames(seu()@meta.data)
-    # TWEAK: which meta.data columns appear in "Color UMAP by". Add patterns
-    # here (regex) to expose more columns, e.g. "^seurat_clusters$", "^sample$",
-    # "cell_type". Use c(".") to offer every column.
-    useful_patterns <- c("^batch$", "^phase$", "_labels_pruned$")
-    grouping_cols <- all_cols[Reduce(`|`, lapply(useful_patterns, grepl, x = all_cols))]
+    # Which meta.data columns appear in "Color UMAP by": every column that makes
+    # sense to colour by categorically -- factor / character / logical columns,
+    # plus low-cardinality numerics (e.g. cluster numbers). Continuous numerics
+    # with many distinct values (nCount, nFeature, doublet_score, percent.mt, ...)
+    # are excluded, because the UMAP assigns one colour per value and those would
+    # produce thousands of categories.
+    # TWEAK: to offer literally EVERY column instead, use `grouping_cols <- all_cols`.
+    # To raise/lower what counts as "categorical", change the 50 below.
+    grouping_cols <- all_cols[vapply(seu()@meta.data, function(x) {
+      is.factor(x) || is.character(x) || is.logical(x) ||
+        (is.numeric(x) && length(unique(x[!is.na(x)])) <= 50)
+    }, logical(1))]
+    # Friendly, A-Z-sorted labels for the dropdown. Named vector: names are shown,
+    # values (the real column names) are what input$group_var returns.
+    grouping_choices <- setNames(grouping_cols, pretty_label(grouping_cols))
+    grouping_choices <- grouping_choices[order(names(grouping_choices))]
     has_markers <- !is.null(seu()@misc$cluster_markers)
     has_contrasts <- !is.null(seu()@misc$contrasts)
 
@@ -338,7 +361,7 @@ server <- function(input, output, session) {
         "Clusters / Metadata",
         sidebarLayout(
           sidebarPanel(
-            selectInput("group_var", "Color UMAP by:", choices = grouping_cols),
+            selectInput("group_var", "Color UMAP by:", choices = grouping_choices),
             uiOutput("category_filter_ui")
           ),
           mainPanel(
@@ -417,36 +440,6 @@ server <- function(input, output, session) {
     checkboxGroupInput("categories_shown", "Show categories:", choices = vals, selected = vals)
   })
 
-  # Helper: clean up a plotly object's axes -- remove tick marks/lines, force a
-  # square 1:1 data region (scaleanchor), optionally pin a fixed axis range, and
-  # pin the square to the top-left. Applied to the Gene Expression plots so they
-  # look and are framed exactly like the Clusters/Metadata UMAP.
-  strip_plotly_axis_chrome <- function(p, axis_range = NULL) {
-    axis_names <- grep("^[xy]axis[0-9]*$", names(p$x$layout), value = TRUE)
-    axis_style <- list(showline = FALSE, ticks = "", zeroline = FALSE, showgrid = TRUE,
-                       minor = list(showgrid = FALSE), constrain = "domain")
-    if (!is.null(axis_range)) axis_style$range <- axis_range
-    layout_args <- setNames(rep(list(axis_style), length(axis_names)), axis_names)
-
-    # Pin the (constrained) square data region to the top-left, matching the
-    # Clusters/Metadata plot so both tabs start in the same place.
-    x_axes <- grep("^xaxis[0-9]*$", axis_names, value = TRUE)
-    for (x_name in x_axes) layout_args[[x_name]]$constraintoward <- "left"
-
-    # Force Plotly to render perfect squares
-    y_axes <- grep("^yaxis[0-9]*$", axis_names, value = TRUE)
-    for (y_name in y_axes) {
-      suffix <- sub("^yaxis", "", y_name)
-      x_id <- paste0("x", suffix)
-      layout_args[[y_name]]$scaleanchor <- x_id
-      layout_args[[y_name]]$scaleratio <- 1
-      layout_args[[y_name]]$constraintoward <- "top"
-    }
-
-    layout_args$margin <- list(l = 50, r = 10, t = 30, b = 30)
-    do.call(plotly::layout, c(list(p), layout_args))
-  }
-
   # ---------------------------------------------------------------------------
   # Clusters / Metadata UMAP (one plotly scatter coloured by a metadata column)
   # ---------------------------------------------------------------------------
@@ -524,14 +517,14 @@ server <- function(input, output, session) {
 
     p <- plotly::layout(
       p,
-      title = list(text = paste("UMAP colored by", input$group_var), x = 0, xanchor = "left",
+      title = list(text = paste("UMAP colored by", pretty_label(input$group_var)), x = 0, xanchor = "left",
                    font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
       xaxis = list(title = "UMAP_1", zeroline = FALSE, range = umap_range(),
                    constrain = "domain", constraintoward = "left"),
       yaxis = list(title = "UMAP_2", zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
                    constrain = "domain", constraintoward = "top", range = umap_range()),
       showlegend = TRUE,
-      legend = list(title = list(text = input$group_var), itemsizing = "constant",
+      legend = list(title = list(text = pretty_label(input$group_var)), itemsizing = "constant",
                     y = 0.5, yanchor = "middle"),
       margin = list(l = 50, r = 10, t = 40, b = 40)
     )
@@ -683,35 +676,45 @@ server <- function(input, output, session) {
         if (!is.finite(upper) || upper <= 0) upper <- 1  # guard: all-zero expression
       }
 
-      plot_df$tooltip <- paste0("Gene: ", g, "<br>Expression: ", round(plot_df$expression, 3))
-      set.seed(1)
+      # Draw low-expression points first so high-expression ones sit on top.
       plot_df <- plot_df[order(plot_df$expression), ]
+      plot_df$tooltip <- paste0("Gene: ", g, "<br>Expression: ", round(plot_df$expression, 3))
 
-      p <- ggplot(plot_df, aes(x = UMAP_1, y = UMAP_2, color = expression, text = tooltip)) +
-        geom_point(size = 0.6) +   # TWEAK: gene-expression point size
-        # TWEAK: expression colour gradient (low = no expression -> high = max).
-        scale_color_gradient(low = "grey85", high = "#1E8B0D", name = "Expression",
-                             limits = c(0, upper), oob = scales::squish) +
-        labs(x = "UMAP_1", y = "UMAP_2") +
-        coord_fixed() +
-        theme_minimal()
+      # Per-gene mode shows each plot's own colorbar; shared mode uses the single
+      # shared colorbar to the right of the grid, so hide the per-plot one.
+      show_bar <- input$scale_mode != "shared"
 
-      # In shared mode the colour scale is shown once, to the right of the grid.
-      if (input$scale_mode == "shared") {
-        p <- p + theme(legend.position = "none")
-      }
+      # Native plot_ly (scattergl) instead of ggplot + ggplotly -- much faster.
+      # cmin/cmax = 0..upper reproduces the old scale_color_gradient(limits =,
+      # oob = squish): values above `upper` clamp to the max colour.
+      p <- plot_ly(
+        plot_df, x = ~UMAP_1, y = ~UMAP_2,
+        type = "scattergl", mode = "markers",
+        marker = list(
+          size = 4,                                              # TWEAK: gene-expression point size
+          color = ~expression,
+          colorscale = list(c(0, "#D9D9D9"), c(1, "#1E8B0D")),   # TWEAK: grey85 -> green gradient
+          cmin = 0, cmax = upper,
+          showscale = show_bar,
+          colorbar = list(title = list(text = "Expression"), thickness = 15, outlinewidth = 0)
+        ),
+        text = ~tooltip, hoverinfo = "text"
+      )
 
-      ply <- plotly::ggplotly(p, tooltip = "text")
-      ply <- strip_plotly_axis_chrome(ply, axis_range = umap_range())
-      # Title set natively in plotly (not via ggplot) so it matches the
-      # Clusters/Metadata plot exactly: same font family, left-aligned, size 15.
-      ply <- plotly::layout(
-        ply,
+      # Same framing as the Clusters/Metadata UMAP: fixed square window, no tick
+      # chrome, left-aligned title (matching font/size).
+      p <- plotly::layout(
+        p,
         title = list(text = g, x = 0, xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
+        xaxis = list(title = "UMAP_1", zeroline = FALSE, showline = FALSE, ticks = "",
+                     range = umap_range(), constrain = "domain", constraintoward = "left"),
+        yaxis = list(title = "UMAP_2", zeroline = FALSE, showline = FALSE, ticks = "",
+                     scaleanchor = "x", scaleratio = 1, constrain = "domain",
+                     constraintoward = "top", range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 30)
       )
-      plotly::config(ply, displayModeBar = FALSE)
+      plotly::config(p, displayModeBar = FALSE)
     })
   })
 
