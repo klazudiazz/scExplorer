@@ -92,6 +92,34 @@ ui <- fluidPage(
       /* Force hide Plotly's modebar (the gray line with options) */
       .plotly .modebar { display: none !important; }
 
+      /* Restyle DataTables' own 'processing' indicator (the default blue pulsing
+         dots) to match the app's green spinner. It shows while a large table
+         draws on the client -- after the server render that the shinycssloaders
+         spinner covers -- so this is the loading icon users actually see. */
+      @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+      .dataTables_processing, div.dt-processing {
+        color: #333 !important;
+        font-size: 14px !important;
+        border: none !important;
+        box-shadow: none !important;
+        background: rgba(255, 255, 255, 0.9) !important;
+        /* Sit below the header row (in the body area) instead of centred over
+           the still-empty table, so it doesn't overlap the column names. */
+        top: 130px !important;
+        bottom: auto !important;
+        margin-top: 0 !important;
+      }
+      /* hide DataTables' default animated bars/dots */
+      .dataTables_processing > div, div.dt-processing > div { display: none !important; }
+      /* green spinner in front of the text, matching the other loaders */
+      .dataTables_processing::before, div.dt-processing::before {
+        content: '';
+        display: inline-block; width: 22px; height: 22px;
+        margin-right: 10px; vertical-align: middle;
+        border: 3px solid #eee; border-top: 3px solid #39FF14; border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
       .selectize-control { min-width: 220px; }
       .selectize-dropdown { min-width: 220px; }
       @media (max-width: 768px) {
@@ -301,28 +329,39 @@ server <- function(input, output, session) {
     c(r[1] - pad, r[2] + pad)
   })
 
-  # Keep the gene dropdown's contents in sync with the chosen sort order.
-  # (Server-side selectize so it stays fast even with tens of thousands of genes.)
-  observeEvent(list(seu(), input$gene_sort), {
-    req(seu(), input$gene_sort)
+  # ordered_gene_choices(): the gene dropdown's choices in a given sort order --
+  # "Alphabetical" (fast; no expression computation) or by average expression
+  # (uses gene_avg_expr(), the slow rowMeans, only when actually requested).
+  # Returns a named vector: names = display labels, values = gene rownames.
+  ordered_gene_choices <- function(sort_mode) {
     lookup <- gene_lookup()
-    if (identical(input$gene_sort, "Alphabetical")) {
-      # Fast path: sorting A-Z needs no expression computation, so the list is
-      # ready almost instantly (avoids the slow rowMeans over all cells).
+    if (identical(sort_mode, "Alphabetical")) {
       ordered_values <- sort(lookup$value)
     } else {
       avg_expr <- gene_avg_expr()   # only computed when sorting by expression
       ascending_order <- order(avg_expr, names(avg_expr), na.last = TRUE, method = "radix")
       genes_low_to_high <- names(avg_expr)[ascending_order]
-      ordered_values <- if (identical(input$gene_sort, "Highest average expression")) {
+      ordered_values <- if (identical(sort_mode, "Highest average expression")) {
         rev(genes_low_to_high)
       } else {
         genes_low_to_high
       }
     }
     lookup_ordered <- lookup[match(ordered_values, lookup$value), ]
-    choices <- setNames(lookup_ordered$value, lookup_ordered$label)
-    updateSelectizeInput(session, "genes", choices = choices, server = TRUE)
+    setNames(lookup_ordered$value, lookup_ordered$label)
+  }
+
+  # Keep each tab's gene dropdown in sync with its own sort selector. (Server-side
+  # selectize so it stays fast even with tens of thousands of genes.)
+  observeEvent(list(seu(), input$gene_sort), {
+    req(seu(), input$gene_sort)
+    updateSelectizeInput(session, "genes",
+                         choices = ordered_gene_choices(input$gene_sort), server = TRUE)
+  })
+  observeEvent(list(seu(), input$agg_gene_sort), {
+    req(seu(), input$agg_gene_sort)
+    updateSelectizeInput(session, "agg_genes",
+                         choices = ordered_gene_choices(input$agg_gene_sort), server = TRUE)
   })
 
   # app_body(): builds the whole tabbed UI once data is loaded. The last two
@@ -356,6 +395,16 @@ server <- function(input, output, session) {
     has_markers <- !is.null(seu()@misc$cluster_markers)
     has_contrasts <- !is.null(seu()@misc$contrasts)
 
+    # DE tests offered by the generic (scdrake-free) Markers/Contrasts tabs.
+    # All built into Seurat and fast enough to auto-compute. (poisson uses raw
+    # counts; roc reports an AUC "power" instead of a p-value.)
+    # NOTE: the slow per-gene tests (negbinom, MAST, DESeq2) were removed for now
+    # -- they take minutes and these tabs auto-compute. Re-add here if wanted
+    # (the counts-slot logic below already handles negbinom/DESeq2).
+    de_test_choices <- c("Wilcoxon" = "wilcox", "Student's t" = "t", "ROC / AUC" = "roc",
+                         "Logistic regression" = "LR", "Likelihood ratio (bimod)" = "bimod",
+                         "Poisson (counts)" = "poisson")
+
     tabs <- list(
       tabPanel(
         "Clusters / Metadata",
@@ -374,58 +423,121 @@ server <- function(input, output, session) {
       ),
       tabPanel(
         "Gene Expression",
-        sidebarLayout(
-          sidebarPanel(
-            selectInput("gene_sort", "Sort genes by:",
-                        choices = c("Alphabetical", "Highest average expression", "Lowest average expression")),
-            selectizeInput("genes", "Gene(s):", choices = NULL, multiple = TRUE,
-                           options = list(placeholder = "Type one or more gene symbols...")),
+        wellPanel(
+          fluidRow(
+            column(3, selectInput("gene_sort", "Sort genes by:", width = "100%",
+                                  choices = c("Alphabetical", "Highest average expression", "Lowest average expression"))),
+            column(3, selectizeInput("genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
+                                     options = list(placeholder = "Type one or more gene symbols..."))),
             # TWEAK: default / allowed plots-per-row for the Gene Expression grid.
-            numericInput("feature_ncol", "Plots per row:", value = 2, min = 1, max = 4),
-            radioButtons("scale_mode", "Color scale:",
-                         choices = c("Same scale for all genes (comparable)" = "shared",
-                                     "Scale adjusted per gene (all clearly visible)" = "per_gene"),
-                         selected = "shared")
-          ),
-          mainPanel(
-            div(style = "width: 100%; display: flex; justify-content: flex-start;",
-                uiOutput("dynamic_feature_plots")
-            )
+            column(2, numericInput("feature_ncol", "Plots per row:", value = 2, min = 1, max = 4, width = "100%")),
+            column(4, radioButtons("scale_mode", "Color scale:",
+                                   choices = c("Same scale for all genes (comparable)" = "shared",
+                                               "Scale adjusted per gene (all clearly visible)" = "per_gene"),
+                                   selected = "shared"))
           )
-        )
+        ),
+        div(style = "width: 100%; display: flex; justify-content: center;",
+            uiOutput("dynamic_feature_plots"))
       )
     )
 
+    # Cluster Markers tab. If the object carries scdrake's precomputed
+    # @misc$cluster_markers we show those (instant). Otherwise we compute markers
+    # on demand from any Seurat object (FindMarkers, behind a Run button).
     if (has_markers) {
       tabs <- c(tabs, list(tabPanel(
         "Cluster Markers",
-        sidebarLayout(
-          sidebarPanel(
-            selectInput("marker_resolution", "Clustering resolution:", choices = unique(seu()@misc$cluster_markers$source_column)),
-            selectInput("marker_test", "Test type:", choices = unique(seu()@misc$cluster_markers$test_type)),
-            uiOutput("marker_cluster_ui"),
-            selectInput("marker_search_field", "Search in:", choices = c("All columns", "ENSEMBL", "ENTREZID", "SYMBOL", "GENENAME")),
-            textInput("marker_search_text", "Search:", placeholder = "Type to search...")
+        wellPanel(
+          fluidRow(
+            column(3, selectInput("marker_resolution", "Clustering resolution:", width = "100%",
+                                  choices = unique(seu()@misc$cluster_markers$source_column))),
+            column(2, selectInput("marker_test", "Test type:", width = "100%",
+                                  choices = unique(seu()@misc$cluster_markers$test_type))),
+            column(2, uiOutput("marker_cluster_ui")),
+            column(3, selectInput("marker_search_field", "Search in:", width = "100%",
+                                  choices = c("All columns", "ENSEMBL", "ENTREZID", "SYMBOL", "GENENAME"))),
+            column(2, textInput("marker_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
+          )
+        ),
+        withSpinner(DTOutput("marker_table"), caption = "Loading table...", color = "#39FF14")
+      )))
+    } else {
+      tabs <- c(tabs, list(tabPanel(
+        "Cluster Markers",
+        wellPanel(
+          fluidRow(
+            column(3, selectInput("gmarker_group", "Grouping column:", choices = grouping_choices, width = "100%")),
+            column(3, uiOutput("gmarker_cluster_ui")),
+            column(3, selectInput("gmarker_test", "Test type:", choices = de_test_choices, width = "100%")),
+            column(3, textInput("gmarker_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
           ),
-          mainPanel(withSpinner(DTOutput("marker_table"), caption = "Loading table...", color = "#39FF14"))
-        )
+          helpText("Markers of the chosen group vs all other cells. Computed automatically.")
+        ),
+        withSpinner(DTOutput("gmarker_table"), caption = "Computing markers...", color = "#39FF14")
       )))
     }
 
+    # Contrasts tab. Precomputed scdrake @misc$contrasts if present, otherwise
+    # differential expression between two chosen groups computed on demand.
     if (has_contrasts) {
       tabs <- c(tabs, list(tabPanel(
         "Contrasts",
-        sidebarLayout(
-          sidebarPanel(
-            selectInput("contrast_choice", "Contrast:", choices = unique(paste0(seu()@misc$contrasts$target, " vs ", seu()@misc$contrasts$reference))),
-            selectInput("contrast_test", "Test type:", choices = unique(seu()@misc$contrasts$test_type)),
-            selectInput("contrast_search_field", "Search in:", choices = c("All columns", "ENSEMBL", "ENTREZID", "SYMBOL", "GENENAME")),
-            textInput("contrast_search_text", "Search:", placeholder = "Type to search...")
+        wellPanel(
+          fluidRow(
+            column(4, selectInput("contrast_choice", "Contrast:", width = "100%",
+                                  choices = unique(paste0(seu()@misc$contrasts$target, " vs ", seu()@misc$contrasts$reference)))),
+            column(2, selectInput("contrast_test", "Test type:", width = "100%",
+                                  choices = unique(seu()@misc$contrasts$test_type))),
+            column(3, selectInput("contrast_search_field", "Search in:", width = "100%",
+                                  choices = c("All columns", "ENSEMBL", "ENTREZID", "SYMBOL", "GENENAME"))),
+            column(3, textInput("contrast_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
+          )
+        ),
+        withSpinner(DTOutput("contrast_table"), caption = "Loading table...", color = "#39FF14")
+      )))
+    } else {
+      tabs <- c(tabs, list(tabPanel(
+        "Contrasts",
+        wellPanel(
+          fluidRow(
+            column(3, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
+            column(2, uiOutput("gcontrast_target_ui")),
+            column(2, uiOutput("gcontrast_reference_ui")),
+            column(2, selectInput("gcontrast_test", "Test type:", choices = de_test_choices, width = "100%")),
+            column(3, textInput("gcontrast_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
           ),
-          mainPanel(withSpinner(DTOutput("contrast_table"), caption = "Loading table...", color = "#39FF14"))
-        )
+          helpText("Differential expression, target vs reference group. Computed automatically.")
+        ),
+        withSpinner(DTOutput("gcontrast_table"), caption = "Computing contrast...", color = "#39FF14")
       )))
     }
+
+    # Aggregated Expression (pseudobulk): summarise the selected genes' expression
+    # per level of a chosen metadata column (condition). Always available -- it
+    # only needs meta.data + an expression layer, so it works on any object.
+    # Controls sit in a compact row across the top so the heatmap + table below
+    # get the FULL page width (and a taller plot), rather than a narrow sidebar.
+    tabs <- c(tabs, list(tabPanel(
+      "Aggregated Expression",
+      wellPanel(
+        fluidRow(
+          column(3, selectInput("agg_group_var", "Aggregate by:",
+                                choices = grouping_choices, width = "100%")),
+          column(3, selectInput("agg_gene_sort", "Sort genes by:", width = "100%",
+                                choices = c("Alphabetical", "Highest average expression", "Lowest average expression"))),
+          column(4, selectizeInput("agg_genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
+                                   options = list(placeholder = "Type one or more gene symbols..."))),
+          column(2, radioButtons("agg_fun", "Summary per group:",
+                                 choices = c("Mean" = "mean", "Sum" = "sum", "Median" = "median"),
+                                 selected = "mean"))
+        )
+      ),
+      withSpinner(plotlyOutput("agg_heatmap", height = "600px"),
+                  caption = "Rendering plot...", color = "#39FF14"),
+      tags$hr(),
+      withSpinner(DTOutput("agg_table"), caption = "Loading table...", color = "#39FF14")
+    )))
 
     do.call(tabsetPanel, tabs)
   })
@@ -566,16 +678,23 @@ server <- function(input, output, session) {
     nrow <- ceiling(n / ncol)
     shared <- identical(input$scale_mode, "shared")
 
-    # TWEAK: these offsets tune how the square plots fill the screen. If plots
-    # feel too small/large or 4 don't fit without scrolling, adjust:
+    # TWEAK: these offsets tune the (fixed) square plot size. If plots feel too
+    # small/large, adjust side_offset (horizontal) or top_offset (the height cap).
+    # (Controls now sit in a row ABOVE the plots, not in a left sidebar, so the
+    # plots use nearly the full page width -- small side_offset.)
+    #
+    # The size is driven by the width available per column and CAPPED to one
+    # viewport height -- it does NOT depend on the number of rows, so each plot
+    # keeps the same size no matter how many genes are added; the extra rows
+    # simply extend the page and it scrolls down.
     gap <- 10
-    side_offset <- 650   # px taken up by the sidebar + gutters, left of the plots
-    top_offset  <- 230   # px taken up by the title, data-source picker and tabs
+    side_offset <- 90    # px taken up by page margins/gutters (no sidebar now)
+    top_offset  <- 380   # px above the plots (title, status, tabs, controls row)
     cb_width    <- if (shared) 150 else 0   # room for the single shared colorbar
 
     w_term <- sprintf("calc((100vw - %dpx) / %d)", side_offset + cb_width + (ncol - 1) * gap, ncol)
-    h_term <- sprintf("calc((100vh - %dpx) / %d)", top_offset + (nrow - 1) * gap, nrow)
-    cell   <- sprintf("min(%s, %s)", w_term, h_term)
+    h_cap  <- sprintf("calc(100vh - %dpx)", top_offset)   # constant cap (independent of nrow)
+    cell   <- sprintf("min(%s, %s)", w_term, h_cap)
 
     plot_list <- lapply(seq_len(n), function(i) {
       withSpinner(
@@ -587,16 +706,24 @@ server <- function(input, output, session) {
     grid_div <- div(
       style = paste0("display: grid; grid-template-columns: repeat(", ncol,
                      ", ", cell, "); grid-template-rows: repeat(", nrow,
-                     ", ", cell, "); gap: ", gap, "px; justify-content: start;",
+                     ", ", cell, "); gap: ", gap, "px; justify-content: center;",
                      " align-content: start;"),
       plot_list)
 
     # In shared mode each plot's own colorbar is hidden; show one to the right.
+    # Its column stretches to the full grid height and a one-cell-tall colorbar
+    # is centred in it, so the scale sits in the vertical middle of ALL the
+    # plots no matter how many genes are added.
     if (shared) {
-      div(style = "display: flex; align-items: stretch; justify-content: flex-start; gap: 15px;",
+      div(style = "display: flex; align-items: stretch; justify-content: center; gap: 15px;",
           grid_div,
-          div(style = paste0("width: ", cb_width, "px; display: flex; align-items: center;"),
-              plotlyOutput("shared_colorbar", width = "100%", height = "70%")))
+          # Column stretches to full grid height; inner box is one cell tall and
+          # centred, so the colorbar sits in the vertical middle of all plots.
+          # (height is set on this div's style, NOT on plotlyOutput, because the
+          # output's height param rejects a min()/calc() expression.)
+          div(style = paste0("width: ", cb_width, "px; display: flex; align-items: center; justify-content: center;"),
+              div(style = paste0("width: 100%; height: ", cell, ";"),
+                  plotlyOutput("shared_colorbar", width = "100%", height = "100%"))))
     } else {
       grid_div
     }
@@ -696,7 +823,7 @@ server <- function(input, output, session) {
           colorscale = list(c(0, "#D9D9D9"), c(1, "#1E8B0D")),   # TWEAK: grey85 -> green gradient
           cmin = 0, cmax = upper,
           showscale = show_bar,
-          colorbar = list(title = list(text = "Expression"), thickness = 15, outlinewidth = 0)
+          colorbar = list(title = list(text = "Expression"), thickness = 15, len = 0.5, outlinewidth = 0)
         ),
         text = ~tooltip, hoverinfo = "text"
       )
@@ -719,6 +846,74 @@ server <- function(input, output, session) {
   })
 
   # ===========================================================================
+  # Aggregated Expression (pseudobulk) tab.
+  # For each selected gene, summarise its expression (from the "data" layer,
+  # same source as the Gene Expression tab) across the cells of each level of
+  # the chosen metadata column -> a genes x groups matrix shown as a heatmap
+  # and a table.
+  # ===========================================================================
+
+  # agg_matrix(): the genes x group-levels matrix of aggregated expression.
+  agg_matrix <- reactive({
+    req(input$agg_group_var)
+    validate(need(length(input$agg_genes) > 0, "Select one or more genes to aggregate."))
+    genes <- input$agg_genes[input$agg_genes %in% rownames(seu())]
+    validate(need(length(genes) > 0, "None of the selected genes are in this object."))
+
+    fun <- switch(input$agg_fun, sum = sum, median = stats::median, mean)
+    expr <- FetchData(seu(), vars = genes)                 # cells x genes (data layer)
+    grp <- as.character(seu()@meta.data[[input$agg_group_var]])
+    grp[is.na(grp)] <- "NA"                                # un-annotated cells -> "NA" group
+    groups <- sort(unique(grp))
+
+    mat <- matrix(NA_real_, nrow = length(genes), ncol = length(groups),
+                  dimnames = list(genes, groups))
+    for (gl in groups) {
+      idx <- grp == gl
+      for (g in genes) mat[g, gl] <- fun(expr[[g]][idx])
+    }
+    mat
+  })
+
+  # Short label for the summary function (colorbar / column headers).
+  agg_fun_label <- reactive({
+    switch(input$agg_fun, sum = "Sum", median = "Median", "Mean")
+  })
+
+  # Heatmap: genes (rows) x group levels (columns), grey85 -> green like the
+  # Gene Expression plots. Colour scale auto-fits the aggregated values.
+  output$agg_heatmap <- renderPlotly({
+    mat <- agg_matrix()
+    plot_ly(
+      x = colnames(mat), y = rownames(mat), z = mat,
+      type = "heatmap",
+      colorscale = list(c(0, "#D9D9D9"), c(1, "#1E8B0D")),   # grey85 -> green
+      colorbar = list(title = list(text = agg_fun_label()), thickness = 15, outlinewidth = 0),
+      hovertemplate = paste0("Gene: %{y}<br>", pretty_label(input$agg_group_var),
+                             ": %{x}<br>", agg_fun_label(), ": %{z:.3f}<extra></extra>")
+    ) %>%
+      plotly::layout(
+        title = list(text = paste(agg_fun_label(), "expression by", pretty_label(input$agg_group_var)),
+                     x = 0, xanchor = "left",
+                     font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
+        xaxis = list(title = pretty_label(input$agg_group_var), tickangle = -45),
+        yaxis = list(title = "Gene", autorange = "reversed"),   # first gene on top
+        margin = list(l = 90, r = 10, t = 40, b = 100)
+      ) %>%
+      plotly::config(displayModeBar = FALSE)
+  })
+
+  # Table: same matrix as a data frame (Gene column + one column per group level).
+  output$agg_table <- renderDT({
+    mat <- agg_matrix()
+    df <- data.frame(Gene = rownames(mat), round(mat, 3),
+                     check.names = FALSE, row.names = NULL)
+    datatable(df, rownames = FALSE,
+              options = list(pageLength = 15, searching = FALSE, scrollX = TRUE,
+                             processing = TRUE, language = list(processing = "Loading table...")))
+  })
+
+  # ===========================================================================
   # Cluster Markers & Contrasts tabs (interactive DT tables).
   # Both read data frames from obj@misc (scdrake format): each row is one
   # cluster/contrast whose `markers` cell holds a per-gene stats table.
@@ -731,7 +926,7 @@ server <- function(input, output, session) {
     df <- df[df$source_column == input$marker_resolution & df$test_type == input$marker_test, ]
     cluster_ids <- unique(df$group_level)
     cluster_ids <- cluster_ids[order(as.numeric(cluster_ids))]
-    selectInput("marker_cluster", "Cluster:", choices = cluster_ids)
+    selectInput("marker_cluster", "Cluster:", choices = cluster_ids, width = "100%")
   })
 
   # Helper: put the identifier / key stat columns first, in a fixed order, then
@@ -775,7 +970,9 @@ server <- function(input, output, session) {
     markers_df <- markers_df[order(markers_df$FDR), ]
     markers_df <- reorder_id_cols(markers_df)
     markers_df <- apply_field_search(markers_df, input$marker_search_field, input$marker_search_text)
-    datatable(markers_df, rownames = FALSE, options = list(pageLength = 15, searching = FALSE))
+    datatable(markers_df, rownames = FALSE,
+              options = list(pageLength = 15, searching = FALSE,
+                             processing = TRUE, language = list(processing = "Loading table...")))
   })
 
   # Contrast table: same idea as the marker table, but the row is chosen by the
@@ -790,7 +987,111 @@ server <- function(input, output, session) {
     contrast_df <- contrast_df[order(contrast_df$FDR), ]
     contrast_df <- reorder_id_cols(contrast_df)
     contrast_df <- apply_field_search(contrast_df, input$contrast_search_field, input$contrast_search_text)
-    datatable(contrast_df, rownames = FALSE, options = list(pageLength = 15, searching = FALSE))
+    datatable(contrast_df, rownames = FALSE,
+              options = list(pageLength = 15, searching = FALSE,
+                             processing = TRUE, language = list(processing = "Loading table...")))
+  })
+
+  # ===========================================================================
+  # Generic (scdrake-free) Cluster Markers & Contrasts.
+  # Used when the object has NO precomputed @misc tables: differential
+  # expression is computed on demand with Seurat::FindMarkers, gated by a Run
+  # button (the computation is heavy) and cached until Run is pressed again.
+  # ===========================================================================
+
+  # Format a FindMarkers() result for display: sort by adjusted p-value, prepend
+  # a gene id column (+ a friendly label when rowData gives one), round numbers.
+  format_generic_de <- function(df) {
+    # Sort by adjusted p-value when available; the ROC test has no p-value, so
+    # fall back to its "power" (higher = better).
+    if ("p_val_adj" %in% names(df)) {
+      df <- df[order(df$p_val_adj), , drop = FALSE]
+    } else if ("power" %in% names(df)) {
+      df <- df[order(df$power, decreasing = TRUE), , drop = FALSE]
+    }
+    feat <- rownames(df)
+    out <- data.frame(gene = feat, stringsAsFactors = FALSE, check.names = FALSE)
+    lbl <- gene_lookup()$label[match(feat, gene_lookup()$value)]
+    if (!all(is.na(lbl)) && !isTRUE(all(lbl == feat))) out$label <- lbl
+    out <- cbind(out, df)
+    num <- vapply(out, is.numeric, logical(1))
+    out[num] <- lapply(out[num], function(x) signif(x, 3))
+    rownames(out) <- NULL
+    out
+  }
+
+  gd_table_opts <- list(pageLength = 15, searching = FALSE, scrollX = TRUE,
+                        processing = TRUE, language = list(processing = "Loading table..."))
+
+  # ---- Generic Cluster Markers: chosen group vs all other cells ----
+  output$gmarker_cluster_ui <- renderUI({
+    req(input$gmarker_group)
+    lvls <- sort(unique(as.character(seu()@meta.data[[input$gmarker_group]])))
+    selectInput("gmarker_cluster", "Group / cluster:", choices = lvls, width = "100%")
+  })
+
+  # Auto-computes whenever the grouping column or group changes (cached until
+  # then, so editing the search box only re-filters -- no recompute).
+  gmarker_res <- reactive({
+    req(seu(), input$gmarker_group, input$gmarker_cluster, input$gmarker_test)
+    # negbinom/poisson/DESeq2 are count-based; the rest use the "data" layer.
+    slot <- if (input$gmarker_test %in% c("negbinom", "poisson", "DESeq2")) "counts" else "data"
+    tryCatch(
+      # suppressWarnings: some tests (e.g. negbinom) emit one benign per-gene
+      # convergence warning each -- hundreds of lines. Errors are still caught.
+      suppressWarnings(
+        Seurat::FindMarkers(seu(), ident.1 = input$gmarker_cluster, group.by = input$gmarker_group,
+                            test.use = input$gmarker_test, slot = slot)
+      ),
+      error = function(e) e
+    )
+  })
+
+  output$gmarker_table <- renderDT({
+    res <- gmarker_res()
+    if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute markers:", conditionMessage(res))))
+    out <- format_generic_de(res)
+    out <- apply_field_search(out, "All columns", input$gmarker_search_text)
+    datatable(out, rownames = FALSE, options = gd_table_opts)
+  })
+
+  # ---- Generic Contrasts: target group vs reference group ----
+  output$gcontrast_target_ui <- renderUI({
+    req(input$gcontrast_group)
+    lvls <- sort(unique(as.character(seu()@meta.data[[input$gcontrast_group]])))
+    selectInput("gcontrast_target", "Target (A):", choices = lvls, width = "100%")
+  })
+  output$gcontrast_reference_ui <- renderUI({
+    req(input$gcontrast_group)
+    lvls <- sort(unique(as.character(seu()@meta.data[[input$gcontrast_group]])))
+    selectInput("gcontrast_reference", "Reference (B):", choices = lvls,
+                selected = if (length(lvls) > 1) lvls[2] else lvls[1], width = "100%")
+  })
+
+  # Auto-computes whenever the groups or test change (cached until then, so the
+  # search box only re-filters -- no recompute).
+  gcontrast_res <- reactive({
+    req(seu(), input$gcontrast_group, input$gcontrast_target, input$gcontrast_reference, input$gcontrast_test)
+    validate(need(input$gcontrast_target != input$gcontrast_reference, "Pick two different groups."))
+    slot <- if (input$gcontrast_test %in% c("negbinom", "poisson", "DESeq2")) "counts" else "data"
+    tryCatch(
+      # suppressWarnings: silence the benign per-gene convergence notes (e.g.
+      # negbinom's theta.ml "iteration limit reached"). Errors still caught.
+      suppressWarnings(
+        Seurat::FindMarkers(seu(), ident.1 = input$gcontrast_target,
+                            ident.2 = input$gcontrast_reference, group.by = input$gcontrast_group,
+                            test.use = input$gcontrast_test, slot = slot)
+      ),
+      error = function(e) e
+    )
+  })
+
+  output$gcontrast_table <- renderDT({
+    res <- gcontrast_res()
+    if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute contrast:", conditionMessage(res))))
+    out <- format_generic_de(res)
+    out <- apply_field_search(out, "All columns", input$gcontrast_search_text)
+    datatable(out, rownames = FALSE, options = gd_table_opts)
   })
 }
 
