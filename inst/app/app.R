@@ -169,6 +169,35 @@ ui <- fluidPage(
     ")),
     tags$script(HTML("
       document.addEventListener('DOMContentLoaded', function() {
+        // ---- Load Test render timer ----
+        // When the 'Copies' slider changes, a full rebuild of 3*N plots follows.
+        // Start a clock, then count the lt_ plot renders (shiny:value) until all
+        // 3*N have drawn, and report the elapsed wall-clock time.
+        var ltStart = null, ltExpected = 0, ltCount = 0;
+        $(document).on('shiny:inputchanged', function(e) {
+          if (e.name === 'lt_copies') {
+            ltStart = performance.now();
+            ltExpected = 3 * e.value;
+            ltCount = 0;
+            var t = document.getElementById('lt_timer');
+            if (t) t.textContent = 'Rendering ' + e.value + ' copies (' + ltExpected + ' plots)...';
+          }
+        });
+        $(document).on('shiny:value', function(e) {
+          if (ltStart === null || !e.name) return;
+          if (e.name.indexOf('lt_umap_') === 0 || e.name.indexOf('lt_gene_') === 0 ||
+              e.name.indexOf('lt_heat_') === 0) {
+            ltCount++;
+            if (ltCount >= ltExpected) {
+              var secs = ((performance.now() - ltStart) / 1000).toFixed(1);
+              var t = document.getElementById('lt_timer');
+              if (t) t.textContent = 'Rendered ' + (ltExpected / 3) + ' copies (' +
+                ltExpected + ' plots) in ' + secs + ' s';
+              ltStart = null;
+            }
+          }
+        });
+
         var observer = new MutationObserver(function() {
           document.querySelectorAll('.shiny-file-input-progress').forEach(function(container) {
             var bar = container.querySelector('.progress-bar');
@@ -312,7 +341,8 @@ server <- function(input, output, session) {
   shared_upper <- reactive({
     fg <- found_genes()
     req(length(fg) > 0)
-    all_expr <- unlist(FetchData(seu(), vars = fg))
+    # Read straight from the data layer (faster than FetchData's data.frame path).
+    all_expr <- as.vector(GetAssayData(seu(), layer = "data")[fg, , drop = FALSE])
     upper <- max(all_expr, na.rm = TRUE)              # true maximum across selected genes
     if (!is.finite(upper) || upper <= 0) upper <- 1   # guard: all-zero expression
     as.numeric(upper)
@@ -537,6 +567,29 @@ server <- function(input, output, session) {
                   caption = "Rendering plot...", color = "#39FF14"),
       tags$hr(),
       withSpinner(DTOutput("agg_table"), caption = "Loading table...", color = "#39FF14")
+    )))
+
+    # ---- Load Test -------------------------------------------------------
+    # Renders N copies of a plot set (Clusters UMAP + Gene-expression UMAP +
+    # Aggregated heatmap) stacked on ONE page, so all copies render at once
+    # (separate tabs would suspend the hidden ones and not stress rendering).
+    # A JS timer (#lt_timer) reports how long N copies took to draw.
+    tabs <- c(tabs, list(tabPanel(
+      "Load Test",
+      wellPanel(
+        fluidRow(
+          column(3, sliderInput("lt_copies", "Copies of the plot set:",
+                                min = 1, max = 20, value = 3, step = 1, width = "100%")),
+          column(3, selectInput("lt_group", "UMAP color / aggregate by:",
+                                choices = grouping_choices, width = "100%")),
+          column(6, selectizeInput("lt_genes", "Gene(s) (expression + heatmap):",
+                                   choices = NULL, multiple = TRUE, width = "100%",
+                                   options = list(placeholder = "Type one or more gene symbols...")))
+        ),
+        div(id = "lt_timer", style = "font-weight: 600; margin-top: 5px; color: #2ecc0f;",
+            "Move the 'Copies' slider to render and time the plots.")
+      ),
+      uiOutput("lt_blocks")
     )))
 
     do.call(tabsetPanel, tabs)
@@ -788,10 +841,11 @@ server <- function(input, output, session) {
       umap_coords <- Embeddings(seu(), "umap")
       # Fetch ONLY this slot's gene, so the plot depends on `g` alone (not the
       # whole gene list) -- adding another gene won't invalidate this plot.
+      # GetAssayData(layer="data")[g, ] is faster than FetchData for one gene.
       plot_df <- data.frame(
         UMAP_1 = umap_coords[, 1],
         UMAP_2 = umap_coords[, 2],
-        expression = FetchData(seu(), vars = g)[[g]],
+        expression = as.numeric(GetAssayData(seu(), layer = "data")[g, ]),
         check.names = FALSE
       )
 
@@ -868,9 +922,10 @@ server <- function(input, output, session) {
 
     mat <- matrix(NA_real_, nrow = length(genes), ncol = length(groups),
                   dimnames = list(genes, groups))
-    for (gl in groups) {
-      idx <- grp == gl
-      for (g in genes) mat[g, gl] <- fun(expr[[g]][idx])
+    # tapply groups once per gene (vs subsetting per gene x group in a nested loop).
+    for (g in genes) {
+      agg_vals <- tapply(expr[[g]], grp, fun)
+      mat[g, names(agg_vals)] <- agg_vals
     }
     mat
   })
@@ -1092,6 +1147,104 @@ server <- function(input, output, session) {
     out <- format_generic_de(res)
     out <- apply_field_search(out, "All columns", input$gcontrast_search_text)
     datatable(out, rownames = FALSE, options = gd_table_opts)
+  })
+
+  # ===========================================================================
+  # Load Test: N stacked copies of a 3-plot set, all rendered at once, to
+  # benchmark how the app scales. Shared data prep (computed once, drawn N
+  # times) so the timer mostly reflects RENDERING cost.
+  # ===========================================================================
+  lt_max_copies <- 20
+
+  # Populate the Load Test gene selector; default-select the first gene so the
+  # gene/heatmap plots always render (keeps the render-count timer accurate).
+  observeEvent(seu(), {
+    req(seu())
+    lookup <- gene_lookup()
+    ordered <- lookup[order(lookup$value), , drop = FALSE]
+    updateSelectizeInput(session, "lt_genes", choices = setNames(ordered$value, ordered$label),
+                         selected = ordered$value[1], server = TRUE)
+  })
+
+  # Shared, once-computed data for all copies.
+  lt_umap_df <- reactive({
+    req(seu(), input$lt_group)
+    emb <- Embeddings(seu(), "umap")
+    grp <- as.character(seu()@meta.data[[input$lt_group]]); grp[is.na(grp)] <- "NA"
+    cats <- sort(unique(grp))
+    pal <- scales::hue_pal()(length(cats)); names(pal) <- cats
+    data.frame(UMAP_1 = emb[, 1], UMAP_2 = emb[, 2],
+               col = unname(pal[grp]), stringsAsFactors = FALSE)
+  })
+
+  lt_heat_mat <- reactive({
+    req(seu(), input$lt_group, input$lt_genes)
+    genes <- input$lt_genes[input$lt_genes %in% rownames(seu())]
+    req(length(genes) > 0)
+    expr <- FetchData(seu(), vars = genes)
+    grp <- as.character(seu()@meta.data[[input$lt_group]]); grp[is.na(grp)] <- "NA"
+    groups <- sort(unique(grp))
+    mat <- matrix(NA_real_, length(genes), length(groups), dimnames = list(genes, groups))
+    for (g in genes) { agg_vals <- tapply(expr[[g]], grp, mean); mat[g, names(agg_vals)] <- agg_vals }
+    mat
+  })
+
+  # One row of three plotly outputs per copy; N rows stacked -> all render.
+  output$lt_blocks <- renderUI({
+    req(input$lt_copies)
+    rows <- lapply(seq_len(input$lt_copies), function(i) {
+      div(style = "display: flex; gap: 10px; margin-bottom: 10px; height: 300px;",
+          div(style = "flex: 1;", plotlyOutput(paste0("lt_umap_", i), height = "100%")),
+          div(style = "flex: 1;", plotlyOutput(paste0("lt_gene_", i), height = "100%")),
+          div(style = "flex: 1;", plotlyOutput(paste0("lt_heat_", i), height = "100%")))
+    })
+    do.call(tagList, rows)
+  })
+
+  # Pre-register up to lt_max_copies of each plot; each renders only when its
+  # index is within the current copy count.
+  lapply(seq_len(lt_max_copies), function(i) {
+    force(i)
+    output[[paste0("lt_umap_", i)]] <- renderPlotly({
+      req(i <= input$lt_copies)
+      df <- lt_umap_df()
+      plot_ly(df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
+              marker = list(size = 4, color = ~col), hoverinfo = "skip") %>%
+        plotly::layout(title = list(text = paste("UMAP", i), x = 0), showlegend = FALSE,
+                       xaxis = list(title = "", zeroline = FALSE),
+                       yaxis = list(title = "", zeroline = FALSE, scaleanchor = "x")) %>%
+        plotly::config(displayModeBar = FALSE)
+    })
+
+    output[[paste0("lt_gene_", i)]] <- renderPlotly({
+      req(i <= input$lt_copies)
+      g <- input$lt_genes[1]
+      # Always return a plot (empty if no gene) so the timer's render count is exact.
+      if (is.null(g) || !(g %in% rownames(seu()))) {
+        return(plotly::config(plot_ly(type = "scattergl"), displayModeBar = FALSE))
+      }
+      emb <- Embeddings(seu(), "umap")
+      df <- data.frame(UMAP_1 = emb[, 1], UMAP_2 = emb[, 2],
+                       expr = as.numeric(GetAssayData(seu(), layer = "data")[g, ]))
+      plot_ly(df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
+              marker = list(size = 4, color = ~expr,
+                            colorscale = list(c(0, "#D9D9D9"), c(1, "#1E8B0D")), showscale = FALSE),
+              hoverinfo = "skip") %>%
+        plotly::layout(title = list(text = paste(g, i), x = 0),
+                       xaxis = list(title = "", zeroline = FALSE),
+                       yaxis = list(title = "", zeroline = FALSE, scaleanchor = "x")) %>%
+        plotly::config(displayModeBar = FALSE)
+    })
+
+    output[[paste0("lt_heat_", i)]] <- renderPlotly({
+      req(i <= input$lt_copies)
+      mat <- lt_heat_mat()
+      plot_ly(x = colnames(mat), y = rownames(mat), z = mat, type = "heatmap",
+              colorscale = list(c(0, "#D9D9D9"), c(1, "#1E8B0D")), showscale = FALSE) %>%
+        plotly::layout(title = list(text = paste("Heatmap", i), x = 0),
+                       yaxis = list(autorange = "reversed")) %>%
+        plotly::config(displayModeBar = FALSE)
+    })
   })
 }
 

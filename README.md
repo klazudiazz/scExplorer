@@ -39,6 +39,20 @@ run_app()
 locally, no server or internet connection needed. Then either upload a Seurat
 `.rds` or click **"Use example data"**.
 
+## Dependencies
+
+Core packages used by the app: **shiny**, **Seurat**, **plotly**, **DT**,
+**shinycssloaders**.
+
+For the **Cluster Markers** / **Contrasts** tabs (differential expression via
+`Seurat::FindMarkers`), the app uses
+**[presto](https://github.com/immunogenomics/presto)** - Seurat picks it up
+automatically to make those tests substantially faster. Install it with:
+
+```r
+remotes::install_github("immunogenomics/presto")
+```
+
 ## What your Seurat object needs
 
 - A dimensionality reduction named **`umap`** (`Embeddings(obj, "umap")`).
