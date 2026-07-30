@@ -39,7 +39,7 @@ library(DT)                # interactive marker / contrast tables
 library(shinycssloaders)   # the "Rendering plot..." loading spinners
 library(plotly)            # interactive UMAPs + colorbars
 
-# Raise the upload size limit (default is 5MB; Seurat objects are much bigger)
+# Raise the upload size limit (default is 5MB; Seurat objects might be much bigger)
 options(shiny.maxRequestSize = 5 * 1024^3)  # 5 GB
 
 # ---- Example data: read once per R session, reuse on every app (re)start ----
@@ -80,6 +80,26 @@ get_example_seu <- function() {
 pretty_label <- function(x) {
   x <- gsub("_", " ", x)
   sub("^(\\w)", "\\U\\1", x, perl = TRUE)
+}
+
+# Diverging blue -> white -> red colour scale used for expression on EVERY plot
+# (Gene Expression, Aggregated Expression heatmap, Split by Group, and their
+# colorbars). TWEAK: edit these stops to re-theme the expression gradient app-wide.
+EXPR_COLORSCALE <- list(
+  c(0.00, "#3B4CC0"),   # low  - blue
+  c(0.25, "#8DB0FE"),
+  c(0.50, "#F7F7F7"),   # mid  - white
+  c(0.75, "#F49A7B"),
+  c(1.00, "#B40426")    # high - red
+)
+
+# z-score a numeric vector (per-gene scaling: centre at 0, unit sd). Returned as
+# all-zero when the gene has no variance, so the plot stays white rather than NaN.
+# Expression plots colour by this so 0 = white, negative = blue, positive = red.
+zscore <- function(x) {
+  s <- stats::sd(x)
+  if (!is.finite(s) || s == 0) return(rep(0, length(x)))
+  (x - mean(x)) / s
 }
 
 ui <- fluidPage(
@@ -161,43 +181,28 @@ ui <- fluidPage(
       .btn-default:hover, .btn-default:focus { border-color: #39FF14; color: #2ecc0f; }
       .selectize-control.single .selectize-input.focus { border-color: #39FF14 !important; box-shadow: 0 0 0 1px #39FF14; }
 
+      /* Summary stat cards (Cells / Genes / Clusters / Samples) */
+      .stat-cards { display: flex; gap: 12px; flex-wrap: wrap; margin: 6px 0 14px; }
+      .stat-card {
+        flex: 1 1 120px; min-width: 120px;
+        background: #f7f7f7; border: 1px solid #e6e6e6; border-top: 3px solid #39FF14;
+        border-radius: 8px; padding: 10px 16px;
+      }
+      .stat-card .stat-label {
+        font-size: 12px; color: #8a8a8a; text-transform: uppercase; letter-spacing: 0.04em;
+      }
+      .stat-card .stat-value { font-size: 26px; font-weight: 700; color: #1a1a1a; line-height: 1.15; }
+
       /* Make each spinner-wrapped feature plot fill its (square) grid cell */
       #dynamic_feature_plots .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
       #dynamic_feature_plots .html-widget { width: 100% !important; height: 100% !important; }
       #umap_plot_box .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
       #umap_plot_box .html-widget { width: 100% !important; height: 100% !important; }
+      #split_plot_grid .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
+      #split_plot_grid .html-widget { width: 100% !important; height: 100% !important; }
     ")),
     tags$script(HTML("
       document.addEventListener('DOMContentLoaded', function() {
-        // ---- Load Test render timer ----
-        // When the 'Copies' slider changes, a full rebuild of 3*N plots follows.
-        // Start a clock, then count the lt_ plot renders (shiny:value) until all
-        // 3*N have drawn, and report the elapsed wall-clock time.
-        var ltStart = null, ltExpected = 0, ltCount = 0;
-        $(document).on('shiny:inputchanged', function(e) {
-          if (e.name === 'lt_copies') {
-            ltStart = performance.now();
-            ltExpected = 3 * e.value;
-            ltCount = 0;
-            var t = document.getElementById('lt_timer');
-            if (t) t.textContent = 'Rendering ' + e.value + ' copies (' + ltExpected + ' plots)...';
-          }
-        });
-        $(document).on('shiny:value', function(e) {
-          if (ltStart === null || !e.name) return;
-          if (e.name.indexOf('lt_umap_') === 0 || e.name.indexOf('lt_gene_') === 0 ||
-              e.name.indexOf('lt_heat_') === 0) {
-            ltCount++;
-            if (ltCount >= ltExpected) {
-              var secs = ((performance.now() - ltStart) / 1000).toFixed(1);
-              var t = document.getElementById('lt_timer');
-              if (t) t.textContent = 'Rendered ' + (ltExpected / 3) + ' copies (' +
-                ltExpected + ' plots) in ' + secs + ' s';
-              ltStart = null;
-            }
-          }
-        });
-
         var observer = new MutationObserver(function() {
           document.querySelectorAll('.shiny-file-input-progress').forEach(function(container) {
             var bar = container.querySelector('.progress-bar');
@@ -250,7 +255,8 @@ ui <- fluidPage(
   # Once data is loaded, show a short status line in place of the controls.
   conditionalPanel(
     condition = "output.data_ready",
-    uiOutput("data_status")
+    uiOutput("data_status"),
+    uiOutput("summary_cards")
   ),
 
   # The whole app body (tabs + plots) is built on the server side once data is
@@ -300,6 +306,50 @@ server <- function(input, output, session) {
     tags$p(tags$strong(msg))
   })
 
+  # Summary stat cards shown under the status line once data is loaded. Cells and
+  # Genes come straight from the object; Clusters / Samples are detected from the
+  # first matching meta.data column (common names), and show "-" when absent so
+  # the cards stay sensible for any Seurat object.
+  # TWEAK: extend these candidate lists to match your own column names.
+  output$summary_cards <- renderUI({
+    req(seu())
+    md <- seu()@meta.data
+    distinct_of <- function(col) {
+      if (is.na(col) || !col %in% colnames(md)) return(NA_integer_)
+      length(unique(md[[col]][!is.na(md[[col]])]))
+    }
+    # Pick a column by exact name, else by a regex over the column names.
+    pick_col <- function(exact, pattern) {
+      col <- intersect(exact, colnames(md))[1]
+      if (is.na(col)) {
+        hit <- grep(pattern, colnames(md), ignore.case = TRUE, value = TRUE)
+        col <- if (length(hit)) hit[1] else NA_character_
+      }
+      col
+    }
+    # Clusters: for scdrake objects use the clustering column recorded in
+    # @misc$cluster_markers$source_column; otherwise detect a "cluster*" column.
+    clust_col <- NA_character_
+    cm <- seu()@misc$cluster_markers
+    if (!is.null(cm) && "source_column" %in% colnames(cm)) clust_col <- as.character(cm$source_column)[1]
+    if (is.na(clust_col)) clust_col <- pick_col(c("seurat_clusters", "clusters", "cluster"), "cluster")
+    n_clusters <- distinct_of(clust_col)
+    n_samples  <- distinct_of(pick_col(c("sample", "orig.ident", "samples", "batch", "donor", "patient"),
+                                       "sample|batch|orig\\.ident"))
+
+    fmt  <- function(x) if (is.na(x)) "-" else format(x, big.mark = ",")
+    card <- function(label, value) {
+      div(class = "stat-card",
+          div(class = "stat-label", label),
+          div(class = "stat-value", value))
+    }
+    div(class = "stat-cards",
+        card("Cells",    fmt(ncol(seu()))),
+        card("Genes",    fmt(nrow(seu()))),
+        card("Clusters", fmt(n_clusters)),
+        card("Samples",  fmt(n_samples)))
+  })
+
   # gene_lookup(): maps each gene rowname to a nice display label
   # "SYMBOL (ENSEMBL)" when those rowData columns exist, else just the rowname.
   # Used to populate the searchable gene dropdown.
@@ -338,14 +388,17 @@ server <- function(input, output, session) {
     input$genes[input$genes %in% rownames(seu())]
   })
 
+  # Shared symmetric colour limit for "Same scale for all genes" mode: the max
+  # absolute z-score across the selected genes (each gene z-scored on its own),
+  # so every plot uses the same +/- range centred on 0 (white).
   shared_upper <- reactive({
     fg <- found_genes()
     req(length(fg) > 0)
-    # Read straight from the data layer (faster than FetchData's data.frame path).
-    all_expr <- as.vector(GetAssayData(seu(), layer = "data")[fg, , drop = FALSE])
-    upper <- max(all_expr, na.rm = TRUE)              # true maximum across selected genes
-    if (!is.finite(upper) || upper <= 0) upper <- 1   # guard: all-zero expression
-    as.numeric(upper)
+    m <- as.matrix(GetAssayData(seu(), layer = "data")[fg, , drop = FALSE])  # genes x cells
+    z <- t(apply(m, 1, zscore))                       # z-score each gene (row)
+    lim <- max(abs(z), na.rm = TRUE)
+    if (!is.finite(lim) || lim <= 0) lim <- 1         # guard: no variance
+    as.numeric(lim)
   })
 
   # One common square axis window (padded full extent of the UMAP embedding),
@@ -569,27 +622,30 @@ server <- function(input, output, session) {
       withSpinner(DTOutput("agg_table"), caption = "Loading table...", color = "#39FF14")
     )))
 
-    # ---- Load Test -------------------------------------------------------
-    # Renders N copies of a plot set (Clusters UMAP + Gene-expression UMAP +
-    # Aggregated heatmap) stacked on ONE page, so all copies render at once
-    # (separate tabs would suspend the hidden ones and not stress rendering).
-    # A JS timer (#lt_timer) reports how long N copies took to draw.
+    # ---- Split by Group --------------------------------------------------
+    # One gene, split across the levels of a grouping column: a separate
+    # expression UMAP per group (e.g. per sample / condition / cluster), each
+    # showing only that group's cells over a grey backdrop of all cells, on a
+    # shared colour scale so the panels are directly comparable.
     tabs <- c(tabs, list(tabPanel(
-      "Load Test",
+      "Split by Group",
       wellPanel(
         fluidRow(
-          column(3, sliderInput("lt_copies", "Copies of the plot set:",
-                                min = 1, max = 20, value = 3, step = 1, width = "100%")),
-          column(3, selectInput("lt_group", "UMAP color / aggregate by:",
+          column(2, selectInput("split_group", "Split by:",
                                 choices = grouping_choices, width = "100%")),
-          column(6, selectizeInput("lt_genes", "Gene(s) (expression + heatmap):",
-                                   choices = NULL, multiple = TRUE, width = "100%",
-                                   options = list(placeholder = "Type one or more gene symbols...")))
+          column(2, selectInput("split_then", "Then by (optional):",
+                                choices = c("(none)" = "", grouping_choices), width = "100%")),
+          column(3, selectInput("split_gene_sort", "Sort genes by:", width = "100%",
+                                choices = c("Alphabetical", "Highest average expression", "Lowest average expression"))),
+          column(3, selectizeInput("split_gene", "Gene:", choices = NULL, multiple = FALSE, width = "100%",
+                                   options = list(placeholder = "Type a gene symbol..."))),
+          column(2, numericInput("split_ncol", "Panels per row:", value = 3, min = 1, max = 5, width = "100%"))
         ),
-        div(id = "lt_timer", style = "font-weight: 600; margin-top: 5px; color: #2ecc0f;",
-            "Move the 'Copies' slider to render and time the plots.")
+        uiOutput("split_levels_ui"),
+        uiOutput("split_levels2_ui"),
+        helpText("One panel per selected group. Optionally split again by a second column (e.g. cell type then condition) to get a grid - then pick which of its groups to show too. Panels are coloured by the gene's expression (shared scale).")
       ),
-      uiOutput("lt_blocks")
+      uiOutput("split_plots")
     )))
 
     do.call(tabsetPanel, tabs)
@@ -785,16 +841,16 @@ server <- function(input, output, session) {
   # Single shared colorbar, shown to the right of the grid in "shared" scale mode
   output$shared_colorbar <- renderPlotly({
     req(identical(input$scale_mode, "shared"))
-    upper <- shared_upper()
+    lim <- shared_upper()
     plot_ly(
       x = c(0, 0), y = c(0, 1),
       type = "scatter", mode = "markers",
       marker = list(
-        color = c(0, upper),
+        color = c(-lim, lim),
         # TWEAK: keep this gradient identical to the per-plot one above so the
-        # shared colorbar matches the points (grey85 low -> green high).
-        colorscale = list(c(0, "#D9D9D9"), c(1, "#1E8B0D")),   # grey85 -> green
-        cmin = 0, cmax = upper,
+        # shared colorbar matches the points (blue -/ white 0 / red +).
+        colorscale = EXPR_COLORSCALE,   # blue -> white -> red (see EXPR_COLORSCALE)
+        cmin = -lim, cmax = lim,                               # symmetric -> 0 is white
         opacity = 0,                                           # hide the dummy points
         showscale = TRUE,
         colorbar = list(title = list(text = "Expression"), thickness = 15,
@@ -842,19 +898,22 @@ server <- function(input, output, session) {
       # Fetch ONLY this slot's gene, so the plot depends on `g` alone (not the
       # whole gene list) -- adding another gene won't invalidate this plot.
       # GetAssayData(layer="data")[g, ] is faster than FetchData for one gene.
+      # z-scored expression (centre 0, unit sd) so the diverging blue-white-red
+      # scale reads as -/+ around the mean, like a scaled-expression plot.
       plot_df <- data.frame(
         UMAP_1 = umap_coords[, 1],
         UMAP_2 = umap_coords[, 2],
-        expression = as.numeric(GetAssayData(seu(), layer = "data")[g, ]),
+        expression = zscore(as.numeric(GetAssayData(seu(), layer = "data")[g, ])),
         check.names = FALSE
       )
 
-      # Determine limits for Color Scale
+      # Symmetric colour limit so 0 maps to white. Shared mode uses the pooled
+      # max |z| across selected genes; per-gene mode uses this gene's max |z|.
       if (input$scale_mode == "shared") {
-        upper <- shared_upper()
+        lim <- shared_upper()
       } else {
-        upper <- max(plot_df$expression, na.rm = TRUE)   # true per-gene maximum
-        if (!is.finite(upper) || upper <= 0) upper <- 1  # guard: all-zero expression
+        lim <- max(abs(plot_df$expression), na.rm = TRUE)
+        if (!is.finite(lim) || lim <= 0) lim <- 1        # guard: no variance
       }
 
       # Draw low-expression points first so high-expression ones sit on top.
@@ -865,17 +924,14 @@ server <- function(input, output, session) {
       # shared colorbar to the right of the grid, so hide the per-plot one.
       show_bar <- input$scale_mode != "shared"
 
-      # Native plot_ly (scattergl) instead of ggplot + ggplotly -- much faster.
-      # cmin/cmax = 0..upper reproduces the old scale_color_gradient(limits =,
-      # oob = squish): values above `upper` clamp to the max colour.
       p <- plot_ly(
         plot_df, x = ~UMAP_1, y = ~UMAP_2,
         type = "scattergl", mode = "markers",
         marker = list(
           size = 4,                                              # TWEAK: gene-expression point size
           color = ~expression,
-          colorscale = list(c(0, "#D9D9D9"), c(1, "#1E8B0D")),   # TWEAK: grey85 -> green gradient
-          cmin = 0, cmax = upper,
+          colorscale = EXPR_COLORSCALE,   # TWEAK: edit EXPR_COLORSCALE near the top
+          cmin = -lim, cmax = lim,                               # symmetric -> 0 is white
           showscale = show_bar,
           colorbar = list(title = list(text = "Expression"), thickness = 15, len = 0.5, outlinewidth = 0)
         ),
@@ -935,14 +991,14 @@ server <- function(input, output, session) {
     switch(input$agg_fun, sum = "Sum", median = "Median", "Mean")
   })
 
-  # Heatmap: genes (rows) x group levels (columns), grey85 -> green like the
+  # Heatmap: genes (rows) x group levels (columns), blue -> white -> red like the
   # Gene Expression plots. Colour scale auto-fits the aggregated values.
   output$agg_heatmap <- renderPlotly({
     mat <- agg_matrix()
     plot_ly(
       x = colnames(mat), y = rownames(mat), z = mat,
       type = "heatmap",
-      colorscale = list(c(0, "#D9D9D9"), c(1, "#1E8B0D")),   # grey85 -> green
+      colorscale = EXPR_COLORSCALE,   # blue -> white -> red (see EXPR_COLORSCALE)
       colorbar = list(title = list(text = agg_fun_label()), thickness = 15, outlinewidth = 0),
       hovertemplate = paste0("Gene: %{y}<br>", pretty_label(input$agg_group_var),
                              ": %{x}<br>", agg_fun_label(), ": %{z:.3f}<extra></extra>")
@@ -1150,99 +1206,206 @@ server <- function(input, output, session) {
   })
 
   # ===========================================================================
-  # Load Test: N stacked copies of a 3-plot set, all rendered at once, to
-  # benchmark how the app scales. Shared data prep (computed once, drawn N
-  # times) so the timer mostly reflects RENDERING cost.
+  # Split by Group: one gene shown as a separate expression UMAP per level of a
+  # grouping column. Each panel plots that group's cells (coloured by the gene's
+  # expression) over a grey backdrop of all cells, on a shared 0..max scale so
+  # the panels are directly comparable. Panel titles are the group names.
   # ===========================================================================
-  lt_max_copies <- 20
+  # Hard limit on how many groups can be shown at once. The panels are WebGL
+  # (fast for many cells), and browsers cap live WebGL contexts, so we bound the
+  # panel count instead: the user picks WHICH groups to show, up to this many.
+  # TWEAK: raise cautiously -- too high risks the browser dropping plots.
+  split_max_panels <- 12
 
-  # Populate the Load Test gene selector; default-select the first gene so the
-  # gene/heatmap plots always render (keeps the render-count timer accurate).
-  observeEvent(seu(), {
-    req(seu())
-    lookup <- gene_lookup()
-    ordered <- lookup[order(lookup$value), , drop = FALSE]
-    updateSelectizeInput(session, "lt_genes", choices = setNames(ordered$value, ordered$label),
-                         selected = ordered$value[1], server = TRUE)
+  # Populate the Split gene selector in the chosen sort order, keeping the
+  # current gene selected when it's still in the list (else the first gene).
+  observeEvent(list(seu(), input$split_gene_sort), {
+    req(seu(), input$split_gene_sort)
+    ch <- ordered_gene_choices(input$split_gene_sort)
+    sel <- isolate(input$split_gene)
+    if (is.null(sel) || !(sel %in% ch)) sel <- ch[[1]]
+    updateSelectizeInput(session, "split_gene", choices = ch, selected = sel, server = TRUE)
   })
 
-  # Shared, once-computed data for all copies.
-  lt_umap_df <- reactive({
-    req(seu(), input$lt_group)
+  # Levels of the "Split by" column -- pick WHICH primary groups to show.
+  output$split_levels_ui <- renderUI({
+    req(input$split_group)
+    vals <- as.character(seu()@meta.data[[input$split_group]]); vals[is.na(vals)] <- "NA"
+    lvls <- sort(unique(vals))
+    selectizeInput("split_levels",
+                   paste0(pretty_label(input$split_group), " - groups to show:"),
+                   choices = lvls, selected = character(0), multiple = TRUE, width = "100%",
+                   options = list(maxItems = split_max_panels, placeholder = "Pick groups to show..."))
+  })
+
+  # Levels of the optional "Then by" column -- pick WHICH secondary groups to
+  # show. Only appears once a "Then by" column is chosen (req("") is falsy).
+  output$split_levels2_ui <- renderUI({
+    req(input$split_then)
+    vals <- as.character(seu()@meta.data[[input$split_then]]); vals[is.na(vals)] <- "NA"
+    lvls <- sort(unique(vals))
+    selectizeInput("split_levels2",
+                   paste0(pretty_label(input$split_then), " - groups to show:"),
+                   choices = lvls, selected = character(0), multiple = TRUE, width = "100%",
+                   options = list(maxItems = split_max_panels, placeholder = "Pick groups to show..."))
+  })
+
+  # Shared data + the list of panels to draw. Each panel is one group (or, when a
+  # second "Then by" column is chosen, one primary x secondary combination): a
+  # mask over all cells + a title. Nothing shows until the user picks groups.
+  split_data <- reactive({
+    req(input$split_group, input$split_gene)
+    g <- input$split_gene
+    validate(need(g %in% rownames(seu()), "Gene not found in this object."))
     emb <- Embeddings(seu(), "umap")
-    grp <- as.character(seu()@meta.data[[input$lt_group]]); grp[is.na(grp)] <- "NA"
-    cats <- sort(unique(grp))
-    pal <- scales::hue_pal()(length(cats)); names(pal) <- cats
-    data.frame(UMAP_1 = emb[, 1], UMAP_2 = emb[, 2],
-               col = unname(pal[grp]), stringsAsFactors = FALSE)
-  })
+    grp <- as.character(seu()@meta.data[[input$split_group]]); grp[is.na(grp)] <- "NA"
+    # z-scored expression (centre 0) with a symmetric colour limit, so the
+    # diverging blue-white-red scale reads as -/+ around the mean.
+    expr <- zscore(as.numeric(GetAssayData(seu(), layer = "data")[g, ]))
+    upper <- max(abs(expr), na.rm = TRUE)
+    if (!is.finite(upper) || upper <= 0) upper <- 1
 
-  lt_heat_mat <- reactive({
-    req(seu(), input$lt_group, input$lt_genes)
-    genes <- input$lt_genes[input$lt_genes %in% rownames(seu())]
-    req(length(genes) > 0)
-    expr <- FetchData(seu(), vars = genes)
-    grp <- as.character(seu()@meta.data[[input$lt_group]]); grp[is.na(grp)] <- "NA"
-    groups <- sort(unique(grp))
-    mat <- matrix(NA_real_, length(genes), length(groups), dimnames = list(genes, groups))
-    for (g in genes) { agg_vals <- tapply(expr[[g]], grp, mean); mat[g, names(agg_vals)] <- agg_vals }
-    mat
-  })
+    all_levels <- sort(unique(grp))
+    sel <- input$split_levels[input$split_levels %in% all_levels]
+    sel <- head(sel, split_max_panels)   # primary groups the user picked
 
-  # One row of three plotly outputs per copy; N rows stacked -> all render.
-  output$lt_blocks <- renderUI({
-    req(input$lt_copies)
-    rows <- lapply(seq_len(input$lt_copies), function(i) {
-      div(style = "display: flex; gap: 10px; margin-bottom: 10px; height: 300px;",
-          div(style = "flex: 1;", plotlyOutput(paste0("lt_umap_", i), height = "100%")),
-          div(style = "flex: 1;", plotlyOutput(paste0("lt_gene_", i), height = "100%")),
-          div(style = "flex: 1;", plotlyOutput(paste0("lt_heat_", i), height = "100%")))
-    })
-    do.call(tagList, rows)
-  })
+    # Optional secondary grouping (the "Then by" column) + the user's picked
+    # secondary levels.
+    sec_col <- input$split_then
+    grp2 <- NULL; sec_sel <- NULL
+    if (!is.null(sec_col) && nzchar(sec_col) && sec_col %in% colnames(seu()@meta.data)) {
+      grp2 <- as.character(seu()@meta.data[[sec_col]]); grp2[is.na(grp2)] <- "NA"
+      all_sec <- sort(unique(grp2))
+      sec_sel <- input$split_levels2[input$split_levels2 %in% all_sec]
+    }
 
-  # Pre-register up to lt_max_copies of each plot; each renders only when its
-  # index is within the current copy count.
-  lapply(seq_len(lt_max_copies), function(i) {
-    force(i)
-    output[[paste0("lt_umap_", i)]] <- renderPlotly({
-      req(i <= input$lt_copies)
-      df <- lt_umap_df()
-      plot_ly(df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
-              marker = list(size = 4, color = ~col), hoverinfo = "skip") %>%
-        plotly::layout(title = list(text = paste("UMAP", i), x = 0), showlegend = FALSE,
-                       xaxis = list(title = "", zeroline = FALSE),
-                       yaxis = list(title = "", zeroline = FALSE, scaleanchor = "x")) %>%
-        plotly::config(displayModeBar = FALSE)
-    })
-
-    output[[paste0("lt_gene_", i)]] <- renderPlotly({
-      req(i <= input$lt_copies)
-      g <- input$lt_genes[1]
-      # Always return a plot (empty if no gene) so the timer's render count is exact.
-      if (is.null(g) || !(g %in% rownames(seu()))) {
-        return(plotly::config(plot_ly(type = "scattergl"), displayModeBar = FALSE))
+    # Build one panel per primary group, or per (primary x secondary) combination.
+    panels <- list()
+    if (is.null(grp2)) {
+      for (p in sel) panels[[length(panels) + 1]] <-
+        list(mask = grp == p, title = paste0(p, "  (n=", sum(grp == p), ")"))
+      ncol_hint <- NA_integer_
+    } else {
+      for (p in sel) for (s in sec_sel) {
+        m <- grp == p & grp2 == s
+        panels[[length(panels) + 1]] <-
+          list(mask = m, title = paste0(p, " - ", s, "  (n=", sum(m), ")"))
       }
-      emb <- Embeddings(seu(), "umap")
-      df <- data.frame(UMAP_1 = emb[, 1], UMAP_2 = emb[, 2],
-                       expr = as.numeric(GetAssayData(seu(), layer = "data")[g, ]))
-      plot_ly(df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
-              marker = list(size = 4, color = ~expr,
-                            colorscale = list(c(0, "#D9D9D9"), c(1, "#1E8B0D")), showscale = FALSE),
-              hoverinfo = "skip") %>%
-        plotly::layout(title = list(text = paste(g, i), x = 0),
-                       xaxis = list(title = "", zeroline = FALSE),
-                       yaxis = list(title = "", zeroline = FALSE, scaleanchor = "x")) %>%
-        plotly::config(displayModeBar = FALSE)
-    })
+      ncol_hint <- if (length(sec_sel) > 0) length(sec_sel) else NA_integer_
+    }
 
-    output[[paste0("lt_heat_", i)]] <- renderPlotly({
-      req(i <= input$lt_copies)
-      mat <- lt_heat_mat()
-      plot_ly(x = colnames(mat), y = rownames(mat), z = mat, type = "heatmap",
-              colorscale = list(c(0, "#D9D9D9"), c(1, "#1E8B0D")), showscale = FALSE) %>%
-        plotly::layout(title = list(text = paste("Heatmap", i), x = 0),
-                       yaxis = list(autorange = "reversed")) %>%
+    list(emb = emb, grp = grp, grp2 = grp2, expr = expr, upper = upper, gene = g,
+         panels = panels, ncol_hint = ncol_hint)
+  })
+
+  # Grid of one panel per group + a single shared colorbar on the right.
+  output$split_plots <- renderUI({
+    d <- split_data()
+    n <- length(d$panels)
+    validate(need(n > 0, "Pick one or more groups to show."))
+    validate(need(n <= split_max_panels,
+                  paste0("That makes ", n, " panels (max ", split_max_panels,
+                         "). Pick fewer groups, or a 'Then by' column with fewer categories.")))
+    # When a secondary column is set, use its level count as the column count so
+    # each row is one primary group (cell type) across the secondary (condition).
+    ncol <- if (!is.na(d$ncol_hint)) max(1, d$ncol_hint) else max(1, min(input$split_ncol, n))
+    nrow <- ceiling(n / ncol)
+    # Same square-cell sizing as the Gene Expression tab: cell = min(width per
+    # column, one viewport height), so plots and colorbar match that tab exactly.
+    gap <- 10
+    side_offset <- 90
+    top_offset  <- 380
+    cb_width    <- 150
+    w_term <- sprintf("calc((100vw - %dpx) / %d)", side_offset + cb_width + (ncol - 1) * gap, ncol)
+    h_cap  <- sprintf("calc(100vh - %dpx)", top_offset)
+    cell   <- sprintf("min(%s, %s)", w_term, h_cap)
+
+    cells <- lapply(seq_len(n), function(i) {
+      withSpinner(plotlyOutput(paste0("split_panel_", i), width = "100%", height = "100%"),
+                  caption = "Rendering plot...", color = "#39FF14")
+    })
+    grid_div <- div(
+      id = "split_plot_grid",
+      style = paste0("display: grid; grid-template-columns: repeat(", ncol,
+                     ", ", cell, "); grid-template-rows: repeat(", nrow,
+                     ", ", cell, "); gap: ", gap, "px; justify-content: center;",
+                     " align-content: start;"),
+      cells)
+    # Grid + shared colorbar, same structure as Gene Expression's shared mode.
+    div(style = "display: flex; align-items: stretch; justify-content: center; gap: 15px;",
+        grid_div,
+        div(style = paste0("width: ", cb_width, "px; display: flex; align-items: center; justify-content: center;"),
+            div(style = paste0("width: 100%; height: ", cell, ";"),
+                plotlyOutput("split_colorbar", width = "100%", height = "100%"))))
+  })
+
+  # Single shared colorbar (blue -> white -> red), matching the panels' scale.
+  output$split_colorbar <- renderPlotly({
+    lim <- split_data()$upper
+    plot_ly(x = c(0, 0), y = c(0, 1), type = "scatter", mode = "markers",
+            marker = list(color = c(-lim, lim),
+                          colorscale = EXPR_COLORSCALE,
+                          cmin = -lim, cmax = lim, opacity = 0, showscale = TRUE,
+                          colorbar = list(title = list(text = "Expression"), thickness = 15,
+                                          len = 0.5, outlinewidth = 0))) %>%
+      plotly::layout(xaxis = list(visible = FALSE, range = c(-1, 1)),
+                     yaxis = list(visible = FALSE, range = c(-1, 2)),
+                     margin = list(l = 0, r = 0, t = 10, b = 10),
+                     paper_bgcolor = "rgba(0,0,0,0)", plot_bgcolor = "rgba(0,0,0,0)") %>%
+      plotly::config(displayModeBar = FALSE)
+  })
+
+  # Pre-register up to split_max_panels panels; each renders group i's cells.
+  lapply(seq_len(split_max_panels), function(i) {
+    force(i)
+    output[[paste0("split_panel_", i)]] <- renderPlotly({
+      d <- split_data()
+      req(i <= length(d$panels))
+      pan <- d$panels[[i]]
+      sel <- pan$mask
+      rng <- umap_range()
+      # Per-cell label: primary group, plus the secondary group when "Then by" is set.
+      lbl <- if (is.null(d$grp2)) d$grp else paste0(d$grp, " - ", d$grp2)
+      # Two traces, same as the Gene Expression tab's style:
+      #  1) grey backdrop = every OTHER cell (context),
+      #  2) this panel's cells coloured by expression via a numeric blue->white->red
+      #     colourscale (numeric colour is what actually renders the gradient -- a
+      #     character/hex vector is NOT applied by plotly and comes out all blue).
+      # BOTH traces carry a tooltip (no hoverinfo="skip"), so hovering any cell
+      # works -- exactly like Clusters / Gene Expression.
+      o <- which(!sel)
+      g <- which(sel)[order(d$expr[sel])]   # low->high so bright cells sit on top
+      mk_df <- function(idx) data.frame(
+        x = d$emb[idx, 1], y = d$emb[idx, 2], e = d$expr[idx],
+        tt = paste0("Cell: ", rownames(d$emb)[idx], "<br>", lbl[idx],
+                    "<br>", d$gene, " (z): ", round(d$expr[idx], 3)),
+        stringsAsFactors = FALSE)
+      # Build traces only when they have cells -- an empty (primary x secondary)
+      # combination would otherwise error on a zero-row data frame.
+      p <- plot_ly()
+      if (length(o) > 0) {
+        p <- add_trace(p, data = mk_df(o), x = ~x, y = ~y, type = "scattergl", mode = "markers",
+                       marker = list(size = 3, color = "#E8E8E8"),
+                       text = ~tt, hoverinfo = "text", showlegend = FALSE)
+      }
+      if (length(g) > 0) {
+        p <- add_trace(p, data = mk_df(g), x = ~x, y = ~y, type = "scattergl", mode = "markers",
+                       marker = list(size = 4, color = ~e,
+                                     colorscale = EXPR_COLORSCALE,
+                                     cmin = -d$upper, cmax = d$upper, showscale = FALSE),
+                       text = ~tt, hoverinfo = "text", showlegend = FALSE)
+      }
+      p %>%
+        plotly::layout(
+          hovermode = "closest",
+          title = list(text = pan$title, x = 0, xanchor = "left",
+                       font = list(size = 14, family = "Open Sans, verdana, arial, sans-serif")),
+          xaxis = list(title = "", zeroline = FALSE, showline = FALSE, ticks = "",
+                       range = rng, constrain = "domain", constraintoward = "left"),
+          yaxis = list(title = "", zeroline = FALSE, showline = FALSE, ticks = "",
+                       scaleanchor = "x", scaleratio = 1, constrain = "domain",
+                       constraintoward = "top", range = rng),
+          margin = list(l = 10, r = 10, t = 30, b = 10)) %>%
         plotly::config(displayModeBar = FALSE)
     })
   })
