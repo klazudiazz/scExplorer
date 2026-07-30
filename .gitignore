@@ -12,3 +12,7 @@ Thumbs.db
 # Data: ignore all .rds EXCEPT the small bundled demo object
 *.rds
 !inst/app/example_data/seurat_example.rds
+
+# Personal / local-only
+docs/
+scexplorer_session_handoff.md
