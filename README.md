@@ -1,4 +1,4 @@
-# scexplorer
+# scExplorer
 
 **Interactive explorer for Seurat objects.**
 
