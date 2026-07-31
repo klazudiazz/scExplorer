@@ -181,6 +181,18 @@ ui <- fluidPage(
       .btn-default:hover, .btn-default:focus { border-color: #39FF14; color: #2ecc0f; }
       .selectize-control.single .selectize-input.focus { border-color: #39FF14 !important; box-shadow: 0 0 0 1px #39FF14; }
 
+      /* Green range slider (ionRangeSlider) to match the theme, instead of blue */
+      .irs--shiny .irs-bar { background: #39FF14; }
+      .irs--shiny .irs-handle { border-color: #39FF14; }
+      .irs--shiny .irs-from, .irs--shiny .irs-to, .irs--shiny .irs-single { background-color: #39FF14; color: #1a1a1a; }
+      .irs--shiny .irs-from:before, .irs--shiny .irs-to:before, .irs--shiny .irs-single:before { border-top-color: #39FF14; }
+      /* Hide the floating grey min/max labels (they detach when you drag a handle);
+         the axis grid below already labels the ends, including 0 at the start. */
+      .irs--shiny .irs-min, .irs--shiny .irs-max, .irs-min, .irs-max { display: none !important; }
+      /* fallback for older ion.rangeSlider markup */
+      .irs-bar, .irs-bar-edge { background: #39FF14 !important; border-color: #39FF14 !important; }
+      .irs-single, .irs-from, .irs-to { background: #39FF14 !important; color: #1a1a1a !important; }
+
       /* Summary stat cards (Cells / Genes / Clusters / Samples) */
       .stat-cards { display: flex; gap: 12px; flex-wrap: wrap; margin: 6px 0 14px; }
       .stat-card {
@@ -475,6 +487,15 @@ server <- function(input, output, session) {
     # values (the real column names) are what input$group_var returns.
     grouping_choices <- setNames(grouping_cols, pretty_label(grouping_cols))
     grouping_choices <- grouping_choices[order(names(grouping_choices))]
+    # "Color UMAP by" ALSO offers continuous numerics (nCount, percent.mt, ...) --
+    # those are drawn as a colour gradient (see is_continuous_col / umap_base).
+    # The aggregate / split tabs keep `grouping_choices` (real categories only),
+    # since a continuous column can't be a heatmap column / panel there.
+    color_cols <- all_cols[vapply(seu()@meta.data, function(x) {
+      is.factor(x) || is.character(x) || is.logical(x) || is.numeric(x)
+    }, logical(1))]
+    color_choices <- setNames(color_cols, pretty_label(color_cols))
+    color_choices <- color_choices[order(names(color_choices))]
     has_markers <- !is.null(seu()@misc$cluster_markers)
     has_contrasts <- !is.null(seu()@misc$contrasts)
 
@@ -493,7 +514,7 @@ server <- function(input, output, session) {
         "Clusters / Metadata",
         sidebarLayout(
           sidebarPanel(
-            selectInput("group_var", "Color UMAP by:", choices = grouping_choices),
+            selectInput("group_var", "Color UMAP by:", choices = color_choices),
             uiOutput("category_filter_ui")
           ),
           mainPanel(
@@ -655,8 +676,21 @@ server <- function(input, output, session) {
   # time the colouring column changes; NA (unlabelled) cells become an "NA" box.
   output$category_filter_ui <- renderUI({
     req(input$group_var)
+    # Continuous columns: a gradient + a value-range slider. Cells outside the
+    # range go grey; cells inside keep the gradient. Defaults span the full range.
+    if (is_continuous_col(input$group_var)) {
+      x <- suppressWarnings(as.numeric(as.character(seu()@meta.data[[input$group_var]])))
+      rng <- range(x, na.rm = TRUE)
+      step <- signif(diff(rng) / 200, 2)
+      return(tagList(
+        helpText("Drag to keep only cells whose value is in this range (others go grey):"),
+        sliderInput("cont_range", "Value range:",
+                    min = floor(rng[1] / step) * step, max = ceiling(rng[2] / step) * step,
+                    value = c(rng[1], rng[2]), step = step, width = "100%")
+      ))
+    }
     vals <- as.character(seu()@meta.data[[input$group_var]])
-    vals[is.na(vals)] <- "NA"   # un-annotated cells (e.g. pruned label columns)
+    vals[is.na(vals)] <- "NA"
     vals <- sort(unique(vals))
     checkboxGroupInput("categories_shown", "Show categories:", choices = vals, selected = vals)
   })
@@ -665,31 +699,58 @@ server <- function(input, output, session) {
   # Clusters / Metadata UMAP (one plotly scatter coloured by a metadata column)
   # ---------------------------------------------------------------------------
 
+  # Turn a metadata column into categories for colouring. Categorical columns
+  # (factor/character/logical, low-cardinality numeric) are used as-is; a
+  # CONTINUOUS numeric (>50 distinct values) is split into quantile RANGES so it
+  # can be shown categorically (one colour per range) instead of per value.
+  # Returns the per-cell values, the ordered level list (present levels only,
+  # NA last), and whether it was binned.
+  # TWEAK: change `length.out = 7` for a different number of ranges (6 here).
+  # A metadata column is treated as CONTINUOUS (coloured by a gradient) when its
+  # values are numeric -- including numbers stored as character/factor, e.g.
+  # prediction scores. Otherwise it's categorical (discrete colours + checkboxes).
+  #   * ">90% coerce to numbers"  -> text labels stay categorical.
+  #   * has NON-INTEGER values    -> a real-valued score (e.g. 0.031) is
+  #       continuous even with few distinct values (like a per-sample score).
+  #   * OR >50 distinct integers  -> e.g. nCount_RNA is continuous, while small
+  #       integer codes (cluster ids 0..17) stay categorical.
+  # TWEAK: change the 50 to shift the integer categorical/continuous threshold.
+  is_continuous_col <- function(col) {
+    xn <- suppressWarnings(as.numeric(as.character(seu()@meta.data[[col]])))
+    if (mean(!is.na(xn)) <= 0.9) return(FALSE)            # not numeric-like
+    u <- unique(xn[!is.na(xn)])
+    any(u != round(u)) || length(u) > 50                 # decimals, or many integers
+  }
+
   # Base data for the UMAP, in a fixed (seeded) random point order. Depends ONLY
   # on the object + colouring column -- NOT on which categories are ticked -- so
   # that toggling categories doesn't rebuild it (the observer below just
-  # recolours the existing plot in place).
+  # recolours the existing plot in place). Branches on continuous vs categorical.
   umap_base <- reactive({
     req(input$group_var)
     emb <- Embeddings(seu(), "umap")
-    df <- data.frame(
-      UMAP_1 = emb[, 1],
-      UMAP_2 = emb[, 2],
-      group  = as.character(seu()@meta.data[[input$group_var]]),
-      stringsAsFactors = FALSE
-    )
-    df$group[is.na(df$group)] <- "NA"   # un-annotated cells -> explicit "NA" category
+    raw <- seu()@meta.data[[input$group_var]]
     set.seed(1)
-    df <- df[sample(nrow(df)), ]        # fixed interleaved order (avoids category stacking)
-    df$tooltip <- paste0("Group: ", df$group)
+    ord <- sample(nrow(emb))             # fixed interleaved order (avoids stacking)
+    df <- data.frame(UMAP_1 = emb[ord, 1], UMAP_2 = emb[ord, 2], stringsAsFactors = FALSE)
 
-    # Colours must be hex -- plotly.js renders R names like "grey85" as black.
-    cats <- sort(unique(df$group))
-    pal <- scales::hue_pal()(length(cats))
-    names(pal) <- cats
+    if (is_continuous_col(input$group_var)) {
+      v <- suppressWarnings(as.numeric(as.character(raw)))[ord]   # handles numeric stored as text
+      df$value <- v
+      df$tooltip <- paste0(pretty_label(input$group_var), ": ", round(v, 3))
+      return(list(df = df, continuous = TRUE))
+    }
+
+    # Categorical: discrete colours (hex -- plotly.js renders names like "grey85"
+    # as black). NA cells become an explicit "NA" category.
+    g <- as.character(raw)[ord]; g[is.na(g)] <- "NA"
+    df$group <- g
+    df$tooltip <- paste0("Group: ", g)
+    cats <- sort(unique(g))
+    non_na <- setdiff(cats, "NA")
+    pal <- setNames(scales::hue_pal()(length(non_na)), non_na)
     if ("NA" %in% cats) pal[["NA"]] <- "#B3B3B3"   # unassigned cells (grey70)
-
-    list(df = df, cats = cats, palette = pal)
+    list(df = df, continuous = FALSE, cats = cats, palette = pal)
   })
 
   # Given a selection, returns the per-point colours (category colour if shown,
@@ -707,6 +768,49 @@ server <- function(input, output, session) {
   output$umap_plot <- renderPlotly({
     base <- umap_base()
     df <- base$df
+
+    # ---- Continuous column: viridis gradient + a typed Min/Max range. Cells in
+    # range keep the gradient; cells outside go grey. Colour limits are the FULL
+    # data range so a value's colour doesn't shift when you narrow the range. ----
+    if (isTRUE(base$continuous)) {
+      full <- range(df$value, na.rm = TRUE)
+      sel <- input$cont_range
+      lo <- if (is.null(sel)) full[1] else sel[1]
+      hi <- if (is.null(sel)) full[2] else sel[2]
+      in_rng <- !is.na(df$value) & df$value >= lo & df$value <= hi
+      out_df <- df[!in_rng, ]; in_df <- df[in_rng, ]
+
+      p <- plot_ly()
+      if (nrow(out_df) > 0) {
+        p <- add_trace(p, data = out_df, x = ~UMAP_1, y = ~UMAP_2,
+                       type = "scattergl", mode = "markers",
+                       marker = list(size = 3, color = "#E8E8E8"),
+                       text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+      }
+      if (nrow(in_df) > 0) {
+        p <- add_trace(p, data = in_df, x = ~UMAP_1, y = ~UMAP_2,
+                       type = "scattergl", mode = "markers",
+                       marker = list(size = 4, color = ~value, colorscale = "Viridis",
+                                     cmin = full[1], cmax = full[2],
+                                     colorbar = list(title = list(text = pretty_label(input$group_var)),
+                                                     thickness = 15, len = 0.5, outlinewidth = 0)),
+                       text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+      }
+      p <- plotly::layout(
+        p, hovermode = "closest",
+        title = list(text = paste("UMAP colored by", pretty_label(input$group_var)),
+                     x = 0, xanchor = "left",
+                     font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
+        xaxis = list(title = "UMAP_1", zeroline = FALSE, range = umap_range(),
+                     constrain = "domain", constraintoward = "left"),
+        yaxis = list(title = "UMAP_2", zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
+                     constrain = "domain", constraintoward = "top", range = umap_range()),
+        margin = list(l = 50, r = 10, t = 40, b = 40)
+      )
+      return(plotly::config(p, displayModeBar = FALSE))
+    }
+
+    # ---- Categorical column: discrete colours + toggleable legend (below). ----
     # Initial colours reflect the current selection but WITHOUT a reactive
     # dependency on it (isolate) -- the observer below updates them in place.
     cols <- umap_point_cols(base, isolate(input$categories_shown))
@@ -758,6 +862,7 @@ server <- function(input, output, session) {
   observeEvent(input$categories_shown, {
     req(input$group_var)
     base <- umap_base()
+    if (isTRUE(base$continuous)) return()   # gradient mode has no category toggles
     cols <- umap_point_cols(base, input$categories_shown)
     legend_order <- names(sort(table(base$df$group), decreasing = TRUE))
 
@@ -1306,9 +1411,8 @@ server <- function(input, output, session) {
     validate(need(n <= split_max_panels,
                   paste0("That makes ", n, " panels (max ", split_max_panels,
                          "). Pick fewer groups, or a 'Then by' column with fewer categories.")))
-    # When a secondary column is set, use its level count as the column count so
-    # each row is one primary group (cell type) across the secondary (condition).
-    ncol <- if (!is.na(d$ncol_hint)) max(1, d$ncol_hint) else max(1, min(input$split_ncol, n))
+    # "Panels per row" always controls the layout (even with a "Then by" column).
+    ncol <- max(1, min(input$split_ncol, n))
     nrow <- ceiling(n / ncol)
     # Same square-cell sizing as the Gene Expression tab: cell = min(width per
     # column, one viewport height), so plots and colorbar match that tab exactly.
