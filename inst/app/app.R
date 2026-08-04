@@ -102,6 +102,25 @@ zscore <- function(x) {
   (x - mean(x)) / s
 }
 
+# Colour limits for RAW layer values: non-negative layers (counts, data) start at
+# 0; a layer with negatives (scale.data = z-scores) gets a symmetric range so 0
+# maps to white on the blue-white-red scale.
+expr_limits <- function(v) {
+  v <- v[is.finite(v)]
+  if (length(v) == 0) return(c(0, 1))
+  if (min(v) < 0) {
+    lim <- max(abs(v)); if (lim <= 0) lim <- 1
+    c(-lim, lim)
+  } else {
+    hi <- max(v); if (hi <= 0) hi <- 1
+    c(0, hi)
+  }
+}
+
+# Human-readable name for an assay layer.
+layer_label <- function(L) switch(L,
+  data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z)", L)
+
 ui <- fluidPage(
   tags$head(
     tags$style(HTML("
@@ -204,6 +223,15 @@ ui <- fluidPage(
         font-size: 12px; color: #8a8a8a; text-transform: uppercase; letter-spacing: 0.04em;
       }
       .stat-card .stat-value { font-size: 26px; font-weight: 700; color: #1a1a1a; line-height: 1.15; }
+
+      /* Assay / layer info strip */
+      .assay-layer-strip { margin: 0 0 10px; padding: 8px 14px; background: #fafafa;
+        border: 1px solid #e6e6e6; border-radius: 6px; font-size: 13px; color: #555; }
+      .assay-layer-strip .assay-name { font-weight: 600; color: #1a1a1a; margin-right: 2px; }
+      .assay-layer-strip .layer-badge { display: inline-block; padding: 1px 7px; margin: 0 2px;
+        background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 4px;
+        font-size: 11px; color: #2e7d32; font-family: monospace; }
+      .assay-layer-strip .assay-block { display: inline-block; margin-right: 18px; }
 
       /* Make each spinner-wrapped feature plot fill its (square) grid cell */
       #dynamic_feature_plots .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
@@ -339,13 +367,6 @@ server <- function(input, output, session) {
       }
       col
     }
-    # Clusters: for scdrake objects use the clustering column recorded in
-    # @misc$cluster_markers$source_column; otherwise detect a "cluster*" column.
-    clust_col <- NA_character_
-    cm <- seu()@misc$cluster_markers
-    if (!is.null(cm) && "source_column" %in% colnames(cm)) clust_col <- as.character(cm$source_column)[1]
-    if (is.na(clust_col)) clust_col <- pick_col(c("seurat_clusters", "clusters", "cluster"), "cluster")
-    n_clusters <- distinct_of(clust_col)
     n_samples  <- distinct_of(pick_col(c("sample", "orig.ident", "samples", "batch", "donor", "patient"),
                                        "sample|batch|orig\\.ident"))
 
@@ -355,11 +376,23 @@ server <- function(input, output, session) {
           div(class = "stat-label", label),
           div(class = "stat-value", value))
     }
-    div(class = "stat-cards",
-        card("Cells",    fmt(ncol(seu()))),
-        card("Genes",    fmt(nrow(seu()))),
-        card("Clusters", fmt(n_clusters)),
-        card("Samples",  fmt(n_samples)))
+    # Assay / layer inventory
+    all_assays <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
+    assay_layer_info <- lapply(all_assays, function(a) {
+      lyrs <- tryCatch(SeuratObject::Layers(seu()[[a]]), error = function(e) "?")
+      tags$span(class = "assay-block",
+                tags$span(class = "assay-name", paste0(a, ":")),
+                lapply(lyrs, function(l) tags$span(class = "layer-badge", l)))
+    })
+
+    tagList(
+      div(class = "stat-cards",
+          card("Cells",   fmt(ncol(seu()))),
+          card("Genes",   fmt(nrow(seu()))),
+          card("Samples", fmt(n_samples))),
+      div(class = "assay-layer-strip",
+          tags$strong("Assays & layers: "), assay_layer_info)
+    )
   })
 
   # gene_lookup(): maps each gene rowname to a nice display label
@@ -392,25 +425,51 @@ server <- function(input, output, session) {
   })
 
   # found_genes(): the subset of the user-selected genes that actually exist in
-  # the object. shared_upper(): the pooled max expression across those genes,
-  # used by BOTH the individual plots and the single shared colorbar so their
-  # scales match in "Same scale for all genes" mode.
+  # the object. shared_limits(): the pooled value range across those genes (of the
+  # chosen data layer), used by BOTH the individual plots and the single shared
+  # colorbar so their scales match in "Same scale for all genes" mode.
   found_genes <- reactive({
     req(seu(), input$genes)
     input$genes[input$genes %in% rownames(seu())]
   })
 
+  # The selected assay for the Gene Expression tab, defaulting to the object's
+  # DefaultAssay until the input exists.
+  feature_assay_val <- reactive({
+    a <- input$feature_assay
+    all_a <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
+    if (!is.null(a) && a %in% all_a) a else tryCatch(Seurat::DefaultAssay(seu()), error = function(e) all_a[1])
+  })
+
+  # Dynamic layer selector for the Gene Expression tab: updates when assay changes.
+  output$feature_layer_ui <- renderUI({
+    assay_use <- feature_assay_val()
+    req(seu(), assay_use)
+    lyrs <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) "data")
+    layer_order <- intersect(c("data", "counts", "scale.data"), lyrs)
+    if (length(layer_order) == 0) layer_order <- lyrs[1]
+    .ln <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
+    choices <- setNames(layer_order, ifelse(layer_order %in% names(.ln), .ln[layer_order], layer_order))
+    selectInput("feature_layer", "Data layer:", choices = choices, width = "100%")
+  })
+
   # Shared symmetric colour limit for "Same scale for all genes" mode: the max
-  # absolute z-score across the selected genes (each gene z-scored on its own),
-  # so every plot uses the same +/- range centred on 0 (white).
-  shared_upper <- reactive({
+  # The selected data layer for the Gene Expression plots (counts / data /
+  # scale.data), defaulting to "data" until the input exists.
+  feature_layer <- reactive({
+    l <- input$feature_layer
+    if (is.null(l) || !nzchar(l)) "data" else l
+  })
+
+  # Shared colour limits for "Same scale for all genes" mode: the pooled range of
+  # the RAW values (of the chosen layer) across the selected genes.
+  shared_limits <- reactive({
     fg <- found_genes()
     req(length(fg) > 0)
-    m <- as.matrix(GetAssayData(seu(), layer = "data")[fg, , drop = FALSE])  # genes x cells
-    z <- t(apply(m, 1, zscore))                       # z-score each gene (row)
-    lim <- max(abs(z), na.rm = TRUE)
-    if (!is.finite(lim) || lim <= 0) lim <- 1         # guard: no variance
-    as.numeric(lim)
+    assay_use <- feature_assay_val()
+    m <- as.matrix(GetAssayData(seu(), layer = feature_layer(), assay = assay_use)[
+      intersect(fg, rownames(GetAssayData(seu(), layer = feature_layer(), assay = assay_use))), , drop = FALSE])
+    expr_limits(as.vector(m))
   })
 
   # One common square axis window (padded full extent of the UMAP embedding),
@@ -459,6 +518,41 @@ server <- function(input, output, session) {
                          choices = ordered_gene_choices(input$agg_gene_sort), server = TRUE)
   })
 
+  # Assays available for differential expression (FindMarkers).
+  # Excludes 'integrated' (and any assay starting with 'integrated') because DE on
+  # batch-integrated data is statistically invalid (it's batch-reconstructed
+  # and loses true single-cell variance structure; Seurat warns against it).
+  de_assay_choices <- reactive({
+    req(seu())
+    all_a <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
+    valid_a <- all_a[!grepl("^integrated", tolower(all_a))]
+    if (length(valid_a) == 0) valid_a <- all_a
+    valid_a
+  })
+
+  default_de_assay <- reactive({
+    req(seu())
+    def <- tryCatch(Seurat::DefaultAssay(seu()), error = function(e) NULL)
+    choices <- de_assay_choices()
+    if (!is.null(def) && def %in% choices) def else choices[1]
+  })
+
+  gmarker_assay_val <- reactive({
+    if (!is.null(input$gmarker_assay) && input$gmarker_assay %in% de_assay_choices()) {
+      input$gmarker_assay
+    } else {
+      default_de_assay()
+    }
+  })
+
+  gcontrast_assay_val <- reactive({
+    if (!is.null(input$gcontrast_assay) && input$gcontrast_assay %in% de_assay_choices()) {
+      input$gcontrast_assay
+    } else {
+      default_de_assay()
+    }
+  })
+
   # app_body(): builds the whole tabbed UI once data is loaded. The last two
   # tabs (Cluster Markers, Contrasts) are only added when the object carries the
   # matching @misc data, so plain Seurat objects simply won't show them.
@@ -477,27 +571,63 @@ server <- function(input, output, session) {
     # with many distinct values (nCount, nFeature, doublet_score, percent.mt, ...)
     # are excluded, because the UMAP assigns one colour per value and those would
     # produce thousands of categories.
-    # TWEAK: to offer literally EVERY column instead, use `grouping_cols <- all_cols`.
-    # To raise/lower what counts as "categorical", change the 50 below.
-    grouping_cols <- all_cols[vapply(seu()@meta.data, function(x) {
-      is.factor(x) || is.character(x) || is.logical(x) ||
-        (is.numeric(x) && length(unique(x[!is.na(x)])) <= 50)
+    # Grouping columns (Split / Aggregate / Markers / Contrasts) = REAL categories:
+    # factor/character/logical or low-cardinality numeric, and NOT a continuous
+    # column. Capped at `max_categories` distinct values so barcode / cell-name
+    # columns (thousands of levels) are excluded -- they'd make thousands of
+    # panels/heatmap columns and trigger Shiny's "large number of options" warning.
+    # TWEAK: raise/lower max_categories to change what counts as a grouping column.
+    max_categories <- 100
+    grouping_cols <- all_cols[vapply(all_cols, function(col) {
+      x <- seu()@meta.data[[col]]
+      if (is_continuous_col(col)) return(FALSE)                     # a score, not a category
+      (is.factor(x) || is.character(x) || is.logical(x) || is.numeric(x)) &&
+        length(unique(x[!is.na(x)])) <= max_categories
     }, logical(1))]
-    # Friendly, A-Z-sorted labels for the dropdown. Named vector: names are shown,
-    # values (the real column names) are what input$group_var returns.
     grouping_choices <- setNames(grouping_cols, pretty_label(grouping_cols))
     grouping_choices <- grouping_choices[order(names(grouping_choices))]
-    # "Color UMAP by" ALSO offers continuous numerics (nCount, percent.mt, ...) --
-    # those are drawn as a colour gradient (see is_continuous_col / umap_base).
-    # The aggregate / split tabs keep `grouping_choices` (real categories only),
-    # since a continuous column can't be a heatmap column / panel there.
-    color_cols <- all_cols[vapply(seu()@meta.data, function(x) {
-      is.factor(x) || is.character(x) || is.logical(x) || is.numeric(x)
+
+    # "Color UMAP by" = the grouping columns PLUS continuous columns (numeric, or
+    # numeric-like scores) which are drawn as a gradient (see is_continuous_col).
+    # Still excludes huge text columns (barcodes) so the UMAP can't get thousands
+    # of discrete colours.
+    color_cols <- all_cols[vapply(all_cols, function(col) {
+      x <- seu()@meta.data[[col]]
+      if (is_continuous_col(col)) return(TRUE)                      # gradient
+      (is.factor(x) || is.character(x) || is.logical(x) || is.numeric(x)) &&
+        length(unique(x[!is.na(x)])) <= max_categories
     }, logical(1))]
     color_choices <- setNames(color_cols, pretty_label(color_cols))
     color_choices <- color_choices[order(names(color_choices))]
+
+    # Clustering / resolution columns (e.g. SCT_snn_res.0.1, integrated_snn_res.0.5,
+    # seurat_clusters, final_clusters) -> a tidy "Resolution" quick-pick that shows
+    # the resolution + cluster count and just colours the UMAP by that column.
+    clust_cols <- grep("snn_res|_res\\.[0-9]|cluster", all_cols, ignore.case = TRUE, value = TRUE)
+    res_label <- function(col) {
+      n <- length(unique(seu()@meta.data[[col]][!is.na(seu()@meta.data[[col]])]))
+      m <- regmatches(col, regexpr("snn_res\\.[0-9.]+$", col))
+      if (length(m) && nzchar(m)) {
+        assay <- sub("_snn_res\\..*$", "", col)
+        resv  <- sub(".*snn_res\\.", "", col)
+        paste0(assay, " · res ", resv, " (", n, " clusters)")
+      } else {
+        paste0(pretty_label(col), " (", n, " clusters)")
+      }
+    }
+    res_choices <- if (length(clust_cols)) setNames(clust_cols, vapply(clust_cols, res_label, character(1))) else character(0)
+
+    # Assay layers present (counts / data / scale.data) for the Gene Expression
+    # "Data layer" toggle -- view raw values before/after normalization.
+    # All assays (for the Gene Expression assay selector).
+    all_assays_ge <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
+    def_assay_ge <- tryCatch(Seurat::DefaultAssay(seu()), error = function(e) all_assays_ge[1])
+
     has_markers <- !is.null(seu()@misc$cluster_markers)
     has_contrasts <- !is.null(seu()@misc$contrasts)
+
+    de_assays <- de_assay_choices()
+    def_de_assay <- default_de_assay()
 
     # DE tests offered by the generic (scdrake-free) Markers/Contrasts tabs.
     # All built into Seurat and fast enough to auto-compute. (poisson uses raw
@@ -514,6 +644,8 @@ server <- function(input, output, session) {
         "Clusters / Metadata",
         sidebarLayout(
           sidebarPanel(
+            if (length(res_choices) > 0)
+              selectInput("resolution_pick", "Resolution / clustering:", choices = res_choices),
             selectInput("group_var", "Color UMAP by:", choices = color_choices),
             uiOutput("category_filter_ui")
           ),
@@ -529,16 +661,27 @@ server <- function(input, output, session) {
         "Gene Expression",
         wellPanel(
           fluidRow(
+            column(3, radioButtons("compare_mode", "Compare:",
+                                   choices = c("Genes (in one data layer)" = "genes",
+                                               "One gene across data layers" = "layers"),
+                                   selected = "genes", inline = FALSE)),
+            if (length(all_assays_ge) > 1)
+              column(2, selectInput("feature_assay", "Assay:", choices = all_assays_ge,
+                                    selected = def_assay_ge, width = "100%")),
             column(3, selectInput("gene_sort", "Sort genes by:", width = "100%",
                                   choices = c("Alphabetical", "Highest average expression", "Lowest average expression"))),
-            column(3, selectizeInput("genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
-                                     options = list(placeholder = "Type one or more gene symbols..."))),
+            column(if (length(all_assays_ge) > 1) 4 else 6, selectizeInput("genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
+                                     options = list(placeholder = "Type one or more gene symbols...")))
+          ),
+          fluidRow(
+            column(3, uiOutput("feature_layer_ui")),
             # TWEAK: default / allowed plots-per-row for the Gene Expression grid.
             column(2, numericInput("feature_ncol", "Plots per row:", value = 2, min = 1, max = 4, width = "100%")),
-            column(4, radioButtons("scale_mode", "Color scale:",
+            column(7, radioButtons("scale_mode", "Color scale:",
                                    choices = c("Same scale for all genes (comparable)" = "shared",
                                                "Scale adjusted per gene (all clearly visible)" = "per_gene"),
-                                   selected = "shared"))
+                                   selected = "shared")),
+            column(12, helpText("In \"One gene across data layers\" mode the FIRST selected gene is shown in each layer (counts / normalized / scaled) side by side; Data layer & Color scale are ignored."))
           )
         ),
         div(style = "width: 100%; display: flex; justify-content: center;",
@@ -571,12 +714,19 @@ server <- function(input, output, session) {
         "Cluster Markers",
         wellPanel(
           fluidRow(
-            column(3, selectInput("gmarker_group", "Grouping column:", choices = grouping_choices, width = "100%")),
-            column(3, uiOutput("gmarker_cluster_ui")),
-            column(3, selectInput("gmarker_test", "Test type:", choices = de_test_choices, width = "100%")),
-            column(3, textInput("gmarker_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
+            column(2, selectInput("gmarker_group", "Grouping column:", choices = grouping_choices, width = "100%")),
+            if (length(de_assays) > 1)
+              column(2, selectInput("gmarker_assay", "Assay:", choices = de_assays, selected = def_de_assay, width = "100%")),
+            column(2, uiOutput("gmarker_layer_ui")),
+            column(2, uiOutput("gmarker_cluster_ui")),
+            column(2, selectInput("gmarker_test", "Test type:", choices = de_test_choices, width = "100%")),
+            column(2, textInput("gmarker_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
           ),
-          helpText("Markers of the chosen group vs all other cells. Computed automatically.")
+          helpText(
+            "Markers of the chosen group vs all other cells. Computed automatically.",
+            if (length(de_assays) > 1) " 'integrated' is excluded because DE on batch-corrected values is statistically invalid.",
+            " Layer: 'data' = log-normalized (default for most tests); 'counts' = raw (used by count-based tests like Poisson)."
+          )
         ),
         withSpinner(DTOutput("gmarker_table"), caption = "Computing markers...", color = "#39FF14")
       )))
@@ -605,13 +755,20 @@ server <- function(input, output, session) {
         "Contrasts",
         wellPanel(
           fluidRow(
-            column(3, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
+            column(2, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
+            if (length(de_assays) > 1)
+              column(2, selectInput("gcontrast_assay", "Assay:", choices = de_assays, selected = def_de_assay, width = "100%")),
+            column(2, uiOutput("gcontrast_layer_ui")),
             column(2, uiOutput("gcontrast_target_ui")),
             column(2, uiOutput("gcontrast_reference_ui")),
             column(2, selectInput("gcontrast_test", "Test type:", choices = de_test_choices, width = "100%")),
-            column(3, textInput("gcontrast_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
+            column(if (length(de_assays) > 1) 2 else 4, textInput("gcontrast_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
           ),
-          helpText("Differential expression, target vs reference group. Computed automatically.")
+          helpText(
+            "Differential expression, target vs reference group. Computed automatically.",
+            if (length(de_assays) > 1) " 'integrated' is excluded because DE on batch-corrected values is statistically invalid.",
+            " Layer: 'data' = log-normalized (default for most tests); 'counts' = raw (used by count-based tests like Poisson)."
+          )
         ),
         withSpinner(DTOutput("gcontrast_table"), caption = "Computing contrast...", color = "#39FF14")
       )))
@@ -672,6 +829,13 @@ server <- function(input, output, session) {
     do.call(tabsetPanel, tabs)
   })
 
+  # Resolution quick-pick -> colour the UMAP by that clustering column (updates
+  # "Color UMAP by"). ignoreInit so it doesn't override the default on load.
+  observeEvent(input$resolution_pick, {
+    req(input$resolution_pick)
+    updateSelectInput(session, "group_var", selected = input$resolution_pick)
+  }, ignoreInit = TRUE)
+
   # The per-category show/hide checkboxes under "Color UMAP by". Rebuilt every
   # time the colouring column changes; NA (unlabelled) cells become an "NA" box.
   output$category_filter_ui <- renderUI({
@@ -681,12 +845,13 @@ server <- function(input, output, session) {
     if (is_continuous_col(input$group_var)) {
       x <- suppressWarnings(as.numeric(as.character(seu()@meta.data[[input$group_var]])))
       rng <- range(x, na.rm = TRUE)
-      step <- signif(diff(rng) / 200, 2)
+      step <- signif(diff(rng) / 100, 2)
       return(tagList(
-        helpText("Drag to keep only cells whose value is in this range (others go grey):"),
-        sliderInput("cont_range", "Value range:",
-                    min = floor(rng[1] / step) * step, max = ceiling(rng[2] / step) * step,
-                    value = c(rng[1], rng[2]), step = step, width = "100%")
+        helpText("Type a value range to keep (others go grey); press Tab/Enter to apply:"),
+        fluidRow(
+          column(6, numericInput("cont_min", "Min:", value = rng[1], step = step)),
+          column(6, numericInput("cont_max", "Max:", value = rng[2], step = step))
+        )
       ))
     }
     vals <- as.character(seu()@meta.data[[input$group_var]])
@@ -774,9 +939,8 @@ server <- function(input, output, session) {
     # data range so a value's colour doesn't shift when you narrow the range. ----
     if (isTRUE(base$continuous)) {
       full <- range(df$value, na.rm = TRUE)
-      sel <- input$cont_range
-      lo <- if (is.null(sel)) full[1] else sel[1]
-      hi <- if (is.null(sel)) full[2] else sel[2]
+      lo <- if (is.null(input$cont_min) || is.na(input$cont_min)) full[1] else input$cont_min
+      hi <- if (is.null(input$cont_max) || is.na(input$cont_max)) full[2] else input$cont_max
       in_rng <- !is.na(df$value) & df$value >= lo & df$value <= hi
       out_df <- df[!in_rng, ]; in_df <- df[in_rng, ]
 
@@ -883,14 +1047,15 @@ server <- function(input, output, session) {
   # plotly's equal-scale axes render correctly, single plot included), and the
   # height term keeps the whole grid on screen -- 4 plots fit without scrolling.
   output$dynamic_feature_plots <- renderUI({
-    req(input$genes)
-    found <- input$genes[input$genes %in% rownames(seu())]
-    if (length(found) == 0) return(NULL)
+    n <- length(plot_specs())
+    if (n == 0) return(NULL)
 
-    n <- length(found)
+    # "layers" mode = one gene per layer, each with its own scale, so no single
+    # shared colorbar. Otherwise the shared colorbar shows in "same scale" mode.
+    layers_mode <- identical(input$compare_mode, "layers")
+    shared <- !layers_mode && identical(input$scale_mode, "shared")
     ncol <- max(1, min(input$feature_ncol, n))
     nrow <- ceiling(n / ncol)
-    shared <- identical(input$scale_mode, "shared")
 
     # TWEAK: these offsets tune the (fixed) square plot size. If plots feel too
     # small/large, adjust side_offset (horizontal) or top_offset (the height cap).
@@ -946,19 +1111,20 @@ server <- function(input, output, session) {
   # Single shared colorbar, shown to the right of the grid in "shared" scale mode
   output$shared_colorbar <- renderPlotly({
     req(identical(input$scale_mode, "shared"))
-    lim <- shared_upper()
+    lims <- shared_limits()
+    lab <- switch(feature_layer(), counts = "Counts", scale.data = "Scaled (z)", "Expression")
     plot_ly(
       x = c(0, 0), y = c(0, 1),
       type = "scatter", mode = "markers",
       marker = list(
-        color = c(-lim, lim),
+        color = c(lims[1], lims[2]),
         # TWEAK: keep this gradient identical to the per-plot one above so the
-        # shared colorbar matches the points (blue -/ white 0 / red +).
+        # shared colorbar matches the points.
         colorscale = EXPR_COLORSCALE,   # blue -> white -> red (see EXPR_COLORSCALE)
-        cmin = -lim, cmax = lim,                               # symmetric -> 0 is white
+        cmin = lims[1], cmax = lims[2],
         opacity = 0,                                           # hide the dummy points
         showscale = TRUE,
-        colorbar = list(title = list(text = "Expression"), thickness = 15,
+        colorbar = list(title = list(text = lab), thickness = 15,
                         len = 0.5, outlinewidth = 0)
       )
     ) %>%
@@ -980,54 +1146,79 @@ server <- function(input, output, session) {
   # ---------------------------------------------------------------------------
   max_plots <- 50
 
-  # One value-stable reactive per plot slot, returning the gene assigned to that
-  # slot (or NA when unused). Because each returns a single value, adding a gene
-  # only changes the NEW slot -- existing slots return the same gene, so their
-  # plots are NOT invalidated and keep their cached render (only the added plot
-  # renders). Depending on input$genes directly, as before, re-ran ALL of them.
-  slot_gene <- lapply(1:max_plots, function(i) {
+  # Assay layers present, in a preferred order (data, counts, scale.data).
+  # Now respects the Gene Expression assay selector.
+  available_layers <- reactive({
+    assay_use <- feature_assay_val()
+    al <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) NULL)
+    if (is.null(al) || length(al) == 0) al <- "data"
+    lo <- intersect(c("data", "counts", "scale.data"), al)
+    if (length(lo) == 0) lo <- al[1]
+    lo
+  })
+
+  # What each plot slot should show: a list of {gene, layer, title}.
+  #  * "genes" mode  -> one plot per selected gene, all in the chosen layer.
+  #  * "layers" mode -> one plot per available layer, all of the FIRST gene.
+  plot_specs <- reactive({
+    fg <- found_genes()
+    req(length(fg) > 0)
+    if (identical(input$compare_mode, "layers")) {
+      g <- fg[[1]]
+      lapply(available_layers(), function(L)
+        list(gene = g, layer = L, title = paste0(g, " · ", layer_label(L))))
+    } else {
+      layer <- feature_layer()
+      lapply(fg, function(g) list(gene = g, layer = layer, title = g))
+    }
+  })
+
+  # One value-stable reactive per plot slot (adding a gene only invalidates the
+  # NEW slot -- existing slots return the same spec, so their render is cached).
+  slot_spec <- lapply(1:max_plots, function(i) {
     force(i)
     reactive({
-      fg <- found_genes()
-      if (i <= length(fg)) fg[[i]] else NA_character_
+      ps <- plot_specs()
+      if (i <= length(ps)) ps[[i]] else NULL
     })
   })
 
   lapply(1:max_plots, function(i) {
     force(i)
     output[[paste0("feature_plot_individual_", i)]] <- renderPlotly({
-      g <- slot_gene[[i]]()
-      req(!is.na(g))
+      spec <- slot_spec[[i]]()
+      req(!is.null(spec))
+      g <- spec$gene; layer <- spec$layer
 
       umap_coords <- Embeddings(seu(), "umap")
-      # Fetch ONLY this slot's gene, so the plot depends on `g` alone (not the
-      # whole gene list) -- adding another gene won't invalidate this plot.
-      # GetAssayData(layer="data")[g, ] is faster than FetchData for one gene.
-      # z-scored expression (centre 0, unit sd) so the diverging blue-white-red
-      # scale reads as -/+ around the mean, like a scaled-expression plot.
+      # RAW values of the slot's layer (counts / data / scale.data) -- no z-scoring,
+      # so you literally see the layer's values (e.g. before vs after normalization).
+      assay_use <- feature_assay_val()
+      lmat <- GetAssayData(seu(), layer = layer, assay = assay_use)
+      validate(need(g %in% rownames(lmat),
+                    paste0(g, " is not present in the '", layer, "' layer of assay '", assay_use, "'.")))
       plot_df <- data.frame(
         UMAP_1 = umap_coords[, 1],
         UMAP_2 = umap_coords[, 2],
-        expression = zscore(as.numeric(GetAssayData(seu(), layer = "data")[g, ])),
+        expression = as.numeric(lmat[g, ]),
         check.names = FALSE
       )
 
-      # Symmetric colour limit so 0 maps to white. Shared mode uses the pooled
-      # max |z| across selected genes; per-gene mode uses this gene's max |z|.
-      if (input$scale_mode == "shared") {
-        lim <- shared_upper()
+      # Colour limits. In "layers" mode each panel is a DIFFERENT layer (different
+      # scale), so every panel gets its own scale + colorbar. Otherwise: shared
+      # across genes (one colorbar) or per-gene. expr_limits() = 0..max, or a
+      # symmetric range for scale.data (which has negatives).
+      layers_mode <- identical(input$compare_mode, "layers")
+      if (!layers_mode && identical(input$scale_mode, "shared")) {
+        lims <- shared_limits(); show_bar <- FALSE
       } else {
-        lim <- max(abs(plot_df$expression), na.rm = TRUE)
-        if (!is.finite(lim) || lim <= 0) lim <- 1        # guard: no variance
+        lims <- expr_limits(plot_df$expression); show_bar <- TRUE
       }
 
-      # Draw low-expression points first so high-expression ones sit on top.
+      # Draw low-value points first so high-value ones sit on top.
       plot_df <- plot_df[order(plot_df$expression), ]
-      plot_df$tooltip <- paste0("Gene: ", g, "<br>Expression: ", round(plot_df$expression, 3))
-
-      # Per-gene mode shows each plot's own colorbar; shared mode uses the single
-      # shared colorbar to the right of the grid, so hide the per-plot one.
-      show_bar <- input$scale_mode != "shared"
+      lab <- switch(layer, counts = "Counts", scale.data = "Scaled (z)", "Expression")
+      plot_df$tooltip <- paste0("Gene: ", g, "<br>", lab, ": ", round(plot_df$expression, 3))
 
       p <- plot_ly(
         plot_df, x = ~UMAP_1, y = ~UMAP_2,
@@ -1036,9 +1227,9 @@ server <- function(input, output, session) {
           size = 4,                                              # TWEAK: gene-expression point size
           color = ~expression,
           colorscale = EXPR_COLORSCALE,   # TWEAK: edit EXPR_COLORSCALE near the top
-          cmin = -lim, cmax = lim,                               # symmetric -> 0 is white
+          cmin = lims[1], cmax = lims[2],
           showscale = show_bar,
-          colorbar = list(title = list(text = "Expression"), thickness = 15, len = 0.5, outlinewidth = 0)
+          colorbar = list(title = list(text = lab), thickness = 15, len = 0.5, outlinewidth = 0)
         ),
         text = ~tooltip, hoverinfo = "text"
       )
@@ -1047,7 +1238,7 @@ server <- function(input, output, session) {
       # chrome, left-aligned title (matching font/size).
       p <- plotly::layout(
         p,
-        title = list(text = g, x = 0, xanchor = "left",
+        title = list(text = spec$title, x = 0, xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
         xaxis = list(title = "UMAP_1", zeroline = FALSE, showline = FALSE, ticks = "",
                      range = umap_range(), constrain = "domain", constraintoward = "left"),
@@ -1248,16 +1439,87 @@ server <- function(input, output, session) {
 
   # Auto-computes whenever the grouping column or group changes (cached until
   # then, so editing the search box only re-filters -- no recompute).
+  # Helper: prepare a Seurat object for FindMarkers on a given assay.
+  # Sets the default assay, joins split layers (Seurat v5 integration creates
+  # per-sample layers like counts.1/data.1 that must be merged before DE),
+  # normalizes if a 'data' layer is missing (e.g. RNA assay that was never
+  # NormalizeData'd -- common in SCT-only integration pipelines), and runs
+  # PrepSCTFindMarkers when SCT is chosen.
+  prepare_obj_for_de <- function(obj, assay_use) {
+    Seurat::DefaultAssay(obj) <- assay_use
+    # Seurat v5: join split layers (counts.1, data.1, ...) into single matrices.
+    if (exists("JoinLayers", where = asNamespace("SeuratObject"))) {
+      obj[[assay_use]] <- tryCatch(
+        suppressWarnings(SeuratObject::JoinLayers(obj[[assay_use]])),
+        error = function(e) obj[[assay_use]]
+      )
+    }
+    # If the assay has no 'data' layer (only raw counts), log-normalize on the
+    # fly so FindMarkers can use slot = "data".  This is fast (~seconds) and
+    # won't touch SCT (which already has a data layer).
+    avail <- tryCatch(SeuratObject::Layers(obj[[assay_use]]), error = function(e) character(0))
+    if (!"data" %in% avail && "counts" %in% avail) {
+      obj <- tryCatch(
+        suppressWarnings(Seurat::NormalizeData(obj, assay = assay_use, verbose = FALSE)),
+        error = function(e) obj
+      )
+    }
+    if (identical(assay_use, "SCT")) {
+      obj <- tryCatch(
+        suppressWarnings(Seurat::PrepSCTFindMarkers(obj, assay = "SCT", verbose = FALSE)),
+        error = function(e) obj
+      )
+    }
+    obj
+  }
+
+  # Dynamic layer selectors: show layers available for the chosen assay.
+  # The .layer_names lookup gives friendly labels.
+  .layer_names <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
+
+  output$gmarker_layer_ui <- renderUI({
+    assay_use <- gmarker_assay_val()
+    req(seu(), assay_use)
+    lyrs <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) "data")
+    layer_order <- intersect(c("data", "counts", "scale.data"), lyrs)
+    if (length(layer_order) == 0) layer_order <- lyrs[1]
+    choices <- setNames(layer_order,
+                        ifelse(layer_order %in% names(.layer_names), .layer_names[layer_order], layer_order))
+    selectInput("gmarker_layer", "Data layer:", choices = choices, width = "100%")
+  })
+
+  output$gcontrast_layer_ui <- renderUI({
+    assay_use <- gcontrast_assay_val()
+    req(seu(), assay_use)
+    lyrs <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) "data")
+    layer_order <- intersect(c("data", "counts", "scale.data"), lyrs)
+    if (length(layer_order) == 0) layer_order <- lyrs[1]
+    choices <- setNames(layer_order,
+                        ifelse(layer_order %in% names(.layer_names), .layer_names[layer_order], layer_order))
+    selectInput("gcontrast_layer", "Data layer:", choices = choices, width = "100%")
+  })
+
   gmarker_res <- reactive({
     req(seu(), input$gmarker_group, input$gmarker_cluster, input$gmarker_test)
-    # negbinom/poisson/DESeq2 are count-based; the rest use the "data" layer.
-    slot <- if (input$gmarker_test %in% c("negbinom", "poisson", "DESeq2")) "counts" else "data"
+    assay_use <- gmarker_assay_val()
+    req(assay_use)
+
+    obj <- prepare_obj_for_de(seu(), assay_use)
+
+    # Use the user-chosen layer, falling back to auto-detection by test type.
+    slot <- if (!is.null(input$gmarker_layer) && nzchar(input$gmarker_layer)) {
+      input$gmarker_layer
+    } else if (input$gmarker_test %in% c("negbinom", "poisson", "DESeq2")) {
+      "counts"
+    } else {
+      "data"
+    }
     tryCatch(
       # suppressWarnings: some tests (e.g. negbinom) emit one benign per-gene
       # convergence warning each -- hundreds of lines. Errors are still caught.
       suppressWarnings(
-        Seurat::FindMarkers(seu(), ident.1 = input$gmarker_cluster, group.by = input$gmarker_group,
-                            test.use = input$gmarker_test, slot = slot)
+        Seurat::FindMarkers(obj, ident.1 = input$gmarker_cluster, group.by = input$gmarker_group,
+                            test.use = input$gmarker_test, slot = slot, assay = assay_use)
       ),
       error = function(e) e
     )
@@ -1289,14 +1551,26 @@ server <- function(input, output, session) {
   gcontrast_res <- reactive({
     req(seu(), input$gcontrast_group, input$gcontrast_target, input$gcontrast_reference, input$gcontrast_test)
     validate(need(input$gcontrast_target != input$gcontrast_reference, "Pick two different groups."))
-    slot <- if (input$gcontrast_test %in% c("negbinom", "poisson", "DESeq2")) "counts" else "data"
+    assay_use <- gcontrast_assay_val()
+    req(assay_use)
+
+    obj <- prepare_obj_for_de(seu(), assay_use)
+
+    # Use the user-chosen layer, falling back to auto-detection by test type.
+    slot <- if (!is.null(input$gcontrast_layer) && nzchar(input$gcontrast_layer)) {
+      input$gcontrast_layer
+    } else if (input$gcontrast_test %in% c("negbinom", "poisson", "DESeq2")) {
+      "counts"
+    } else {
+      "data"
+    }
     tryCatch(
       # suppressWarnings: silence the benign per-gene convergence notes (e.g.
       # negbinom's theta.ml "iteration limit reached"). Errors still caught.
       suppressWarnings(
-        Seurat::FindMarkers(seu(), ident.1 = input$gcontrast_target,
+        Seurat::FindMarkers(obj, ident.1 = input$gcontrast_target,
                             ident.2 = input$gcontrast_reference, group.by = input$gcontrast_group,
-                            test.use = input$gcontrast_test, slot = slot)
+                            test.use = input$gcontrast_test, slot = slot, assay = assay_use)
       ),
       error = function(e) e
     )
