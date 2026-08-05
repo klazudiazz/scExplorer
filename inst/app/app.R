@@ -93,15 +93,6 @@ EXPR_COLORSCALE <- list(
   c(1.00, "#B40426")    # high - red
 )
 
-# z-score a numeric vector (per-gene scaling: centre at 0, unit sd). Returned as
-# all-zero when the gene has no variance, so the plot stays white rather than NaN.
-# Expression plots colour by this so 0 = white, negative = blue, positive = red.
-zscore <- function(x) {
-  s <- stats::sd(x)
-  if (!is.finite(s) || s == 0) return(rep(0, length(x)))
-  (x - mean(x)) / s
-}
-
 # Colour limits for RAW layer values: non-negative layers (counts, data) start at
 # 0; a layer with negatives (scale.data = z-scores) gets a symmetric range so 0
 # maps to white on the blue-white-red scale.
@@ -199,18 +190,6 @@ ui <- fluidPage(
       .nav-tabs > li > a:hover { color: #2ecc0f; }
       .btn-default:hover, .btn-default:focus { border-color: #39FF14; color: #2ecc0f; }
       .selectize-control.single .selectize-input.focus { border-color: #39FF14 !important; box-shadow: 0 0 0 1px #39FF14; }
-
-      /* Green range slider (ionRangeSlider) to match the theme, instead of blue */
-      .irs--shiny .irs-bar { background: #39FF14; }
-      .irs--shiny .irs-handle { border-color: #39FF14; }
-      .irs--shiny .irs-from, .irs--shiny .irs-to, .irs--shiny .irs-single { background-color: #39FF14; color: #1a1a1a; }
-      .irs--shiny .irs-from:before, .irs--shiny .irs-to:before, .irs--shiny .irs-single:before { border-top-color: #39FF14; }
-      /* Hide the floating grey min/max labels (they detach when you drag a handle);
-         the axis grid below already labels the ends, including 0 at the start. */
-      .irs--shiny .irs-min, .irs--shiny .irs-max, .irs-min, .irs-max { display: none !important; }
-      /* fallback for older ion.rangeSlider markup */
-      .irs-bar, .irs-bar-edge { background: #39FF14 !important; border-color: #39FF14 !important; }
-      .irs-single, .irs-from, .irs-to { background: #39FF14 !important; color: #1a1a1a !important; }
 
       /* Summary stat cards (Cells / Genes / Clusters / Samples) */
       .stat-cards { display: flex; gap: 12px; flex-wrap: wrap; margin: 6px 0 14px; }
@@ -467,17 +446,23 @@ server <- function(input, output, session) {
     fg <- found_genes()
     req(length(fg) > 0)
     assay_use <- feature_assay_val()
-    m <- as.matrix(GetAssayData(seu(), layer = feature_layer(), assay = assay_use)[
-      intersect(fg, rownames(GetAssayData(seu(), layer = feature_layer(), assay = assay_use))), , drop = FALSE])
+    lmat <- GetAssayData(seu(), layer = feature_layer(), assay = assay_use)   # fetch once
+    m <- as.matrix(lmat[intersect(fg, rownames(lmat)), , drop = FALSE])
     expr_limits(as.vector(m))
+  })
+
+  # Memoised UMAP embedding matrix -- every plot pulls from this one reactive
+  # instead of re-extracting Embeddings(seu(), "umap") on each render.
+  umap_emb <- reactive({
+    req(seu())
+    Embeddings(seu(), "umap")
   })
 
   # One common square axis window (padded full extent of the UMAP embedding),
   # applied to BOTH axes of EVERY plot so all UMAPs are framed identically with
   # the same x/y range and scale.
   umap_range <- reactive({
-    req(seu())
-    emb <- Embeddings(seu(), "umap")[, 1:2]
+    emb <- umap_emb()[, 1:2]
     r <- range(emb, na.rm = TRUE)
     pad <- diff(r) * 0.03
     c(r[1] - pad, r[2] + pad)
@@ -787,11 +772,21 @@ server <- function(input, output, session) {
                                 choices = grouping_choices, width = "100%")),
           column(3, selectInput("agg_gene_sort", "Sort genes by:", width = "100%",
                                 choices = c("Alphabetical", "Highest average expression", "Lowest average expression"))),
-          column(4, selectizeInput("agg_genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
-                                   options = list(placeholder = "Type one or more gene symbols..."))),
-          column(2, radioButtons("agg_fun", "Summary per group:",
+          column(6, selectizeInput("agg_genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
+                                   options = list(placeholder = "Type one or more gene symbols...")))
+        ),
+        fluidRow(
+          # Assay selector (only when the object has >1 assay -- stays generic for
+          # single-assay objects), plus a layer selector that updates with the assay.
+          # Same pattern as the Gene Expression tab: aggregate the RAW values of the
+          # chosen assay/layer (counts / data / scale.data).
+          if (length(all_assays_ge) > 1)
+            column(2, selectInput("agg_assay", "Assay:", choices = all_assays_ge,
+                                  selected = def_assay_ge, width = "100%")),
+          column(3, uiOutput("agg_layer_ui")),
+          column(if (length(all_assays_ge) > 1) 4 else 6, radioButtons("agg_fun", "Summary per group:",
                                  choices = c("Mean" = "mean", "Sum" = "sum", "Median" = "median"),
-                                 selected = "mean"))
+                                 selected = "mean", inline = TRUE))
         )
       ),
       withSpinner(plotlyOutput("agg_heatmap", height = "600px"),
@@ -819,9 +814,18 @@ server <- function(input, output, session) {
                                    options = list(placeholder = "Type a gene symbol..."))),
           column(2, numericInput("split_ncol", "Panels per row:", value = 3, min = 1, max = 5, width = "100%"))
         ),
+        fluidRow(
+          # Assay + data-layer selectors (same pattern as Gene Expression). Panels
+          # show the RAW values of the chosen assay/layer -- consistent with the
+          # Gene Expression tab (no app-side z-scoring).
+          if (length(all_assays_ge) > 1)
+            column(2, selectInput("split_assay", "Assay:", choices = all_assays_ge,
+                                  selected = def_assay_ge, width = "100%")),
+          column(3, uiOutput("split_layer_ui"))
+        ),
         uiOutput("split_levels_ui"),
         uiOutput("split_levels2_ui"),
-        helpText("One panel per selected group. Optionally split again by a second column (e.g. cell type then condition) to get a grid - then pick which of its groups to show too. Panels are coloured by the gene's expression (shared scale).")
+        helpText("One panel per selected group. Optionally split again by a second column (e.g. cell type then condition) to get a grid - then pick which of its groups to show too. Panels are coloured by the gene's expression on a shared scale (raw values of the selected data layer).")
       ),
       uiOutput("split_plots")
     )))
@@ -893,7 +897,7 @@ server <- function(input, output, session) {
   # recolours the existing plot in place). Branches on continuous vs categorical.
   umap_base <- reactive({
     req(input$group_var)
-    emb <- Embeddings(seu(), "umap")
+    emb <- umap_emb()
     raw <- seu()@meta.data[[input$group_var]]
     set.seed(1)
     ord <- sample(nrow(emb))             # fixed interleaved order (avoids stacking)
@@ -1190,7 +1194,7 @@ server <- function(input, output, session) {
       req(!is.null(spec))
       g <- spec$gene; layer <- spec$layer
 
-      umap_coords <- Embeddings(seu(), "umap")
+      umap_coords <- umap_emb()
       # RAW values of the slot's layer (counts / data / scale.data) -- no z-scoring,
       # so you literally see the layer's values (e.g. before vs after normalization).
       assay_use <- feature_assay_val()
@@ -1218,8 +1222,10 @@ server <- function(input, output, session) {
       # Draw low-value points first so high-value ones sit on top.
       plot_df <- plot_df[order(plot_df$expression), ]
       lab <- switch(layer, counts = "Counts", scale.data = "Scaled (z)", "Expression")
-      plot_df$tooltip <- paste0("Gene: ", g, "<br>", lab, ": ", round(plot_df$expression, 3))
 
+      # Hover reads the value straight from marker.color (the expression already
+      # sent to plotly) via hovertemplate -- so we DON'T ship a second ~19k-element
+      # per-cell tooltip string array to the browser for every gene panel.
       p <- plot_ly(
         plot_df, x = ~UMAP_1, y = ~UMAP_2,
         type = "scattergl", mode = "markers",
@@ -1231,7 +1237,7 @@ server <- function(input, output, session) {
           showscale = show_bar,
           colorbar = list(title = list(text = lab), thickness = 15, len = 0.5, outlinewidth = 0)
         ),
-        text = ~tooltip, hoverinfo = "text"
+        hovertemplate = paste0("Gene: ", g, "<br>", lab, ": %{marker.color:.3f}<extra></extra>")
       )
 
       # Same framing as the Clusters/Metadata UMAP: fixed square window, no tick
@@ -1259,15 +1265,50 @@ server <- function(input, output, session) {
   # and a table.
   # ===========================================================================
 
-  # agg_matrix(): the genes x group-levels matrix of aggregated expression.
+  # The selected assay for the Aggregated tab, defaulting to DefaultAssay until
+  # the input exists. Same shape as feature_assay_val() for Gene Expression.
+  agg_assay_val <- reactive({
+    a <- input$agg_assay
+    all_a <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
+    if (!is.null(a) && a %in% all_a) a else tryCatch(Seurat::DefaultAssay(seu()), error = function(e) all_a[1])
+  })
+
+  # Dynamic layer selector for the Aggregated tab: shows only the layers present
+  # in the selected assay, updating when the assay changes.
+  output$agg_layer_ui <- renderUI({
+    assay_use <- agg_assay_val()
+    req(seu(), assay_use)
+    lyrs <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) "data")
+    layer_order <- intersect(c("data", "counts", "scale.data"), lyrs)
+    if (length(layer_order) == 0) layer_order <- lyrs[1]
+    .ln <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
+    choices <- setNames(layer_order, ifelse(layer_order %in% names(.ln), .ln[layer_order], layer_order))
+    selectInput("agg_layer", "Data layer:", choices = choices, width = "100%")
+  })
+
+  # The selected data layer, defaulting to "data" until the input renders.
+  agg_layer <- reactive({
+    l <- input$agg_layer
+    if (is.null(l) || !nzchar(l)) "data" else l
+  })
+
+  # agg_matrix(): the genes x group-levels matrix of aggregated expression, using
+  # the RAW values of the chosen assay/layer (no app-side z-scoring).
   agg_matrix <- reactive({
     req(input$agg_group_var)
     validate(need(length(input$agg_genes) > 0, "Select one or more genes to aggregate."))
-    genes <- input$agg_genes[input$agg_genes %in% rownames(seu())]
-    validate(need(length(genes) > 0, "None of the selected genes are in this object."))
+    assay_use <- agg_assay_val()
+    layer_use <- agg_layer()
+    full <- GetAssayData(seu(), layer = layer_use, assay = assay_use)   # genes x cells
+    # Filter against the chosen layer's genes: scale.data only holds variable
+    # features, so some picked genes may legitimately be absent there.
+    genes <- input$agg_genes[input$agg_genes %in% rownames(full)]
+    validate(need(length(genes) > 0,
+                  paste0("None of the selected genes are in the '", layer_use,
+                         "' layer of assay '", assay_use, "'.")))
 
     fun <- switch(input$agg_fun, sum = sum, median = stats::median, mean)
-    expr <- FetchData(seu(), vars = genes)                 # cells x genes (data layer)
+    expr_mat <- as.matrix(full[genes, , drop = FALSE])     # genes x cells (chosen layer)
     grp <- as.character(seu()@meta.data[[input$agg_group_var]])
     grp[is.na(grp)] <- "NA"                                # un-annotated cells -> "NA" group
     groups <- sort(unique(grp))
@@ -1276,7 +1317,7 @@ server <- function(input, output, session) {
                   dimnames = list(genes, groups))
     # tapply groups once per gene (vs subsetting per gene x group in a nested loop).
     for (g in genes) {
-      agg_vals <- tapply(expr[[g]], grp, fun)
+      agg_vals <- tapply(expr_mat[g, ], grp, fun)
       mat[g, names(agg_vals)] <- agg_vals
     }
     mat
@@ -1287,20 +1328,30 @@ server <- function(input, output, session) {
     switch(input$agg_fun, sum = "Sum", median = "Median", "Mean")
   })
 
+  # Human-readable name of the chosen layer, for the heatmap title.
+  agg_layer_label <- reactive({
+    layer_label(agg_layer())
+  })
+
   # Heatmap: genes (rows) x group levels (columns), blue -> white -> red like the
   # Gene Expression plots. Colour scale auto-fits the aggregated values.
   output$agg_heatmap <- renderPlotly({
     mat <- agg_matrix()
+    # Fix the colour range to the RAW aggregated values: 0..max for non-negative
+    # layers (counts / data), symmetric about 0 for scale.data so 0 reads white.
+    lims <- expr_limits(as.vector(mat))
     plot_ly(
       x = colnames(mat), y = rownames(mat), z = mat,
       type = "heatmap",
       colorscale = EXPR_COLORSCALE,   # blue -> white -> red (see EXPR_COLORSCALE)
+      zmin = lims[1], zmax = lims[2], zauto = FALSE,
       colorbar = list(title = list(text = agg_fun_label()), thickness = 15, outlinewidth = 0),
       hovertemplate = paste0("Gene: %{y}<br>", pretty_label(input$agg_group_var),
                              ": %{x}<br>", agg_fun_label(), ": %{z:.3f}<extra></extra>")
     ) %>%
       plotly::layout(
-        title = list(text = paste(agg_fun_label(), "expression by", pretty_label(input$agg_group_var)),
+        title = list(text = paste0(agg_fun_label(), "  ·  ", agg_layer_label(),
+                                   "  ·  by ", pretty_label(input$agg_group_var)),
                      x = 0, xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
         xaxis = list(title = pretty_label(input$agg_group_var), tickangle = -45),
@@ -1606,6 +1657,33 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "split_gene", choices = ch, selected = sel, server = TRUE)
   })
 
+  # Selected assay for the Split tab, defaulting to DefaultAssay until the input
+  # exists. Same shape as feature_assay_val() / agg_assay_val().
+  split_assay_val <- reactive({
+    a <- input$split_assay
+    all_a <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
+    if (!is.null(a) && a %in% all_a) a else tryCatch(Seurat::DefaultAssay(seu()), error = function(e) all_a[1])
+  })
+
+  # Dynamic layer selector for the Split tab: only the layers present in the
+  # selected assay, updating when the assay changes.
+  output$split_layer_ui <- renderUI({
+    assay_use <- split_assay_val()
+    req(seu(), assay_use)
+    lyrs <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) "data")
+    layer_order <- intersect(c("data", "counts", "scale.data"), lyrs)
+    if (length(layer_order) == 0) layer_order <- lyrs[1]
+    .ln <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
+    choices <- setNames(layer_order, ifelse(layer_order %in% names(.ln), .ln[layer_order], layer_order))
+    selectInput("split_layer", "Data layer:", choices = choices, width = "100%")
+  })
+
+  # Selected data layer, defaulting to "data" until the input renders.
+  split_layer <- reactive({
+    l <- input$split_layer
+    if (is.null(l) || !nzchar(l)) "data" else l
+  })
+
   # Levels of the "Split by" column -- pick WHICH primary groups to show.
   output$split_levels_ui <- renderUI({
     req(input$split_group)
@@ -1635,14 +1713,21 @@ server <- function(input, output, session) {
   split_data <- reactive({
     req(input$split_group, input$split_gene)
     g <- input$split_gene
-    validate(need(g %in% rownames(seu()), "Gene not found in this object."))
-    emb <- Embeddings(seu(), "umap")
+    assay_use <- split_assay_val()
+    layer_use <- split_layer()
+    full <- GetAssayData(seu(), layer = layer_use, assay = assay_use)   # genes x cells
+    validate(need(g %in% rownames(full),
+                  paste0("Gene '", g, "' is not present in the '", layer_use,
+                         "' layer of assay '", assay_use, "'.")))
+    emb <- umap_emb()
     grp <- as.character(seu()@meta.data[[input$split_group]]); grp[is.na(grp)] <- "NA"
-    # z-scored expression (centre 0) with a symmetric colour limit, so the
-    # diverging blue-white-red scale reads as -/+ around the mean.
-    expr <- zscore(as.numeric(GetAssayData(seu(), layer = "data")[g, ]))
-    upper <- max(abs(expr), na.rm = TRUE)
-    if (!is.finite(upper) || upper <= 0) upper <- 1
+    # RAW values of the chosen layer (no app-side z-scoring) -- consistent with
+    # the Gene Expression tab. Colour range from expr_limits(): 0..max for
+    # non-negative layers (counts / data), symmetric about 0 for scale.data so 0
+    # reads white on the blue-white-red scale.
+    expr <- as.numeric(full[g, ])
+    lims <- expr_limits(expr)
+    layer_lab <- layer_label(layer_use)
 
     all_levels <- sort(unique(grp))
     sel <- input$split_levels[input$split_levels %in% all_levels]
@@ -1673,7 +1758,14 @@ server <- function(input, output, session) {
       ncol_hint <- if (length(sec_sel) > 0) length(sec_sel) else NA_integer_
     }
 
-    list(emb = emb, grp = grp, grp2 = grp2, expr = expr, upper = upper, gene = g,
+    # Per-cell hover string, built ONCE here (not per panel): each panel just
+    # indexes into it, so the paste0 over ~19k cells runs once per selection
+    # instead of once for every one of the (up to 12) panels.
+    lbl <- if (is.null(grp2)) grp else paste0(grp, " - ", grp2)
+    tt <- paste0("Cell: ", rownames(emb), "<br>", lbl, "<br>", g, ": ", round(expr, 3))
+
+    list(emb = emb, grp = grp, grp2 = grp2, expr = expr, lims = lims,
+         layer_lab = layer_lab, gene = g, tt = tt,
          panels = panels, ncol_hint = ncol_hint)
   })
 
@@ -1719,12 +1811,13 @@ server <- function(input, output, session) {
 
   # Single shared colorbar (blue -> white -> red), matching the panels' scale.
   output$split_colorbar <- renderPlotly({
-    lim <- split_data()$upper
+    d <- split_data()
+    lims <- d$lims
     plot_ly(x = c(0, 0), y = c(0, 1), type = "scatter", mode = "markers",
-            marker = list(color = c(-lim, lim),
+            marker = list(color = lims,
                           colorscale = EXPR_COLORSCALE,
-                          cmin = -lim, cmax = lim, opacity = 0, showscale = TRUE,
-                          colorbar = list(title = list(text = "Expression"), thickness = 15,
+                          cmin = lims[1], cmax = lims[2], opacity = 0, showscale = TRUE,
+                          colorbar = list(title = list(text = d$layer_lab), thickness = 15,
                                           len = 0.5, outlinewidth = 0))) %>%
       plotly::layout(xaxis = list(visible = FALSE, range = c(-1, 1)),
                      yaxis = list(visible = FALSE, range = c(-1, 2)),
@@ -1742,8 +1835,6 @@ server <- function(input, output, session) {
       pan <- d$panels[[i]]
       sel <- pan$mask
       rng <- umap_range()
-      # Per-cell label: primary group, plus the secondary group when "Then by" is set.
-      lbl <- if (is.null(d$grp2)) d$grp else paste0(d$grp, " - ", d$grp2)
       # Two traces, same as the Gene Expression tab's style:
       #  1) grey backdrop = every OTHER cell (context),
       #  2) this panel's cells coloured by expression via a numeric blue->white->red
@@ -1755,8 +1846,7 @@ server <- function(input, output, session) {
       g <- which(sel)[order(d$expr[sel])]   # low->high so bright cells sit on top
       mk_df <- function(idx) data.frame(
         x = d$emb[idx, 1], y = d$emb[idx, 2], e = d$expr[idx],
-        tt = paste0("Cell: ", rownames(d$emb)[idx], "<br>", lbl[idx],
-                    "<br>", d$gene, " (z): ", round(d$expr[idx], 3)),
+        tt = d$tt[idx],
         stringsAsFactors = FALSE)
       # Build traces only when they have cells -- an empty (primary x secondary)
       # combination would otherwise error on a zero-row data frame.
@@ -1770,7 +1860,7 @@ server <- function(input, output, session) {
         p <- add_trace(p, data = mk_df(g), x = ~x, y = ~y, type = "scattergl", mode = "markers",
                        marker = list(size = 4, color = ~e,
                                      colorscale = EXPR_COLORSCALE,
-                                     cmin = -d$upper, cmax = d$upper, showscale = FALSE),
+                                     cmin = d$lims[1], cmax = d$lims[2], showscale = FALSE),
                        text = ~tt, hoverinfo = "text", showlegend = FALSE)
       }
       p %>%
