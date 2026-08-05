@@ -112,6 +112,48 @@ expr_limits <- function(v) {
 layer_label <- function(L) switch(L,
   data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z)", L)
 
+# ---- Download helpers -------------------------------------------------------
+# Tables: build a DT with a client-side "Excel" download button. Uses the
+# DataTables Buttons extension; the .xlsx is generated in the browser via JSZip
+# (bundled with the DT package) -> no server-side Excel writer / no Java needed,
+# and the file opens in Excel / LibreOffice / Google Sheets alike. `filename` is
+# the .xlsx base name; `page = "all"` exports every row, not just the current page.
+dt_with_excel <- function(df, filename) {
+  DT::datatable(
+    df, rownames = FALSE, extensions = "Buttons",
+    options = list(
+      dom = "Bfrtip",
+      buttons = list(list(extend = "excel", text = "Download Excel",
+                          filename = filename, title = NULL,
+                          exportOptions = list(modifier = list(page = "all")))),
+      pageLength = 15, searching = FALSE, scrollX = TRUE,
+      processing = TRUE, language = list(processing = "Loading table...")
+    )
+  )
+}
+
+# Plots: a small "PNG" button that exports a plotly plot as a static PNG entirely
+# in the browser (Plotly.downloadImage -> see the dlPlot() JS in tags$head), so
+# no kaleido/orca/pandoc is needed. `id` = the plotlyOutput id, `fname` = PNG name.
+safe_fname <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+plot_dl_btn <- function(id, fname) {
+  tags$button(class = "png-dl-btn", type = "button", title = "Download PNG",
+              onclick = sprintf("dlPlot('%s','%s')", id, safe_fname(fname)),
+              HTML("&#8615; PNG"))
+}
+# "Download all as one PNG" button for a multi-panel grid: composites every
+# listed panel (+ the shared colorbar, if given) into a single image laid out in
+# `ncol` columns. `ids` = character vector of plot ids.
+plot_dl_all_btn <- function(ids, ncol, colorbar_id = NULL, filename = "plots",
+                            label = "Download all as one PNG") {
+  ids_json <- jsonlite::toJSON(as.character(ids))   # always a JSON array
+  cb <- if (is.null(colorbar_id)) "null" else sprintf("'%s'", colorbar_id)
+  tags$button(class = "png-dl-all-btn", type = "button",
+              onclick = sprintf("dlPlotsCombined(%s, %d, %s, '%s')",
+                                ids_json, as.integer(ncol), cb, safe_fname(filename)),
+              HTML(paste0("&#8615; ", label)))
+}
+
 ui <- fluidPage(
   tags$head(
     tags$style(HTML("
@@ -191,6 +233,32 @@ ui <- fluidPage(
       .btn-default:hover, .btn-default:focus { border-color: #39FF14; color: #2ecc0f; }
       .selectize-control.single .selectize-input.focus { border-color: #39FF14 !important; box-shadow: 0 0 0 1px #39FF14; }
 
+      /* Per-plot 'Download PNG' button (top-right corner, always visible). */
+      .png-dl-btn {
+        position: absolute; top: 4px; right: 4px; z-index: 10;
+        font-size: 11px; line-height: 1; padding: 3px 8px; cursor: pointer;
+        background: rgba(255,255,255,0.9); color: #1a1a1a;
+        border: 1px solid #39FF14; border-radius: 4px;
+        opacity: 0.85; transition: opacity 0.15s, background 0.15s;
+      }
+      .png-dl-btn:hover { opacity: 1; background: #39FF14; }
+
+      /* 'Download all PNGs' button shown above a multi-panel grid. */
+      .png-dl-all-btn {
+        font-size: 13px; padding: 5px 14px; cursor: pointer; margin-bottom: 10px;
+        background: rgba(255,255,255,0.95); color: #1a1a1a;
+        border: 1px solid #39FF14; border-radius: 4px;
+      }
+      .png-dl-all-btn:hover { background: #39FF14; }
+
+      /* DataTables 'Download Excel' button, themed to match. */
+      .dt-buttons .dt-button {
+        background: rgba(255,255,255,0.9) !important; color: #1a1a1a !important;
+        border: 1px solid #39FF14 !important; border-radius: 4px !important;
+        padding: 4px 12px !important; margin-bottom: 8px !important; font-size: 13px !important;
+      }
+      .dt-buttons .dt-button:hover { background: #39FF14 !important; }
+
       /* Summary stat cards (Cells / Genes / Clusters / Samples) */
       .stat-cards { display: flex; gap: 12px; flex-wrap: wrap; margin: 6px 0 14px; }
       .stat-card {
@@ -251,6 +319,111 @@ ui <- fluidPage(
           }
         });
       });
+
+      // Turn any string into a safe file base name.
+      function pngSanitize(s) {
+        return String(s).replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'plot';
+      }
+      // Read a plotly plot's on-screen title so the PNG name matches what the
+      // user sees (falls back to the R-provided name if there's no title).
+      function pngName(gd, fallback) {
+        try {
+          var t = gd && gd.layout && gd.layout.title;
+          var txt = t ? (typeof t === 'string' ? t : t.text) : null;
+          if (txt) { return pngSanitize(txt); }
+        } catch (e) {}
+        return pngSanitize(fallback);
+      }
+      // Indices of gradient traces (a numeric-coloured scattergl trace) whose
+      // colorbar is currently hidden -- these are the panels that, in shared-scale
+      // mode, rely on the ONE colorbar drawn to the side.
+      function hiddenScaleTraces(gd) {
+        var idx = [];
+        (gd.data || []).forEach(function(tr, i) {
+          if (tr.marker && tr.marker.colorscale && Array.isArray(tr.marker.color)
+              && tr.marker.showscale === false) { idx.push(i); }
+        });
+        return idx;
+      }
+      // Export ONE plotly plot as a static PNG, client-side (no server deps). If
+      // the panel's own colorbar is hidden (shared-scale mode), turn it on just
+      // for the capture and restore it after, so every downloaded PNG has a scale
+      // without changing what's on screen.
+      window.dlPlot = function(id, fallback) {
+        var el = document.getElementById(id);
+        if (!el) { return; }
+        var gd = el.classList.contains('js-plotly-plot') ? el : el.querySelector('.js-plotly-plot');
+        if (!gd || !window.Plotly) { return; }
+        var opts = { format: 'png', filename: pngName(gd, fallback), scale: 2 };
+        var hidden = hiddenScaleTraces(gd);
+        if (hidden.length === 0) {                         // already has a colorbar
+          window.Plotly.downloadImage(gd, opts);
+          return;
+        }
+        Promise.resolve(window.Plotly.restyle(gd, { 'marker.showscale': true }, hidden))
+          .then(function() { return window.Plotly.downloadImage(gd, opts); })
+          .then(function() { window.Plotly.restyle(gd, { 'marker.showscale': false }, hidden); })
+          .catch(function() { window.Plotly.restyle(gd, { 'marker.showscale': false }, hidden); });
+      };
+      // Export ALL displayed panels as ONE combined PNG: render each panel to an
+      // image via Plotly (correct WebGL readback), then paint them onto a single
+      // canvas in the grid layout (+ the shared colorbar on the right, if any).
+      // ids = panel plot ids; ncol = panels per row; colorbarId = shared colorbar
+      // id or null; filename = output base name.
+      window.dlPlotsCombined = function(ids, ncol, colorbarId, filename) {
+        if (!ids || !ids.length || !window.Plotly) { return; }
+        var SCALE = 2, GAP = 20;
+        function gdOf(id) {
+          var el = document.getElementById(id); if (!el) { return null; }
+          return el.classList.contains('js-plotly-plot') ? el : el.querySelector('.js-plotly-plot');
+        }
+        function snap(id) {
+          var gd = gdOf(id); if (!gd) { return Promise.resolve(null); }
+          var w = gd.clientWidth || 500, h = gd.clientHeight || 500;
+          return window.Plotly.toImage(gd, { format: 'png', width: w, height: h, scale: SCALE });
+        }
+        function toImg(url) {
+          return new Promise(function(res) {
+            if (!url) { res(null); return; }
+            var im = new Image();
+            im.onload = function() { res(im); };
+            im.onerror = function() { res(null); };
+            im.src = url;
+          });
+        }
+        Promise.all(ids.map(snap)).then(function(urls) { return Promise.all(urls.map(toImg)); })
+          .then(function(panelImgs) {
+            panelImgs = panelImgs.filter(Boolean);
+            if (!panelImgs.length) { return; }
+            var proceed = function(cbImg) {
+              var n = panelImgs.length;
+              var cols = Math.max(1, Math.min(ncol || 1, n));
+              var rows = Math.ceil(n / cols);
+              var cw = panelImgs[0].naturalWidth, ch = panelImgs[0].naturalHeight;
+              var gridW = cols * cw + (cols - 1) * GAP, gridH = rows * ch + (rows - 1) * GAP;
+              var cbW = cbImg ? (cbImg.naturalWidth + GAP) : 0;
+              var canvas = document.createElement('canvas');
+              canvas.width = gridW + cbW; canvas.height = gridH;
+              var ctx = canvas.getContext('2d');
+              ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+              panelImgs.forEach(function(im, i) {
+                var r = Math.floor(i / cols), c = i % cols;
+                ctx.drawImage(im, c * (cw + GAP), r * (ch + GAP), cw, ch);
+              });
+              if (cbImg) { ctx.drawImage(cbImg, gridW + GAP, Math.max(0, (gridH - cbImg.naturalHeight) / 2)); }
+              canvas.toBlob(function(blob) {
+                if (!blob) { return; }
+                var a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = (filename || 'plots') + '.png';
+                document.body.appendChild(a); a.click();
+                setTimeout(function() { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+              }, 'image/png');
+            };
+            if (colorbarId) { snap(colorbarId).then(toImg).then(proceed); }
+            else { proceed(null); }
+          });
+      };
     "))
   ),
 
@@ -396,11 +569,22 @@ server <- function(input, output, session) {
     }
   })
 
-  # gene_avg_expr(): mean log-expression per gene, used to offer the
-  # "sort genes by highest/lowest average expression" options.
+  # gene_avg_expr(): mean expression per gene, used to offer the "sort genes by
+  # highest/lowest average expression" options. Prefers the normalized "data"
+  # layer of the default assay, but falls back to "counts" when "data" is missing
+  # or empty (e.g. RNA in an SCT-only pipeline). suppressWarnings avoids the
+  # "Layer 'data' is empty" console warning; the emptiness check drives fallback.
   gene_avg_expr <- reactive({
     req(seu())
-    Matrix::rowMeans(GetAssayData(seu(), layer = "data"))
+    try_layer <- function(L) {
+      m <- suppressWarnings(tryCatch(GetAssayData(seu(), layer = L),
+                                     error = function(e) NULL))
+      if (is.null(m) || nrow(m) == 0 || ncol(m) == 0) NULL else m
+    }
+    m <- try_layer("data")
+    if (is.null(m)) m <- try_layer("counts")
+    if (is.null(m)) return(setNames(rep(0, nrow(seu())), rownames(seu())))  # last resort
+    Matrix::rowMeans(m)
   })
 
   # found_genes(): the subset of the user-selected genes that actually exist in
@@ -420,7 +604,10 @@ server <- function(input, output, session) {
     if (!is.null(a) && a %in% all_a) a else tryCatch(Seurat::DefaultAssay(seu()), error = function(e) all_a[1])
   })
 
-  # Dynamic layer selector for the Gene Expression tab: updates when assay changes.
+  # Dynamic layer control for the Gene Expression tab: updates when assay changes.
+  #  * "genes" mode  -> a single "Data layer" dropdown (which layer to view genes in).
+  #  * "layers" mode -> a "Layers to show" checkbox group, so the user picks WHICH
+  #    of the assay's layers to compare side by side (instead of all at once).
   output$feature_layer_ui <- renderUI({
     assay_use <- feature_assay_val()
     req(seu(), assay_use)
@@ -429,7 +616,14 @@ server <- function(input, output, session) {
     if (length(layer_order) == 0) layer_order <- lyrs[1]
     .ln <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
     choices <- setNames(layer_order, ifelse(layer_order %in% names(.ln), .ln[layer_order], layer_order))
-    selectInput("feature_layer", "Data layer:", choices = choices, width = "100%")
+    if (identical(input$compare_mode, "layers")) {
+      # Start with NONE ticked: rendering every layer at once is a WebGL overload
+      # that can freeze the tab, so the user opts in to the layers they want.
+      checkboxGroupInput("feature_layers_show", "Layers to show:", choices = choices,
+                         selected = character(0), inline = TRUE)
+    } else {
+      selectInput("feature_layer", "Data layer:", choices = choices, width = "100%")
+    }
   })
 
   # Shared symmetric colour limit for "Same scale for all genes" mode: the max
@@ -636,7 +830,8 @@ server <- function(input, output, session) {
           ),
           mainPanel(
             div(style = "display: flex; justify-content: flex-start; width: 100%; overflow: hidden;",
-                div(id = "umap_plot_box", style = "width: calc(min(100vh - 230px, 100vw - 800px) + 240px); height: min(100vh - 230px, 100vw - 800px);",
+                div(id = "umap_plot_box", class = "plot-dl-wrap", style = "position: relative; width: calc(min(100vh - 230px, 100vw - 800px) + 40px); height: min(100vh - 230px, 100vw - 800px);",
+                    plot_dl_btn("umap_plot", "UMAP"),
                     withSpinner(plotlyOutput("umap_plot", width = "100%", height = "100%"), caption = "Rendering plot...", color = "#39FF14"))
             )
           )
@@ -666,7 +861,7 @@ server <- function(input, output, session) {
                                    choices = c("Same scale for all genes (comparable)" = "shared",
                                                "Scale adjusted per gene (all clearly visible)" = "per_gene"),
                                    selected = "shared")),
-            column(12, helpText("In \"One gene across data layers\" mode the FIRST selected gene is shown in each layer (counts / normalized / scaled) side by side; Data layer & Color scale are ignored."))
+            column(12, helpText("In \"One gene across data layers\" mode the FIRST selected gene is shown side by side in each layer you tick under \"Layers to show\" (each panel gets its own scale); Color scale is ignored."))
           )
         ),
         div(style = "width: 100%; display: flex; justify-content: center;",
@@ -721,7 +916,7 @@ server <- function(input, output, session) {
     # differential expression between two chosen groups computed on demand.
     if (has_contrasts) {
       tabs <- c(tabs, list(tabPanel(
-        "Contrasts",
+        "Contrasts (DEA)",
         wellPanel(
           fluidRow(
             column(4, selectInput("contrast_choice", "Contrast:", width = "100%",
@@ -737,7 +932,7 @@ server <- function(input, output, session) {
       )))
     } else {
       tabs <- c(tabs, list(tabPanel(
-        "Contrasts",
+        "Contrasts (DEA)",
         wellPanel(
           fluidRow(
             column(2, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
@@ -789,8 +984,10 @@ server <- function(input, output, session) {
                                  selected = "mean", inline = TRUE))
         )
       ),
-      withSpinner(plotlyOutput("agg_heatmap", height = "600px"),
-                  caption = "Rendering plot...", color = "#39FF14"),
+      div(class = "plot-dl-wrap", style = "position: relative;",
+          plot_dl_btn("agg_heatmap", "aggregated_expression"),
+          withSpinner(plotlyOutput("agg_heatmap", height = "600px"),
+                      caption = "Rendering plot...", color = "#39FF14")),
       tags$hr(),
       withSpinner(DTOutput("agg_table"), caption = "Loading table...", color = "#39FF14")
     )))
@@ -967,12 +1164,12 @@ server <- function(input, output, session) {
       p <- plotly::layout(
         p, hovermode = "closest",
         title = list(text = paste("UMAP colored by", pretty_label(input$group_var)),
-                     x = 0, xanchor = "left",
+                     x = 0, xref = "paper", xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
         xaxis = list(title = "UMAP_1", zeroline = FALSE, range = umap_range(),
-                     constrain = "domain", constraintoward = "left"),
+                     constrain = "range"),
         yaxis = list(title = "UMAP_2", zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
-                     constrain = "domain", constraintoward = "top", range = umap_range()),
+                     constrain = "range", range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 40)
       )
       return(plotly::config(p, displayModeBar = FALSE))
@@ -1010,12 +1207,12 @@ server <- function(input, output, session) {
 
     p <- plotly::layout(
       p,
-      title = list(text = paste("UMAP colored by", pretty_label(input$group_var)), x = 0, xanchor = "left",
+      title = list(text = paste("UMAP colored by", pretty_label(input$group_var)), x = 0, xref = "paper", xanchor = "left",
                    font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
       xaxis = list(title = "UMAP_1", zeroline = FALSE, range = umap_range(),
-                   constrain = "domain", constraintoward = "left"),
+                   constrain = "range"),
       yaxis = list(title = "UMAP_2", zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
-                   constrain = "domain", constraintoward = "top", range = umap_range()),
+                   constrain = "range", range = umap_range()),
       showlegend = TRUE,
       legend = list(title = list(text = pretty_label(input$group_var)), itemsizing = "constant",
                     y = 0.5, yanchor = "middle"),
@@ -1051,8 +1248,14 @@ server <- function(input, output, session) {
   # plotly's equal-scale axes render correctly, single plot included), and the
   # height term keeps the whole grid on screen -- 4 plots fit without scrolling.
   output$dynamic_feature_plots <- renderUI({
-    n <- length(plot_specs())
-    if (n == 0) return(NULL)
+    specs <- plot_specs()
+    n <- length(specs)
+    if (n == 0) {
+      # In "layers" mode a gene may be chosen but no layer ticked yet -> nudge.
+      if (identical(input$compare_mode, "layers") && length(found_genes()) > 0)
+        return(helpText("Tick one or more layers under \"Layers to show\" to display them."))
+      return(NULL)
+    }
 
     # "layers" mode = one gene per layer, each with its own scale, so no single
     # shared colorbar. Otherwise the shared colorbar shows in "same scale" mode.
@@ -1080,10 +1283,13 @@ server <- function(input, output, session) {
     cell   <- sprintf("min(%s, %s)", w_term, h_cap)
 
     plot_list <- lapply(seq_len(n), function(i) {
-      withSpinner(
-        plotlyOutput(paste0("feature_plot_individual_", i), width = "100%", height = "100%"),
-        caption = "Rendering plot...", color = "#39FF14"
-      )
+      id <- paste0("feature_plot_individual_", i)
+      div(class = "plot-dl-wrap", style = "position: relative; width: 100%; height: 100%;",
+          plot_dl_btn(id, specs[[i]]$title),
+          withSpinner(
+            plotlyOutput(id, width = "100%", height = "100%"),
+            caption = "Rendering plot...", color = "#39FF14"
+          ))
     })
 
     grid_div <- div(
@@ -1097,7 +1303,7 @@ server <- function(input, output, session) {
     # Its column stretches to the full grid height and a one-cell-tall colorbar
     # is centred in it, so the scale sits in the vertical middle of ALL the
     # plots no matter how many genes are added.
-    if (shared) {
+    body <- if (shared) {
       div(style = "display: flex; align-items: stretch; justify-content: center; gap: 15px;",
           grid_div,
           # Column stretches to full grid height; inner box is one cell tall and
@@ -1109,6 +1315,17 @@ server <- function(input, output, session) {
                   plotlyOutput("shared_colorbar", width = "100%", height = "100%"))))
     } else {
       grid_div
+    }
+
+    # "Download all as one PNG" (all panels composited) -- only for >1 panel.
+    # In shared-scale mode the single side colorbar is included in the image.
+    if (n > 1) {
+      ids <- paste0("feature_plot_individual_", seq_len(n))
+      cb <- if (shared) "shared_colorbar" else NULL
+      tagList(div(style = "text-align: right; padding-right: 20px;",
+                  plot_dl_all_btn(ids, ncol, cb, "gene_expression_panels")), body)
+    } else {
+      body
     }
   })
 
@@ -1128,8 +1345,10 @@ server <- function(input, output, session) {
         cmin = lims[1], cmax = lims[2],
         opacity = 0,                                           # hide the dummy points
         showscale = TRUE,
+        # x = 0 / xanchor left -> bar sits at the LEFT of its own image, so it
+        # ends up right next to the plots (on screen and in the combined PNG).
         colorbar = list(title = list(text = lab), thickness = 15,
-                        len = 0.5, outlinewidth = 0)
+                        len = 0.5, outlinewidth = 0, x = 0, xanchor = "left")
       )
     ) %>%
       plotly::layout(
@@ -1163,17 +1382,25 @@ server <- function(input, output, session) {
 
   # What each plot slot should show: a list of {gene, layer, title}.
   #  * "genes" mode  -> one plot per selected gene, all in the chosen layer.
-  #  * "layers" mode -> one plot per available layer, all of the FIRST gene.
+  #  * "layers" mode -> one plot per CHOSEN layer (via "Layers to show"), of the
+  #    FIRST gene. Defaults to all available layers until the user narrows it.
   plot_specs <- reactive({
     fg <- found_genes()
     req(length(fg) > 0)
     if (identical(input$compare_mode, "layers")) {
       g <- fg[[1]]
-      lapply(available_layers(), function(L)
+      avail <- available_layers()
+      # Only the layers the user ticked, in preferred order (data, counts,
+      # scale.data). Nothing ticked -> nothing rendered (see the hint below).
+      keep <- avail[avail %in% input$feature_layers_show]
+      lapply(keep, function(L)
         list(gene = g, layer = L, title = paste0(g, " · ", layer_label(L))))
     } else {
       layer <- feature_layer()
-      lapply(fg, function(g) list(gene = g, layer = layer, title = g))
+      # Title shows the gene AND the data layer, so a downloaded panel is self-
+      # describing (e.g. "Malat1 · Normalized (log)") rather than just "Malat1".
+      lapply(fg, function(g) list(gene = g, layer = layer,
+                                  title = paste0(g, " · ", layer_label(layer))))
     }
   })
 
@@ -1244,13 +1471,13 @@ server <- function(input, output, session) {
       # chrome, left-aligned title (matching font/size).
       p <- plotly::layout(
         p,
-        title = list(text = spec$title, x = 0, xanchor = "left",
+        title = list(text = spec$title, x = 0, xref = "paper", xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
         xaxis = list(title = "UMAP_1", zeroline = FALSE, showline = FALSE, ticks = "",
-                     range = umap_range(), constrain = "domain", constraintoward = "left"),
+                     range = umap_range(), constrain = "range"),
         yaxis = list(title = "UMAP_2", zeroline = FALSE, showline = FALSE, ticks = "",
-                     scaleanchor = "x", scaleratio = 1, constrain = "domain",
-                     constraintoward = "top", range = umap_range()),
+                     scaleanchor = "x", scaleratio = 1, constrain = "range",
+                     range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 30)
       )
       plotly::config(p, displayModeBar = FALSE)
@@ -1350,9 +1577,11 @@ server <- function(input, output, session) {
                              ": %{x}<br>", agg_fun_label(), ": %{z:.3f}<extra></extra>")
     ) %>%
       plotly::layout(
-        title = list(text = paste0(agg_fun_label(), "  ·  ", agg_layer_label(),
-                                   "  ·  by ", pretty_label(input$agg_group_var)),
-                     x = 0, xanchor = "left",
+        title = list(text = paste0(agg_fun_label(), " expression of ", nrow(mat),
+                                   " gene", if (nrow(mat) != 1) "s" else "", " per ",
+                                   pretty_label(input$agg_group_var), "  ·  ",
+                                   agg_layer_label()),
+                     x = 0, xref = "paper", xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
         xaxis = list(title = pretty_label(input$agg_group_var), tickangle = -45),
         yaxis = list(title = "Gene", autorange = "reversed"),   # first gene on top
@@ -1366,10 +1595,8 @@ server <- function(input, output, session) {
     mat <- agg_matrix()
     df <- data.frame(Gene = rownames(mat), round(mat, 3),
                      check.names = FALSE, row.names = NULL)
-    datatable(df, rownames = FALSE,
-              options = list(pageLength = 15, searching = FALSE, scrollX = TRUE,
-                             processing = TRUE, language = list(processing = "Loading table...")))
-  })
+    dt_with_excel(df, "aggregated_expression")
+  }, server = FALSE)   # client-side so the Excel button exports ALL rows, not just the current page
 
   # ===========================================================================
   # Cluster Markers & Contrasts tabs (interactive DT tables).
@@ -1428,10 +1655,8 @@ server <- function(input, output, session) {
     markers_df <- markers_df[order(markers_df$FDR), ]
     markers_df <- reorder_id_cols(markers_df)
     markers_df <- apply_field_search(markers_df, input$marker_search_field, input$marker_search_text)
-    datatable(markers_df, rownames = FALSE,
-              options = list(pageLength = 15, searching = FALSE,
-                             processing = TRUE, language = list(processing = "Loading table...")))
-  })
+    dt_with_excel(markers_df, paste0("cluster_markers_cluster_", input$marker_cluster))
+  }, server = FALSE)   # client-side so the Excel button exports ALL rows
 
   # Contrast table: same idea as the marker table, but the row is chosen by the
   # "target vs reference" pair (split back apart here) plus the test type.
@@ -1445,10 +1670,8 @@ server <- function(input, output, session) {
     contrast_df <- contrast_df[order(contrast_df$FDR), ]
     contrast_df <- reorder_id_cols(contrast_df)
     contrast_df <- apply_field_search(contrast_df, input$contrast_search_field, input$contrast_search_text)
-    datatable(contrast_df, rownames = FALSE,
-              options = list(pageLength = 15, searching = FALSE,
-                             processing = TRUE, language = list(processing = "Loading table...")))
-  })
+    dt_with_excel(contrast_df, safe_fname(paste0("contrasts_DEA_", input$contrast_choice)))
+  }, server = FALSE)   # client-side so the Excel button exports ALL rows
 
   # ===========================================================================
   # Generic (scdrake-free) Cluster Markers & Contrasts.
@@ -1477,9 +1700,6 @@ server <- function(input, output, session) {
     rownames(out) <- NULL
     out
   }
-
-  gd_table_opts <- list(pageLength = 15, searching = FALSE, scrollX = TRUE,
-                        processing = TRUE, language = list(processing = "Loading table..."))
 
   # ---- Generic Cluster Markers: chosen group vs all other cells ----
   output$gmarker_cluster_ui <- renderUI({
@@ -1581,8 +1801,8 @@ server <- function(input, output, session) {
     if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute markers:", conditionMessage(res))))
     out <- format_generic_de(res)
     out <- apply_field_search(out, "All columns", input$gmarker_search_text)
-    datatable(out, rownames = FALSE, options = gd_table_opts)
-  })
+    dt_with_excel(out, safe_fname(paste0("cluster_markers_", input$gmarker_cluster)))
+  }, server = FALSE)   # client-side so the Excel button exports ALL rows
 
   # ---- Generic Contrasts: target group vs reference group ----
   output$gcontrast_target_ui <- renderUI({
@@ -1632,8 +1852,8 @@ server <- function(input, output, session) {
     if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute contrast:", conditionMessage(res))))
     out <- format_generic_de(res)
     out <- apply_field_search(out, "All columns", input$gcontrast_search_text)
-    datatable(out, rownames = FALSE, options = gd_table_opts)
-  })
+    dt_with_excel(out, safe_fname(paste0("contrasts_DEA_", input$gcontrast_target, "_vs_", input$gcontrast_reference)))
+  }, server = FALSE)   # client-side so the Excel button exports ALL rows
 
   # ===========================================================================
   # Split by Group: one gene shown as a separate expression UMAP per level of a
@@ -1744,16 +1964,18 @@ server <- function(input, output, session) {
     }
 
     # Build one panel per primary group, or per (primary x secondary) combination.
+    # Titles lead with the gene so a downloaded panel is self-describing
+    # (e.g. "Malat1 · WT  (n=1234)").
     panels <- list()
     if (is.null(grp2)) {
       for (p in sel) panels[[length(panels) + 1]] <-
-        list(mask = grp == p, title = paste0(p, "  (n=", sum(grp == p), ")"))
+        list(mask = grp == p, title = paste0(g, " · ", p, "  (n=", sum(grp == p), ")"))
       ncol_hint <- NA_integer_
     } else {
       for (p in sel) for (s in sec_sel) {
         m <- grp == p & grp2 == s
         panels[[length(panels) + 1]] <-
-          list(mask = m, title = paste0(p, " - ", s, "  (n=", sum(m), ")"))
+          list(mask = m, title = paste0(g, " · ", p, " - ", s, "  (n=", sum(m), ")"))
       }
       ncol_hint <- if (length(sec_sel) > 0) length(sec_sel) else NA_integer_
     }
@@ -1791,8 +2013,11 @@ server <- function(input, output, session) {
     cell   <- sprintf("min(%s, %s)", w_term, h_cap)
 
     cells <- lapply(seq_len(n), function(i) {
-      withSpinner(plotlyOutput(paste0("split_panel_", i), width = "100%", height = "100%"),
-                  caption = "Rendering plot...", color = "#39FF14")
+      id <- paste0("split_panel_", i)
+      div(class = "plot-dl-wrap", style = "position: relative; width: 100%; height: 100%;",
+          plot_dl_btn(id, d$panels[[i]]$title),
+          withSpinner(plotlyOutput(id, width = "100%", height = "100%"),
+                      caption = "Rendering plot...", color = "#39FF14"))
     })
     grid_div <- div(
       id = "split_plot_grid",
@@ -1802,11 +2027,21 @@ server <- function(input, output, session) {
                      " align-content: start;"),
       cells)
     # Grid + shared colorbar, same structure as Gene Expression's shared mode.
-    div(style = "display: flex; align-items: stretch; justify-content: center; gap: 15px;",
+    body <- div(style = "display: flex; align-items: stretch; justify-content: center; gap: 15px;",
         grid_div,
         div(style = paste0("width: ", cb_width, "px; display: flex; align-items: center; justify-content: center;"),
             div(style = paste0("width: 100%; height: ", cell, ";"),
                 plotlyOutput("split_colorbar", width = "100%", height = "100%"))))
+
+    # "Download all as one PNG" (all panels + the shared colorbar composited).
+    if (n > 1) {
+      ids <- paste0("split_panel_", seq_len(n))
+      tagList(div(style = "text-align: right; padding-right: 20px;",
+                  plot_dl_all_btn(ids, ncol, "split_colorbar",
+                                  paste0(d$gene, "_split_panels"))), body)
+    } else {
+      body
+    }
   })
 
   # Single shared colorbar (blue -> white -> red), matching the panels' scale.
@@ -1817,8 +2052,10 @@ server <- function(input, output, session) {
             marker = list(color = lims,
                           colorscale = EXPR_COLORSCALE,
                           cmin = lims[1], cmax = lims[2], opacity = 0, showscale = TRUE,
+                          # bar anchored left so it sits right next to the panels
+                          # (on screen and in the combined PNG).
                           colorbar = list(title = list(text = d$layer_lab), thickness = 15,
-                                          len = 0.5, outlinewidth = 0))) %>%
+                                          len = 0.5, outlinewidth = 0, x = 0, xanchor = "left"))) %>%
       plotly::layout(xaxis = list(visible = FALSE, range = c(-1, 1)),
                      yaxis = list(visible = FALSE, range = c(-1, 2)),
                      margin = list(l = 0, r = 0, t = 10, b = 10),
@@ -1860,19 +2097,23 @@ server <- function(input, output, session) {
         p <- add_trace(p, data = mk_df(g), x = ~x, y = ~y, type = "scattergl", mode = "markers",
                        marker = list(size = 4, color = ~e,
                                      colorscale = EXPR_COLORSCALE,
-                                     cmin = d$lims[1], cmax = d$lims[2], showscale = FALSE),
+                                     cmin = d$lims[1], cmax = d$lims[2], showscale = FALSE,
+                                     # Hidden on screen (one shared colorbar to the side); revealed
+                                     # only when a single panel is exported to PNG, so the file has a scale.
+                                     colorbar = list(title = list(text = d$layer_lab), thickness = 15,
+                                                     len = 0.5, outlinewidth = 0)),
                        text = ~tt, hoverinfo = "text", showlegend = FALSE)
       }
       p %>%
         plotly::layout(
           hovermode = "closest",
-          title = list(text = pan$title, x = 0, xanchor = "left",
+          title = list(text = pan$title, x = 0, xref = "paper", xanchor = "left",
                        font = list(size = 14, family = "Open Sans, verdana, arial, sans-serif")),
           xaxis = list(title = "", zeroline = FALSE, showline = FALSE, ticks = "",
-                       range = rng, constrain = "domain", constraintoward = "left"),
+                       range = rng, constrain = "range"),
           yaxis = list(title = "", zeroline = FALSE, showline = FALSE, ticks = "",
-                       scaleanchor = "x", scaleratio = 1, constrain = "domain",
-                       constraintoward = "top", range = rng),
+                       scaleanchor = "x", scaleratio = 1, constrain = "range",
+                       range = rng),
           margin = list(l = 10, r = 10, t = 30, b = 10)) %>%
         plotly::config(displayModeBar = FALSE)
     })
