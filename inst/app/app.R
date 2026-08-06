@@ -41,6 +41,11 @@ library(plotly)            # interactive UMAPs + colorbars
 
 # Raise the upload size limit (default is 5MB; Seurat objects might be much bigger)
 options(shiny.maxRequestSize = 5 * 1024^3)  # 5 GB
+# The marker/contrast/aggregated tables render CLIENT-side (renderDT server = FALSE)
+# on purpose, so the DataTables "Download Excel" button exports ALL rows (not just
+# the current page). DT warns when a client-side table is large -- silence that
+# expected warning here.
+options(DT.warn.size = FALSE)
 
 # ---- Example data: read once per R session, reuse on every app (re)start ----
 # The example .rds is large, so instead of readRDS()-ing it every time the app
