@@ -7,6 +7,11 @@ a bundled example) and explore it in the browser - no coding required. Built to
 work with plain Seurat objects and with objects produced by the
 [scdrake](https://github.com/bioinfocz/scdrake) pipeline.
 
+## Documentation
+
+See the **[User Guide](docs/USER_GUIDE.md)** for a full walkthrough of every tab and
+option: what each control does, the information it gives, and what you'd use it for.
+
 ## Features
 
 - **Clusters / Metadata** - UMAP coloured by a metadata column (`batch`,
