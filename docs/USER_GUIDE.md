@@ -81,7 +81,7 @@ coloured by a metadata column you choose.
 
 | Option | What it does | Information / use |
 |---|---|---|
-| Resolution / clustering *(appears only if the object has clustering columns)* | Quick-pick a clustering column (e.g. `SCT_snn_res.0.1`), listed as `assay · res X (N clusters)` | Recolour the map by that clustering. Higher resolution = more, finer clusters; the points don't move, only their colours. |
+| Resolution / clustering *(appears only if the object has clustering columns)* | Quick-pick a clustering column (e.g. `SCT_snn_res.0.1`), listed as `assay · res X (N clusters)` | Recolour the map by that clustering. Higher resolution = more, finer clusters; the points don't move, only their colours. Stays in sync with "Color UMAP by" (picking a clustering in either box updates the other). |
 | Color UMAP by | Colour cells by any metadata column (clusters, cell type, sample, phase, condition, QC scores…) | See structure and how any variable is distributed across the map. |
 | Show categories (checkboxes) *(categorical columns)* | Toggle individual categories on/off; unticked ones turn grey | Isolate one or a few groups - e.g. grey out everything except "T cells". Toggling is instant (no re-render). |
 | Min / Max boxes *(continuous columns)* | Grey out cells whose value falls outside the typed range | Focus on a value window - e.g. only cells with a QC score above a threshold. |
@@ -89,7 +89,9 @@ coloured by a metadata column you choose.
 Categorical vs continuous is auto-detected. Discrete labels (clusters, cell types)
 get distinct colours + the "Show categories" checkboxes. Numeric columns (counts, QC
 metrics, prediction scores - even numbers stored as text) get a viridis gradient +
-colorbar, exact hover value, and the Min/Max range filter.
+colorbar, exact hover value, and the Min/Max range filter. Clustering columns are
+always treated as categorical, however many clusters they have (a 60-cluster leiden
+result is 60 categories, not a scale).
 
 Category order. Wherever categories are listed (the legend, the "Show categories"
 checkboxes, and the group pickers on the other tabs), they are sorted naturally -

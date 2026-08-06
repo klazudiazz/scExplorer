@@ -752,6 +752,14 @@ server <- function(input, output, session) {
   gmarker_assay_val <- make_de_assay_val("gmarker_assay")
   gcontrast_assay_val <- make_de_assay_val("gcontrast_assay")
 
+  # Clustering / resolution columns in the metadata (e.g. SCT_snn_res.0.1,
+  # seurat_clusters, final_clusters). Shared by the "Resolution / clustering"
+  # quick-pick and the two-way sync with "Color UMAP by" below.
+  clust_cols_r <- reactive({
+    req(seu())
+    grep("snn_res|_res\\.[0-9]|cluster", colnames(seu()@meta.data), ignore.case = TRUE, value = TRUE)
+  })
+
   # app_body(): builds the whole tabbed UI once data is loaded. The last two
   # tabs (Cluster Markers, Contrasts) are only added when the object carries the
   # matching @misc data, so plain Seurat objects simply won't show them.
@@ -778,6 +786,7 @@ server <- function(input, output, session) {
     # TWEAK: raise/lower max_categories to change what counts as a grouping column.
     max_categories <- 100
     grouping_cols <- all_cols[vapply(all_cols, function(col) {
+      if (col %in% clust_cols_r()) return(TRUE)                     # clusterings: always a category, any count
       x <- seu()@meta.data[[col]]
       if (is_continuous_col(col)) return(FALSE)                     # a score, not a category
       (is.factor(x) || is.character(x) || is.logical(x) || is.numeric(x)) &&
@@ -791,6 +800,7 @@ server <- function(input, output, session) {
     # Still excludes huge text columns (barcodes) so the UMAP can't get thousands
     # of discrete colours.
     color_cols <- all_cols[vapply(all_cols, function(col) {
+      if (col %in% clust_cols_r()) return(TRUE)                     # clusterings: always colourable, any count
       x <- seu()@meta.data[[col]]
       if (is_continuous_col(col)) return(TRUE)                      # gradient
       (is.factor(x) || is.character(x) || is.logical(x) || is.numeric(x)) &&
@@ -802,7 +812,7 @@ server <- function(input, output, session) {
     # Clustering / resolution columns (e.g. SCT_snn_res.0.1, integrated_snn_res.0.5,
     # seurat_clusters, final_clusters) -> a tidy "Resolution" quick-pick that shows
     # the resolution + cluster count and just colours the UMAP by that column.
-    clust_cols <- grep("snn_res|_res\\.[0-9]|cluster", all_cols, ignore.case = TRUE, value = TRUE)
+    clust_cols <- clust_cols_r()
     res_label <- function(col) {
       n <- length(unique(seu()@meta.data[[col]][!is.na(seu()@meta.data[[col]])]))
       m <- regmatches(col, regexpr("snn_res\\.[0-9.]+$", col))
@@ -1049,11 +1059,22 @@ server <- function(input, output, session) {
     do.call(tabsetPanel, tabs)
   })
 
-  # Resolution quick-pick -> colour the UMAP by that clustering column (updates
-  # "Color UMAP by"). ignoreInit so it doesn't override the default on load.
+  # Two-way sync between the "Resolution / clustering" quick-pick and "Color UMAP
+  # by", so they never show conflicting clusterings.
+  # (a) picking a resolution colours the UMAP by that clustering column.
   observeEvent(input$resolution_pick, {
     req(input$resolution_pick)
-    updateSelectInput(session, "group_var", selected = input$resolution_pick)
+    if (!identical(isolate(input$group_var), input$resolution_pick))
+      updateSelectInput(session, "group_var", selected = input$resolution_pick)
+  }, ignoreInit = TRUE)
+  # (b) choosing a clustering column in "Color UMAP by" moves the Resolution box
+  # to match. Non-clustering columns leave the Resolution box untouched. The
+  # identical() guards stop the two observers from ping-ponging.
+  observeEvent(input$group_var, {
+    req(input$group_var)
+    if (input$group_var %in% clust_cols_r() &&
+        !identical(isolate(input$resolution_pick), input$group_var))
+      updateSelectInput(session, "resolution_pick", selected = input$group_var)
   }, ignoreInit = TRUE)
 
   # The per-category show/hide checkboxes under "Color UMAP by". Rebuilt every
@@ -1094,13 +1115,16 @@ server <- function(input, output, session) {
   # A metadata column is treated as CONTINUOUS (coloured by a gradient) when its
   # values are numeric -- including numbers stored as character/factor, e.g.
   # prediction scores. Otherwise it's categorical (discrete colours + checkboxes).
-  #   * ">90% coerce to numbers"  -> text labels stay categorical.
-  #   * has NON-INTEGER values    -> a real-valued score (e.g. 0.031) is
+  #   * clustering columns          -> ALWAYS categorical, however many clusters
+  #       (a leiden clustering with 60 clusters is still 60 categories, not a scale).
+  #   * ">90% coerce to numbers"    -> text labels stay categorical.
+  #   * has NON-INTEGER values      -> a real-valued score (e.g. 0.031) is
   #       continuous even with few distinct values (like a per-sample score).
-  #   * OR >50 distinct integers  -> e.g. nCount_RNA is continuous, while small
+  #   * OR >50 distinct integers    -> e.g. nCount_RNA is continuous, while small
   #       integer codes (cluster ids 0..17) stay categorical.
   # TWEAK: change the 50 to shift the integer categorical/continuous threshold.
   is_continuous_col <- function(col) {
+    if (col %in% clust_cols_r()) return(FALSE)           # clusterings are categorical
     xn <- suppressWarnings(as.numeric(as.character(seu()@meta.data[[col]])))
     if (mean(!is.na(xn)) <= 0.9) return(FALSE)            # not numeric-like
     u <- unique(xn[!is.na(xn)])
