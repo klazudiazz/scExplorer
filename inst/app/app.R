@@ -82,6 +82,15 @@ pretty_label <- function(x) {
   sub("^(\\w)", "\\U\\1", x, perl = TRUE)
 }
 
+# Sort category levels for display: numerically when every level is a number
+# (so 2 comes before 10, not "10" before "2"), otherwise alphabetically. Used
+# everywhere categorical levels are listed (legend, checkboxes, group pickers).
+sort_levels <- function(x) {
+  x <- unique(as.character(x))
+  xn <- suppressWarnings(as.numeric(x))
+  if (length(x) > 0 && all(!is.na(xn))) x[order(xn)] else sort(x)
+}
+
 # Diverging blue -> white -> red colour scale used for expression on EVERY plot
 # (Gene Expression, Aggregated Expression heatmap, Split by Group, and their
 # colorbars). TWEAK: edit these stops to re-theme the expression gradient app-wide.
@@ -111,6 +120,19 @@ expr_limits <- function(v) {
 # Human-readable name for an assay layer.
 layer_label <- function(L) switch(L,
   data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z)", L)
+
+# Friendly labels for a "Data layer" dropdown (fuller than layer_label()).
+LAYER_LABELS <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
+
+# Named choices for a "Data layer" selector: the layers present in `assay_use`
+# of `seu_obj`, in preferred order (data, counts, scale.data), labelled by
+# LAYER_LABELS. Shared by every Data-layer dropdown in the app.
+layer_choices <- function(seu_obj, assay_use) {
+  lyrs <- tryCatch(SeuratObject::Layers(seu_obj[[assay_use]]), error = function(e) "data")
+  ord <- intersect(c("data", "counts", "scale.data"), lyrs)
+  if (length(ord) == 0) ord <- lyrs[1]
+  setNames(ord, ifelse(ord %in% names(LAYER_LABELS), LAYER_LABELS[ord], ord))
+}
 
 # ---- Download helpers -------------------------------------------------------
 # Tables: build a DT with a client-side "Excel" download button. Uses the
@@ -543,7 +565,7 @@ server <- function(input, output, session) {
           card("Genes",   fmt(nrow(seu()))),
           card("Samples", fmt(n_samples))),
       div(class = "assay-layer-strip",
-          tags$strong("Assays & layers: "), assay_layer_info)
+          tags$strong("Assays/layers: "), assay_layer_info)
     )
   })
 
@@ -596,13 +618,33 @@ server <- function(input, output, session) {
     input$genes[input$genes %in% rownames(seu())]
   })
 
-  # The selected assay for the Gene Expression tab, defaulting to the object's
-  # DefaultAssay until the input exists.
-  feature_assay_val <- reactive({
-    a <- input$feature_assay
+  # ---- Per-tab assay / layer selectors (shared factories) -------------------
+  # Several tabs each have an "Assay" + "Data layer" pair with identical logic;
+  # these factories build the backing reactives from just the input id, so each
+  # tab is a one-liner instead of a repeated block.
+
+  # Selected assay, defaulting to the object's DefaultAssay until the input exists
+  # (used by tabs that may view ANY assay: Gene Expression, Aggregated, Split).
+  make_assay_val <- function(id) reactive({
+    a <- input[[id]]
     all_a <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
     if (!is.null(a) && a %in% all_a) a else tryCatch(Seurat::DefaultAssay(seu()), error = function(e) all_a[1])
   })
+
+  # Selected assay for the DE tabs (Cluster Markers, Contrasts): restricted to
+  # de_assay_choices() (which excludes `integrated`), defaulting to default_de_assay().
+  make_de_assay_val <- function(id) reactive({
+    a <- input[[id]]
+    if (!is.null(a) && a %in% de_assay_choices()) a else default_de_assay()
+  })
+
+  # Selected data layer, defaulting to "data" until the input renders.
+  make_layer_val <- function(id) reactive({
+    l <- input[[id]]
+    if (is.null(l) || !nzchar(l)) "data" else l
+  })
+
+  feature_assay_val <- make_assay_val("feature_assay")
 
   # Dynamic layer control for the Gene Expression tab: updates when assay changes.
   #  * "genes" mode  -> a single "Data layer" dropdown (which layer to view genes in).
@@ -611,11 +653,7 @@ server <- function(input, output, session) {
   output$feature_layer_ui <- renderUI({
     assay_use <- feature_assay_val()
     req(seu(), assay_use)
-    lyrs <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) "data")
-    layer_order <- intersect(c("data", "counts", "scale.data"), lyrs)
-    if (length(layer_order) == 0) layer_order <- lyrs[1]
-    .ln <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
-    choices <- setNames(layer_order, ifelse(layer_order %in% names(.ln), .ln[layer_order], layer_order))
+    choices <- layer_choices(seu(), assay_use)
     if (identical(input$compare_mode, "layers")) {
       # Start with NONE ticked: rendering every layer at once is a WebGL overload
       # that can freeze the tab, so the user opts in to the layers they want.
@@ -626,13 +664,8 @@ server <- function(input, output, session) {
     }
   })
 
-  # Shared symmetric colour limit for "Same scale for all genes" mode: the max
-  # The selected data layer for the Gene Expression plots (counts / data /
-  # scale.data), defaulting to "data" until the input exists.
-  feature_layer <- reactive({
-    l <- input$feature_layer
-    if (is.null(l) || !nzchar(l)) "data" else l
-  })
+  # The selected data layer for the Gene Expression plots (data / counts / scale.data).
+  feature_layer <- make_layer_val("feature_layer")
 
   # Shared colour limits for "Same scale for all genes" mode: the pooled range of
   # the RAW values (of the chosen layer) across the selected genes.
@@ -716,21 +749,8 @@ server <- function(input, output, session) {
     if (!is.null(def) && def %in% choices) def else choices[1]
   })
 
-  gmarker_assay_val <- reactive({
-    if (!is.null(input$gmarker_assay) && input$gmarker_assay %in% de_assay_choices()) {
-      input$gmarker_assay
-    } else {
-      default_de_assay()
-    }
-  })
-
-  gcontrast_assay_val <- reactive({
-    if (!is.null(input$gcontrast_assay) && input$gcontrast_assay %in% de_assay_choices()) {
-      input$gcontrast_assay
-    } else {
-      default_de_assay()
-    }
-  })
+  gmarker_assay_val <- make_de_assay_val("gmarker_assay")
+  gcontrast_assay_val <- make_de_assay_val("gcontrast_assay")
 
   # app_body(): builds the whole tabbed UI once data is loaded. The last two
   # tabs (Cluster Markers, Contrasts) are only added when the object carries the
@@ -864,8 +884,7 @@ server <- function(input, output, session) {
             column(12, helpText("In \"One gene across data layers\" mode the FIRST selected gene is shown side by side in each layer you tick under \"Layers to show\" (each panel gets its own scale); Color scale is ignored."))
           )
         ),
-        div(style = "width: 100%; display: flex; justify-content: center;",
-            uiOutput("dynamic_feature_plots"))
+        uiOutput("dynamic_feature_plots")   # (centres its own grid internally, like Split)
       )
     )
 
@@ -1057,7 +1076,7 @@ server <- function(input, output, session) {
     }
     vals <- as.character(seu()@meta.data[[input$group_var]])
     vals[is.na(vals)] <- "NA"
-    vals <- sort(unique(vals))
+    vals <- sort_levels(vals)
     checkboxGroupInput("categories_shown", "Show categories:", choices = vals, selected = vals)
   })
 
@@ -1112,7 +1131,7 @@ server <- function(input, output, session) {
     g <- as.character(raw)[ord]; g[is.na(g)] <- "NA"
     df$group <- g
     df$tooltip <- paste0("Group: ", g)
-    cats <- sort(unique(g))
+    cats <- sort_levels(g)
     non_na <- setdiff(cats, "NA")
     pal <- setNames(scales::hue_pal()(length(non_na)), non_na)
     if ("NA" %in% cats) pal[["NA"]] <- "#B3B3B3"   # unassigned cells (grey70)
@@ -1191,10 +1210,11 @@ server <- function(input, output, session) {
       text = ~tooltip, hoverinfo = "text", showlegend = FALSE
     )
 
-    # Legend = one invisible proxy trace per category (traces 1..N), ordered by
-    # frequency (most common first). Each carries one tiny (size 0.1) real point
-    # (an all-NA proxy would be dropped); itemsizing keeps swatches full size.
-    legend_order <- names(sort(table(df$group), decreasing = TRUE))
+    # Legend = one invisible proxy trace per category (traces 1..N), in natural
+    # sorted order (numeric ascending, else alphabetical). Each carries one tiny
+    # (size 0.1) real point (an all-NA proxy would be dropped); itemsizing keeps
+    # swatches full size.
+    legend_order <- sort_levels(df$group)
     for (cat in legend_order) {
       idx <- which(df$group == cat)[1]
       p <- add_trace(
@@ -1229,7 +1249,7 @@ server <- function(input, output, session) {
     base <- umap_base()
     if (isTRUE(base$continuous)) return()   # gradient mode has no category toggles
     cols <- umap_point_cols(base, input$categories_shown)
-    legend_order <- names(sort(table(base$df$group), decreasing = TRUE))
+    legend_order <- sort_levels(base$df$group)
 
     proxy <- plotlyProxy("umap_plot", session)
     # Points trace (index 0): replace the whole colour vector.
@@ -1322,7 +1342,7 @@ server <- function(input, output, session) {
     if (n > 1) {
       ids <- paste0("feature_plot_individual_", seq_len(n))
       cb <- if (shared) "shared_colorbar" else NULL
-      tagList(div(style = "text-align: right; padding-right: 20px;",
+      tagList(div(style = "text-align: right; padding-right: 0;",
                   plot_dl_all_btn(ids, ncol, cb, "gene_expression_panels")), body)
     } else {
       body
@@ -1492,32 +1512,14 @@ server <- function(input, output, session) {
   # and a table.
   # ===========================================================================
 
-  # The selected assay for the Aggregated tab, defaulting to DefaultAssay until
-  # the input exists. Same shape as feature_assay_val() for Gene Expression.
-  agg_assay_val <- reactive({
-    a <- input$agg_assay
-    all_a <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
-    if (!is.null(a) && a %in% all_a) a else tryCatch(Seurat::DefaultAssay(seu()), error = function(e) all_a[1])
-  })
-
-  # Dynamic layer selector for the Aggregated tab: shows only the layers present
-  # in the selected assay, updating when the assay changes.
+  # Aggregated tab: assay + dynamic data-layer selector (any assay).
+  agg_assay_val <- make_assay_val("agg_assay")
   output$agg_layer_ui <- renderUI({
     assay_use <- agg_assay_val()
     req(seu(), assay_use)
-    lyrs <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) "data")
-    layer_order <- intersect(c("data", "counts", "scale.data"), lyrs)
-    if (length(layer_order) == 0) layer_order <- lyrs[1]
-    .ln <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
-    choices <- setNames(layer_order, ifelse(layer_order %in% names(.ln), .ln[layer_order], layer_order))
-    selectInput("agg_layer", "Data layer:", choices = choices, width = "100%")
+    selectInput("agg_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
   })
-
-  # The selected data layer, defaulting to "data" until the input renders.
-  agg_layer <- reactive({
-    l <- input$agg_layer
-    if (is.null(l) || !nzchar(l)) "data" else l
-  })
+  agg_layer <- make_layer_val("agg_layer")
 
   # agg_matrix(): the genes x group-levels matrix of aggregated expression, using
   # the RAW values of the chosen assay/layer (no app-side z-scoring).
@@ -1538,7 +1540,7 @@ server <- function(input, output, session) {
     expr_mat <- as.matrix(full[genes, , drop = FALSE])     # genes x cells (chosen layer)
     grp <- as.character(seu()@meta.data[[input$agg_group_var]])
     grp[is.na(grp)] <- "NA"                                # un-annotated cells -> "NA" group
-    groups <- sort(unique(grp))
+    groups <- sort_levels(grp)
 
     mat <- matrix(NA_real_, nrow = length(genes), ncol = length(groups),
                   dimnames = list(genes, groups))
@@ -1704,7 +1706,7 @@ server <- function(input, output, session) {
   # ---- Generic Cluster Markers: chosen group vs all other cells ----
   output$gmarker_cluster_ui <- renderUI({
     req(input$gmarker_group)
-    lvls <- sort(unique(as.character(seu()@meta.data[[input$gmarker_group]])))
+    lvls <- sort_levels(seu()@meta.data[[input$gmarker_group]])
     selectInput("gmarker_cluster", "Group / cluster:", choices = lvls, width = "100%")
   })
 
@@ -1744,30 +1746,17 @@ server <- function(input, output, session) {
     obj
   }
 
-  # Dynamic layer selectors: show layers available for the chosen assay.
-  # The .layer_names lookup gives friendly labels.
-  .layer_names <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
-
+  # Dynamic layer selectors for the DE tabs: show layers available for the chosen assay.
   output$gmarker_layer_ui <- renderUI({
     assay_use <- gmarker_assay_val()
     req(seu(), assay_use)
-    lyrs <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) "data")
-    layer_order <- intersect(c("data", "counts", "scale.data"), lyrs)
-    if (length(layer_order) == 0) layer_order <- lyrs[1]
-    choices <- setNames(layer_order,
-                        ifelse(layer_order %in% names(.layer_names), .layer_names[layer_order], layer_order))
-    selectInput("gmarker_layer", "Data layer:", choices = choices, width = "100%")
+    selectInput("gmarker_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
   })
 
   output$gcontrast_layer_ui <- renderUI({
     assay_use <- gcontrast_assay_val()
     req(seu(), assay_use)
-    lyrs <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) "data")
-    layer_order <- intersect(c("data", "counts", "scale.data"), lyrs)
-    if (length(layer_order) == 0) layer_order <- lyrs[1]
-    choices <- setNames(layer_order,
-                        ifelse(layer_order %in% names(.layer_names), .layer_names[layer_order], layer_order))
-    selectInput("gcontrast_layer", "Data layer:", choices = choices, width = "100%")
+    selectInput("gcontrast_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
   })
 
   gmarker_res <- reactive({
@@ -1807,12 +1796,12 @@ server <- function(input, output, session) {
   # ---- Generic Contrasts: target group vs reference group ----
   output$gcontrast_target_ui <- renderUI({
     req(input$gcontrast_group)
-    lvls <- sort(unique(as.character(seu()@meta.data[[input$gcontrast_group]])))
+    lvls <- sort_levels(seu()@meta.data[[input$gcontrast_group]])
     selectInput("gcontrast_target", "Target (A):", choices = lvls, width = "100%")
   })
   output$gcontrast_reference_ui <- renderUI({
     req(input$gcontrast_group)
-    lvls <- sort(unique(as.character(seu()@meta.data[[input$gcontrast_group]])))
+    lvls <- sort_levels(seu()@meta.data[[input$gcontrast_group]])
     selectInput("gcontrast_reference", "Reference (B):", choices = lvls,
                 selected = if (length(lvls) > 1) lvls[2] else lvls[1], width = "100%")
   })
@@ -1858,8 +1847,8 @@ server <- function(input, output, session) {
   # ===========================================================================
   # Split by Group: one gene shown as a separate expression UMAP per level of a
   # grouping column. Each panel plots that group's cells (coloured by the gene's
-  # expression) over a grey backdrop of all cells, on a shared 0..max scale so
-  # the panels are directly comparable. Panel titles are the group names.
+  # raw expression in the chosen layer) over a grey backdrop of all cells, on a
+  # shared colour scale (from expr_limits()) so the panels are directly comparable.
   # ===========================================================================
   # Hard limit on how many groups can be shown at once. The panels are WebGL
   # (fast for many cells), and browsers cap live WebGL contexts, so we bound the
@@ -1877,38 +1866,20 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "split_gene", choices = ch, selected = sel, server = TRUE)
   })
 
-  # Selected assay for the Split tab, defaulting to DefaultAssay until the input
-  # exists. Same shape as feature_assay_val() / agg_assay_val().
-  split_assay_val <- reactive({
-    a <- input$split_assay
-    all_a <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
-    if (!is.null(a) && a %in% all_a) a else tryCatch(Seurat::DefaultAssay(seu()), error = function(e) all_a[1])
-  })
-
-  # Dynamic layer selector for the Split tab: only the layers present in the
-  # selected assay, updating when the assay changes.
+  # Split tab: assay + dynamic data-layer selector (any assay).
+  split_assay_val <- make_assay_val("split_assay")
   output$split_layer_ui <- renderUI({
     assay_use <- split_assay_val()
     req(seu(), assay_use)
-    lyrs <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) "data")
-    layer_order <- intersect(c("data", "counts", "scale.data"), lyrs)
-    if (length(layer_order) == 0) layer_order <- lyrs[1]
-    .ln <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
-    choices <- setNames(layer_order, ifelse(layer_order %in% names(.ln), .ln[layer_order], layer_order))
-    selectInput("split_layer", "Data layer:", choices = choices, width = "100%")
+    selectInput("split_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
   })
-
-  # Selected data layer, defaulting to "data" until the input renders.
-  split_layer <- reactive({
-    l <- input$split_layer
-    if (is.null(l) || !nzchar(l)) "data" else l
-  })
+  split_layer <- make_layer_val("split_layer")
 
   # Levels of the "Split by" column -- pick WHICH primary groups to show.
   output$split_levels_ui <- renderUI({
     req(input$split_group)
     vals <- as.character(seu()@meta.data[[input$split_group]]); vals[is.na(vals)] <- "NA"
-    lvls <- sort(unique(vals))
+    lvls <- sort_levels(vals)
     selectizeInput("split_levels",
                    paste0(pretty_label(input$split_group), " - groups to show:"),
                    choices = lvls, selected = character(0), multiple = TRUE, width = "100%",
@@ -1920,7 +1891,7 @@ server <- function(input, output, session) {
   output$split_levels2_ui <- renderUI({
     req(input$split_then)
     vals <- as.character(seu()@meta.data[[input$split_then]]); vals[is.na(vals)] <- "NA"
-    lvls <- sort(unique(vals))
+    lvls <- sort_levels(vals)
     selectizeInput("split_levels2",
                    paste0(pretty_label(input$split_then), " - groups to show:"),
                    choices = lvls, selected = character(0), multiple = TRUE, width = "100%",
@@ -1949,7 +1920,7 @@ server <- function(input, output, session) {
     lims <- expr_limits(expr)
     layer_lab <- layer_label(layer_use)
 
-    all_levels <- sort(unique(grp))
+    all_levels <- sort_levels(grp)
     sel <- input$split_levels[input$split_levels %in% all_levels]
     sel <- head(sel, split_max_panels)   # primary groups the user picked
 
@@ -1959,7 +1930,7 @@ server <- function(input, output, session) {
     grp2 <- NULL; sec_sel <- NULL
     if (!is.null(sec_col) && nzchar(sec_col) && sec_col %in% colnames(seu()@meta.data)) {
       grp2 <- as.character(seu()@meta.data[[sec_col]]); grp2[is.na(grp2)] <- "NA"
-      all_sec <- sort(unique(grp2))
+      all_sec <- sort_levels(grp2)
       sec_sel <- input$split_levels2[input$split_levels2 %in% all_sec]
     }
 
@@ -2036,7 +2007,7 @@ server <- function(input, output, session) {
     # "Download all as one PNG" (all panels + the shared colorbar composited).
     if (n > 1) {
       ids <- paste0("split_panel_", seq_len(n))
-      tagList(div(style = "text-align: right; padding-right: 20px;",
+      tagList(div(style = "text-align: right; padding-right: 0;",
                   plot_dl_all_btn(ids, ncol, "split_colorbar",
                                   paste0(d$gene, "_split_panels"))), body)
     } else {
