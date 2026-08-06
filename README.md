@@ -101,9 +101,7 @@ seu <- RunUMAP(seu, dims = 1:30)             # adds the required "umap" reductio
 saveRDS(seu, "my_object.rds")
 ```
 
-Then upload `my_object.rds` in the app. (Objects produced by the
-[scdrake](https://github.com/bioinfocz/scdrake) pipeline already contain all of
-this, plus the optional marker/contrast tables below.)
+Then upload `my_object.rds` in the app.
 
 ## What your Seurat object needs
 
