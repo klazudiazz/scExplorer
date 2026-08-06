@@ -23,10 +23,10 @@ Three cards summarise the object:
 | Genes | Number of genes/features (`nrow`) |
 | Samples | Number of distinct samples/batches, detected from a sample/batch column (shows `-` if none found) |
 
-### Assays & layers strip
+### Assays/layers strip
 Below the cards, a strip lists every assay and the layers it contains, e.g.:
 
-> Assays & layers: RNA: `counts`  SCT: `counts` `data` `scale.data`  integrated: `data` `scale.data`
+> Assays/layers: RNA: `counts`  SCT: `counts` `data` `scale.data`  integrated: `data` `scale.data`
 
 This tells you at a glance which assays exist and which data layers are available in
 each - useful because the Assay/Data-layer menus throughout the app only offer what's
