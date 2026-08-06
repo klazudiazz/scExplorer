@@ -4,8 +4,7 @@
 
 A Shiny app (`scExplorer`) that lets you upload any Seurat object `.rds` (or load
 a bundled example) and explore it in the browser - no coding required. Built to
-work with plain Seurat objects and with objects produced by the
-[scdrake](https://github.com/bioinfocz/scdrake) pipeline.
+work with plain Seurat objects.
 
 ## Documentation
 
