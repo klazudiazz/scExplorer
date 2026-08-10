@@ -700,6 +700,16 @@ server <- function(input, output, session) {
     c(r[1] - pad, r[2] + pad)
   })
 
+  # A fixed, "nice" tick spacing for the UMAP axes (aiming for ~6 gridlines).
+  # Pinning it makes every colouring draw gridlines at the SAME values, instead
+  # of plotly auto-choosing different spacing per plot from the pixel width.
+  umap_dtick <- reactive({
+    raw <- diff(umap_range()) / 6
+    mag <- 10^floor(log10(raw))
+    nice <- c(1, 2, 2.5, 5, 10)
+    mag * nice[which.min(abs(nice - raw / mag))]
+  })
+
   # ordered_gene_choices(): the gene dropdown's choices in a given sort order --
   # "Alphabetical" (fast; no expression computation) or by average expression
   # (uses gene_avg_expr(), the slow rowMeans, only when actually requested).
@@ -945,6 +955,56 @@ server <- function(input, output, session) {
         withSpinner(DTOutput("gmarker_table"), caption = "Computing markers...", color = "#39FF14")
       )))
     }
+
+    # Marker Plot tab: a dot plot of chosen genes across a grouping column -- dot
+    # size = % of cells expressing, colour = average expression (z-scored per gene).
+    # The classic "markers per cell type" visualisation; pair it with the marker
+    # tables (copy top genes from Cluster Markers into the gene picker here).
+    tabs <- c(tabs, list(tabPanel(
+      "Marker Plot",
+      wellPanel(
+        fluidRow(
+          column(3, selectInput("dot_group_var", "Group by:", choices = grouping_choices, width = "100%")),
+          if (length(all_assays_ge) > 1)
+            column(2, selectInput("dot_assay", "Assay:", choices = all_assays_ge,
+                                  selected = def_assay_ge, width = "100%")),
+          column(3, uiOutput("dot_layer_ui")),
+          column(if (length(all_assays_ge) > 1) 4 else 6,
+                 radioButtons("dot_gene_mode", "Genes:",
+                              choices = c("Top markers per group (auto)" = "auto",
+                                          "Choose manually" = "manual"),
+                              selected = "auto", inline = TRUE))
+        ),
+        # AUTO: find each group's top markers (one group vs the rest). Gated behind
+        # a button because it computes markers for EVERY group (heavier than the
+        # single-group Cluster Markers tab).
+        conditionalPanel(
+          condition = "input.dot_gene_mode == 'auto'",
+          fluidRow(
+            column(3, numericInput("dot_top_n", "Top markers / group:", value = 3, min = 1, max = 15, width = "100%")),
+            column(3, selectInput("dot_test", "Test type:", choices = de_test_choices, width = "100%")),
+            column(3, div(style = "margin-top: 25px;",
+                          actionButton("dot_compute", "Compute markers",
+                                       style = "background-color: #39FF14; color: #1a1a1a; border-color: #39FF14; font-weight: 600;")))
+          )
+        ),
+        # MANUAL: pick genes yourself (e.g. copied from the Cluster Markers table).
+        conditionalPanel(
+          condition = "input.dot_gene_mode == 'manual'",
+          fluidRow(
+            column(3, selectInput("dot_gene_sort", "Sort genes by:", width = "100%",
+                                  choices = c("Alphabetical", "Highest average expression", "Lowest average expression"))),
+            column(9, selectizeInput("dot_genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
+                                     options = list(placeholder = "Type marker genes (e.g. from Cluster Markers)...")))
+          )
+        ),
+        helpText("Dot size = % of cells in the group expressing the gene; colour = average expression, z-scored per gene across groups (blue = low, red = high in that group). In auto mode, each group's top markers (group vs all other cells) are found and shown.")
+      ),
+      div(class = "plot-dl-wrap", style = "position: relative;",
+          plot_dl_btn("dot_plot", "marker_dotplot"),
+          withSpinner(plotlyOutput("dot_plot", height = "600px"),
+                      caption = "Computing markers / rendering...", color = "#39FF14"))
+    )))
 
     # Contrasts tab. Precomputed scdrake @misc$contrasts if present, otherwise
     # differential expression between two chosen groups computed on demand.
@@ -1215,9 +1275,11 @@ server <- function(input, output, session) {
                      x = 0, xref = "paper", xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
         xaxis = list(title = "UMAP_1", zeroline = FALSE, range = umap_range(),
-                     constrain = "range"),
+                     tick0 = 0, dtick = umap_dtick(),
+                     constrain = "domain", constraintoward = "center"),
         yaxis = list(title = "UMAP_2", zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
-                     constrain = "range", range = umap_range()),
+                     tick0 = 0, dtick = umap_dtick(),
+                     constrain = "domain", constraintoward = "middle", range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 40)
       )
       return(plotly::config(p, displayModeBar = FALSE))
@@ -1239,10 +1301,10 @@ server <- function(input, output, session) {
       text = ~tooltip, hoverinfo = "text", showlegend = FALSE
     )
 
-    # Legend = one invisible proxy trace per category (traces 1..N), in natural
-    # sorted order (numeric ascending, else alphabetical). Each carries one tiny
-    # (size 0.1) real point (an all-NA proxy would be dropped); itemsizing keeps
-    # swatches full size.
+    # Legend on the right = one invisible proxy trace per category (traces 1..N),
+    # in natural sorted order. Each carries one tiny (size 0.1) real point;
+    # itemsizing keeps swatches full size. constrain="domain" pins the axis to the
+    # data range (so the axis never stretches, however wide the legend is).
     legend_order <- sort_levels(df$group)
     for (cat in legend_order) {
       idx <- which(df$group == cat)[1]
@@ -1255,13 +1317,15 @@ server <- function(input, output, session) {
     }
 
     p <- plotly::layout(
-      p,
+      p, hovermode = "closest",
       title = list(text = paste("UMAP colored by", pretty_label(input$group_var)), x = 0, xref = "paper", xanchor = "left",
                    font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
       xaxis = list(title = "UMAP_1", zeroline = FALSE, range = umap_range(),
-                   constrain = "range"),
+                   tick0 = 0, dtick = umap_dtick(),
+                   constrain = "domain", constraintoward = "center"),
       yaxis = list(title = "UMAP_2", zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
-                   constrain = "range", range = umap_range()),
+                   tick0 = 0, dtick = umap_dtick(),
+                   constrain = "domain", constraintoward = "middle", range = umap_range()),
       showlegend = TRUE,
       legend = list(title = list(text = pretty_label(input$group_var)), itemsizing = "constant",
                     y = 0.5, yanchor = "middle"),
@@ -1272,18 +1336,15 @@ server <- function(input, output, session) {
 
   # Toggling a category recolours the EXISTING plot via plotly restyle -- no
   # re-render, no "Rendering plot..." spinner. Trace 0 = points; traces 1..N =
-  # the legend swatches (frequency order), recoloured to match the selection.
+  # the legend swatches, recoloured to grey out / restore each category.
   observeEvent(input$categories_shown, {
     req(input$group_var)
     base <- umap_base()
     if (isTRUE(base$continuous)) return()   # gradient mode has no category toggles
     cols <- umap_point_cols(base, input$categories_shown)
     legend_order <- sort_levels(base$df$group)
-
     proxy <- plotlyProxy("umap_plot", session)
-    # Points trace (index 0): replace the whole colour vector.
     plotlyProxyInvoke(proxy, "restyle", list(marker.color = list(cols$points)), list(0))
-    # Legend swatches (traces 1..N): grey out / restore each category.
     leg_cols <- unname(cols$legend[legend_order])
     plotlyProxyInvoke(proxy, "restyle",
                       list(marker.color = as.list(leg_cols)),
@@ -1628,6 +1689,138 @@ server <- function(input, output, session) {
                      check.names = FALSE, row.names = NULL)
     dt_with_excel(df, "aggregated_expression")
   }, server = FALSE)   # client-side so the Excel button exports ALL rows, not just the current page
+
+  # ===========================================================================
+  # Marker Plot tab: a dot plot of selected genes x a grouping column.
+  #   dot size  = % of cells in the group that express the gene (raw layer > 0)
+  #   dot colour = average expression, z-scored per gene ACROSS groups
+  # (so the diverging blue-white-red scale reads as "low/high in this group").
+  # ===========================================================================
+  dot_assay_val <- make_assay_val("dot_assay")
+  output$dot_layer_ui <- renderUI({
+    assay_use <- dot_assay_val()
+    req(seu(), assay_use)
+    selectInput("dot_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
+  })
+  dot_layer <- make_layer_val("dot_layer")
+
+  # Populate the (manual-mode) gene picker in the chosen sort order.
+  observeEvent(list(seu(), input$dot_gene_sort), {
+    req(seu(), input$dot_gene_sort)
+    updateSelectizeInput(session, "dot_genes",
+                         choices = ordered_gene_choices(input$dot_gene_sort), server = TRUE)
+  })
+
+  # AUTO mode: FindAllMarkers on the grouping column (each group vs the rest),
+  # computed only when "Compute markers" is clicked (it's heavier than the
+  # single-group Cluster Markers tab). Returns the raw results table (or an error).
+  dot_auto <- eventReactive(input$dot_compute, {
+    req(input$dot_group_var)
+    grp <- input$dot_group_var; assay_use <- dot_assay_val(); test <- input$dot_test
+    obj <- prepare_obj_for_de(seu(), assay_use)
+    Seurat::Idents(obj) <- grp                         # use the grouping column as identities
+    res <- tryCatch(
+      suppressWarnings(Seurat::FindAllMarkers(
+        obj, only.pos = TRUE, test.use = test, assay = assay_use,
+        min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE)),   # drop sparse / low-FC genes
+      error = function(e) e
+    )
+    # Remember WHAT this was computed for, so we can detect stale results below.
+    list(res = res, group = grp, assay = assay_use, test = test)
+  })
+
+  # The genes to plot: the manual picker, or the top-N markers per group from the
+  # last auto computation (re-slicing top-N is instant; it doesn't recompute DE).
+  dot_genes_final <- reactive({
+    if (identical(input$dot_gene_mode, "auto")) {
+      a <- dot_auto()
+      # Stale-guard: the auto genes belong to the grouping/assay/test they were
+      # computed with. If any changed since, prompt a refresh instead of showing
+      # the previous grouping's genes.
+      validate(need(!is.null(a) &&
+                    identical(a$group, input$dot_group_var) &&
+                    identical(a$assay, dot_assay_val()) &&
+                    identical(a$test, input$dot_test),
+                    "Click 'Compute markers' to find the top markers for the current grouping."))
+      res <- a$res
+      validate(need(!inherits(res, "error"),
+                    paste("Could not compute markers:",
+                          if (inherits(res, "error")) conditionMessage(res) else "")))
+      validate(need(is.data.frame(res) && nrow(res) > 0, "No markers found for this grouping."))
+      n <- if (is.null(input$dot_top_n) || is.na(input$dot_top_n)) 3 else input$dot_top_n
+      # Keep significant markers (when the test gives a p-value; ROC doesn't), so
+      # the top-N are real cluster markers, not high-FC-but-sparse junk genes.
+      if ("p_val_adj" %in% names(res)) res <- res[!is.na(res$p_val_adj) & res$p_val_adj < 0.05, ]
+      validate(need(nrow(res) > 0,
+                    "No significant markers passed the filter. Try a different test or grouping."))
+      res <- res[order(res$cluster, -res$avg_log2FC), ]
+      unique(unlist(by(res, res$cluster, function(d) head(d$gene, n))))   # top N per group, block-ordered
+    } else {
+      input$dot_genes
+    }
+  })
+
+  # dot_data(): per gene x group, the % expressing and the mean expression, plus
+  # the mean z-scored per gene across groups (for colour).
+  dot_data <- reactive({
+    req(input$dot_group_var)
+    gsel <- dot_genes_final()
+    validate(need(length(gsel) > 0,
+                  "Pick genes (manual mode) or click 'Compute markers' (auto mode)."))
+    assay_use <- dot_assay_val(); layer_use <- dot_layer()
+    full <- GetAssayData(seu(), layer = layer_use, assay = assay_use)   # genes x cells
+    genes <- gsel[gsel %in% rownames(full)]
+    validate(need(length(genes) > 0,
+                  paste0("None of the selected genes are in the '", layer_use,
+                         "' layer of assay '", assay_use, "'.")))
+    m <- full[genes, , drop = FALSE]
+    grp <- as.character(seu()@meta.data[[input$dot_group_var]]); grp[is.na(grp)] <- "NA"
+    groups <- sort_levels(grp)
+
+    pct <- matrix(0, length(genes), length(groups), dimnames = list(genes, groups))
+    avg <- matrix(0, length(genes), length(groups), dimnames = list(genes, groups))
+    for (l in groups) {
+      sub <- m[, grp == l, drop = FALSE]
+      pct[, l] <- as.numeric(Matrix::rowMeans(sub > 0)) * 100
+      avg[, l] <- as.numeric(Matrix::rowMeans(sub))
+    }
+    # z-score each gene's mean across groups (constant genes -> 0, i.e. white).
+    scaled <- t(scale(t(avg)))
+    scaled[!is.finite(scaled)] <- 0
+    list(genes = genes, groups = groups, pct = pct, avg = avg, scaled = scaled)
+  })
+
+  output$dot_plot <- renderPlotly({
+    d <- dot_data()
+    df <- expand.grid(gene = d$genes, group = d$groups,
+                      KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+    idx <- cbind(match(df$gene, d$genes), match(df$group, d$groups))
+    df$pct    <- d$pct[idx]
+    df$avg    <- d$avg[idx]
+    df$scaled <- d$scaled[idx]
+    df$dotsize <- 2 + (df$pct / 100) * 16                       # 0% -> 2px, 100% -> 18px
+    df$tt <- sprintf("Gene: %s<br>%s: %s<br>%% expressing: %.1f%%<br>Avg expr: %.3f",
+                     df$gene, pretty_label(input$dot_group_var), df$group, df$pct, df$avg)
+    lim <- max(abs(d$scaled), na.rm = TRUE); if (!is.finite(lim) || lim <= 0) lim <- 1
+
+    plot_ly(df, x = ~gene, y = ~group, type = "scatter", mode = "markers",
+            marker = list(size = ~dotsize, color = ~scaled, colorscale = EXPR_COLORSCALE,
+                          cmin = -lim, cmax = lim, line = list(width = 0.5, color = "rgba(120,120,120,0.5)"),
+                          colorbar = list(title = list(text = "Avg expr (z)"),
+                                          thickness = 15, len = 0.6, outlinewidth = 0)),
+            text = ~tt, hoverinfo = "text") %>%
+      plotly::layout(
+        title = list(text = paste0("Marker dot plot by ", pretty_label(input$dot_group_var)),
+                     x = 0, xref = "paper", xanchor = "left",
+                     font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
+        xaxis = list(title = "", type = "category", tickangle = -45,
+                     categoryorder = "array", categoryarray = d$genes),
+        yaxis = list(title = "", type = "category",
+                     categoryorder = "array", categoryarray = rev(d$groups)),
+        margin = list(l = 130, r = 10, t = 50, b = 120)
+      ) %>%
+      plotly::config(displayModeBar = FALSE)
+  })
 
   # ===========================================================================
   # Cluster Markers & Contrasts tabs (interactive DT tables).
