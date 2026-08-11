@@ -131,6 +131,10 @@ blue → white → red scale. Values are the raw values of the chosen data layer
 > Genes missing from `scale.data` (only variable features are scaled) show a short
 > message in that panel - expected, not an error.
 
+> At most 12 gene panels are drawn at once. Each panel is a full interactive (WebGL)
+> UMAP, and browsers limit how many can be live before the tab freezes. If you pick
+> more than 12 genes the tab asks you to select fewer instead of drawing them.
+
 Used for: seeing *where* a gene is expressed - confirming a cluster's identity from
 a marker, or checking a gene of interest's activity across the map.
 
@@ -159,9 +163,14 @@ B) Computed live (any object):
 | Data layer | Which layer the test reads (only the layers present in the assay are offered) |
 | Group / cluster | Which group to find markers for (that group vs everyone else) |
 | Test type | Statistical test (see the list below) |
+| Compute markers | Runs the computation. It does not run automatically - see the note below |
 | Search | Filter the results table |
 
-Markers are auto-computed on selection. Table columns: `avg_log2FC` (how much higher
+Set the options, then click Compute markers. It is not automatic on purpose: the
+computation is heavy on large objects and would otherwise re-run on every dropdown
+change and freeze the app. After it runs, changing an option shows a "click Compute
+markers" prompt until you re-run; the Search box filters the existing results without
+recomputing. Table columns: `avg_log2FC` (how much higher
 in this group), `pct.1` / `pct.2` (fraction of cells expressing it, in the group vs the
 rest), `p_val` and `p_val_adj` (significance; very significant genes can display as `0`
 when they underflow double precision).
@@ -239,7 +248,12 @@ B) Computed live (any object):
 | Target (A) | The first group |
 | Reference (B) | The group to compare against |
 | Test type | Statistical test |
+| Compute contrast | Runs the computation (not automatic, same as Cluster Markers) |
 | Search | Filter results |
+
+Set the options, then click Compute contrast. Like Cluster Markers it does not run
+automatically (the computation is heavy); after it runs, changing an option prompts a
+re-run, and Search filters the existing results without recomputing.
 
 Difference from Cluster Markers: Markers = one group vs *everyone else*;
 Contrasts = one group vs *one specific other group*.
