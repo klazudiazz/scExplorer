@@ -126,11 +126,10 @@ expr_limits <- function(v) {
   }
 }
 
-# Human-readable name for an assay layer.
 layer_label <- function(L) switch(L,
   data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z)", L)
 
-# Friendly labels for a "Data layer" dropdown (fuller than layer_label()).
+# labels for a "Data layer" dropdown (fuller than layer_label()).
 LAYER_LABELS <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
 
 # Named choices for a "Data layer" selector: the layers present in `assay_use`
