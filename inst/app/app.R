@@ -950,8 +950,13 @@ server <- function(input, output, session) {
             column(2, selectInput("gmarker_test", "Test type:", choices = de_test_choices, width = "100%")),
             column(2, textInput("gmarker_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
           ),
+          fluidRow(
+            column(3, div(style = "margin-top: 5px;",
+                          actionButton("gmarker_compute", "Compute markers",
+                                       style = "background-color: #39FF14; color: #1a1a1a; border-color: #39FF14; font-weight: 600;")))
+          ),
           helpText(
-            "Markers of the chosen group vs all other cells. Computed automatically.",
+            "Markers of the chosen group vs all other cells. Set the options, then click 'Compute markers' -- it is heavy on large objects, so it does NOT run automatically.",
             if (length(de_assays) > 1) " 'integrated' is excluded because DE on batch-corrected values is statistically invalid.",
             " Layer: 'data' = log-normalized (default for most tests); 'counts' = raw (used by count-based tests like Poisson)."
           )
@@ -1071,8 +1076,13 @@ server <- function(input, output, session) {
             column(2, selectInput("gcontrast_test", "Test type:", choices = de_test_choices, width = "100%")),
             column(if (length(de_assays) > 1) 2 else 4, textInput("gcontrast_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
           ),
+          fluidRow(
+            column(3, div(style = "margin-top: 5px;",
+                          actionButton("gcontrast_compute", "Compute contrast",
+                                       style = "background-color: #39FF14; color: #1a1a1a; border-color: #39FF14; font-weight: 600;")))
+          ),
           helpText(
-            "Differential expression, target vs reference group. Computed automatically.",
+            "Differential expression, target vs reference group. Set the options, then click 'Compute contrast' -- it is heavy on large objects, so it does NOT run automatically.",
             if (length(de_assays) > 1) " 'integrated' is excluded because DE on batch-corrected values is statistically invalid.",
             " Layer: 'data' = log-normalized (default for most tests); 'counts' = raw (used by count-based tests like Poisson)."
           )
@@ -1298,8 +1308,14 @@ server <- function(input, output, session) {
                        type = "scattergl", mode = "markers",
                        marker = list(size = 4, color = ~value, colorscale = "Viridis",
                                      cmin = full[1], cmax = full[2],
-                                     colorbar = list(title = list(text = pretty_label(input$group_var)),
-                                                     thickness = 15, len = 0.5, outlinewidth = 0)),
+                                     # Title on the SIDE (vertical, along the bar), not on top: a
+                                     # long column name on top sprawls sideways and makes plotly
+                                     # reserve a wide right margin, shrinking the (equal-aspect)
+                                     # square. Side title keeps the same footprint as the
+                                     # categorical legend, so gradient plots stay the same size.
+                                     colorbar = list(title = list(text = pretty_label(input$group_var), side = "right"),
+                                                     thickness = 15, len = 0.5, outlinewidth = 0,
+                                                     x = 1.02, xanchor = "left", y = 0.5, yanchor = "middle")),
                        text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
       }
       p <- plotly::layout(
@@ -1384,6 +1400,11 @@ server <- function(input, output, session) {
                       as.list(seq_along(legend_order)))
   }, ignoreInit = TRUE)
 
+  # Max Gene Expression panels drawn at once. Each gene is a full-resolution WebGL
+  # UMAP, and browsers cap live WebGL contexts (~8-16) -- too many at once freezes
+  # the tab. Mirrors Split by Group's split_max_panels. TWEAK: raise cautiously.
+  feature_max_panels <- 12
+
   # ---- Square grid for Gene Expression ----
   # Each plot is a square whose side is the SMALLER of the width available per
   # column and the height available per row (viewport-aware). Using the same
@@ -1399,6 +1420,11 @@ server <- function(input, output, session) {
         return(helpText("Tick one or more layers under \"Layers to show\" to display them."))
       return(NULL)
     }
+    # Refuse to draw more than feature_max_panels WebGL UMAPs at once -- past the
+    # browser's live-context ceiling the tab freezes (same guard Split by Group uses).
+    validate(need(n <= feature_max_panels,
+                  sprintf("That would draw %d plots at once (max %d), which can freeze the browser. Select fewer genes.",
+                          n, feature_max_panels)))
 
     # "layers" mode = one gene per layer, each with its own scale, so no single
     # shared colorbar. Otherwise the shared colorbar shows in "same scale" mode.
@@ -2092,7 +2118,12 @@ server <- function(input, output, session) {
     selectInput("gcontrast_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
   })
 
-  gmarker_res <- reactive({
+  # Gated behind the "Compute markers" button. FindMarkers over the whole object
+  # is heavy (seconds to minutes on large data) and Shiny is single-threaded, so
+  # running it on every dropdown change would freeze the app for ALL sessions.
+  # eventReactive only recomputes on click; the result is stamped with the inputs
+  # it was computed for so the table can flag a stale selection (see gmarker_table).
+  gmarker_res <- eventReactive(input$gmarker_compute, {
     req(seu(), input$gmarker_group, input$gmarker_cluster, input$gmarker_test)
     assay_use <- gmarker_assay_val()
     req(assay_use)
@@ -2107,7 +2138,7 @@ server <- function(input, output, session) {
     } else {
       "data"
     }
-    tryCatch(
+    res <- tryCatch(
       # suppressWarnings: some tests (e.g. negbinom) emit one benign per-gene
       # convergence warning each -- hundreds of lines. Errors are still caught.
       suppressWarnings(
@@ -2116,10 +2147,25 @@ server <- function(input, output, session) {
       ),
       error = function(e) e
     )
+    # Stamp what this was computed for, so an input change since can be detected.
+    list(res = res, group = input$gmarker_group, cluster = input$gmarker_cluster,
+         assay = assay_use, layer = input$gmarker_layer, test = input$gmarker_test)
   })
 
   output$gmarker_table <- renderDT({
-    res <- gmarker_res()
+    # Before the first compute, prompt rather than hanging on the spinner.
+    validate(need(isTRUE(input$gmarker_compute > 0),
+                  "Set the options above, then click 'Compute markers'."))
+    a <- gmarker_res()
+    # Stale-guard: the cached result belongs to the inputs it was computed with.
+    # If any changed since, ask for a recompute instead of showing mislabeled data.
+    validate(need(identical(a$group, input$gmarker_group) &&
+                  identical(a$cluster, input$gmarker_cluster) &&
+                  identical(a$assay, gmarker_assay_val()) &&
+                  identical(a$layer, input$gmarker_layer) &&
+                  identical(a$test, input$gmarker_test),
+                  "Inputs changed. Click 'Compute markers' to update the table."))
+    res <- a$res
     if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute markers:", conditionMessage(res))))
     out <- format_generic_de(res)
     out <- apply_field_search(out, "All columns", input$gmarker_search_text)
@@ -2141,7 +2187,10 @@ server <- function(input, output, session) {
 
   # Auto-computes whenever the groups or test change (cached until then, so the
   # search box only re-filters -- no recompute).
-  gcontrast_res <- reactive({
+  # Gated behind the "Compute contrast" button (same reason as gmarker_res above:
+  # FindMarkers is heavy and Shiny is single-threaded). Only recomputes on click;
+  # stamped with its inputs so the table can flag a stale selection.
+  gcontrast_res <- eventReactive(input$gcontrast_compute, {
     req(seu(), input$gcontrast_group, input$gcontrast_target, input$gcontrast_reference, input$gcontrast_test)
     validate(need(input$gcontrast_target != input$gcontrast_reference, "Pick two different groups."))
     assay_use <- gcontrast_assay_val()
@@ -2157,7 +2206,7 @@ server <- function(input, output, session) {
     } else {
       "data"
     }
-    tryCatch(
+    res <- tryCatch(
       # suppressWarnings: silence the benign per-gene convergence notes (e.g.
       # negbinom's theta.ml "iteration limit reached"). Errors still caught.
       suppressWarnings(
@@ -2167,10 +2216,23 @@ server <- function(input, output, session) {
       ),
       error = function(e) e
     )
+    list(res = res, group = input$gcontrast_group, target = input$gcontrast_target,
+         reference = input$gcontrast_reference, assay = assay_use,
+         layer = input$gcontrast_layer, test = input$gcontrast_test)
   })
 
   output$gcontrast_table <- renderDT({
-    res <- gcontrast_res()
+    validate(need(isTRUE(input$gcontrast_compute > 0),
+                  "Set the options above, then click 'Compute contrast'."))
+    a <- gcontrast_res()
+    validate(need(identical(a$group, input$gcontrast_group) &&
+                  identical(a$target, input$gcontrast_target) &&
+                  identical(a$reference, input$gcontrast_reference) &&
+                  identical(a$assay, gcontrast_assay_val()) &&
+                  identical(a$layer, input$gcontrast_layer) &&
+                  identical(a$test, input$gcontrast_test),
+                  "Inputs changed. Click 'Compute contrast' to update the table."))
+    res <- a$res
     if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute contrast:", conditionMessage(res))))
     out <- format_generic_de(res)
     out <- apply_field_search(out, "All columns", input$gcontrast_search_text)
