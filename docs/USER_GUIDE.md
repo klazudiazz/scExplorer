@@ -171,7 +171,57 @@ different?" → look them up to name it.
 
 ---
 
-## 4. Contrasts (DEA)
+## 4. Marker Plot
+
+Marker genes across a grouping column, as either a dot plot or violins. The first thing
+you choose is the Plot type; the options below adapt to it. Group by, Assay and Data
+layer apply to both.
+
+| Option | What it does |
+|---|---|
+| Plot type | Dot plot or Violin (choose first) |
+| Group by | The metadata column for the groups (cell type, cluster, condition...) |
+| Assay *(if >1)* | Which assay to read |
+| Data layer | Which layer to use (Normalized / Raw counts / Scaled) |
+
+### Dot plot
+
+Genes on the x-axis, groups on the y-axis. Dot size = % of cells in the group that
+express the gene; dot colour = average expression z-scored per gene across groups
+(blue = low, red = high in that group) - so you see at a glance which group each marker
+is specific to.
+
+| Option | What it does |
+|---|---|
+| Genes: Top markers per group (auto) | Finds each group's top markers (group vs the rest) automatically |
+| &nbsp;&nbsp;• Top markers / group | How many top markers per group (e.g. 3) |
+| &nbsp;&nbsp;• Test type | Statistical test for the markers (Wilcoxon by default) |
+| &nbsp;&nbsp;• Compute markers | Runs the computation (gated behind a button - it's heavier than one group) |
+| Genes: Choose manually | Type genes yourself (e.g. copied from the Cluster Markers table) |
+
+Auto mode notes:
+- Click Compute markers after you change the grouping, assay, or test - the plot tells
+  you when the genes are stale for the current grouping.
+- Only significant markers expressed in at least 25% of a group are kept, so the top
+  genes are real cluster markers rather than high-fold-change-but-sparse noise.
+- Changing "Top markers / group" re-slices instantly (no recompute).
+
+### Violin
+
+One row of violins per gene (x = group), showing the expression distribution: the violin
+shape, an inner box (median and quartiles) and jittered individual cells. Pick the genes
+with the "Genes to show (violin)" box (a searchable dropdown of all genes, sorted by the
+"Sort genes by" option); it starts filled with your computed markers, if any. It is
+interactive - hover a point for a cell's exact value, hover the box for the quartile
+stats, drag to zoom, double-click to reset. Cells are downsampled for responsiveness.
+
+Used for: seeing each group's defining markers in one figure (dot plot), or the full
+expression distribution of chosen genes per group (violin) - e.g. spotting a bimodal or
+skewed gene.
+
+---
+
+## 5. Contrasts (DEA)
 
 Differential expression between two groups you choose (A vs B) - a head-to-head
 comparison ("DEA" = Differential Expression Analysis). Precomputed or live:
@@ -218,7 +268,7 @@ makes these substantially faster (Seurat uses it automatically). If an assay lac
 
 ---
 
-## 5. Aggregated Expression
+## 6. Aggregated Expression
 
 A summary heatmap + table: for each selected gene, one value per group (a
 pseudobulk-style summary).
@@ -242,7 +292,7 @@ Used for: comparing a panel of genes across conditions/clusters at a glance -
 
 ---
 
-## 6. Split by Group
+## 7. Split by Group
 
 One gene shown as a separate expression UMAP per group - e.g. one panel per cell
 type, condition, or sample. Each panel shows only that group's cells (coloured by the
@@ -282,6 +332,7 @@ by which cells are shown.
 | What clusters / cell types are there? | Clusters / Metadata |
 | Where is gene X expressed (and in which layer)? | Gene Expression |
 | What defines this cluster / cell type? | Cluster Markers |
+| Which markers are specific to each cell type (one figure)? | Marker Plot |
 | How do groups A and B differ (gene table)? | Contrasts (DEA) |
 | How does a gene panel compare across conditions? | Aggregated Expression |
 | How does one gene differ across groups/cell types? | Split by Group |

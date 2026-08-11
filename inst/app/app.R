@@ -96,6 +96,10 @@ sort_levels <- function(x) {
   if (length(x) > 0 && all(!is.na(xn))) x[order(xn)] else sort(x)
 }
 
+# Choices for every "Sort genes by" dropdown (Gene Expression, Aggregated, Split,
+# Marker Plot). ordered_gene_choices() interprets these values.
+GENE_SORT_CHOICES <- c("Alphabetical", "Highest average expression", "Lowest average expression")
+
 # Diverging blue -> white -> red colour scale used for expression on EVERY plot
 # (Gene Expression, Aggregated Expression heatmap, Split by Group, and their
 # colorbars). TWEAK: edit these stops to re-theme the expression gradient app-wide.
@@ -894,7 +898,7 @@ server <- function(input, output, session) {
               column(2, selectInput("feature_assay", "Assay:", choices = all_assays_ge,
                                     selected = def_assay_ge, width = "100%")),
             column(3, selectInput("gene_sort", "Sort genes by:", width = "100%",
-                                  choices = c("Alphabetical", "Highest average expression", "Lowest average expression"))),
+                                  choices = GENE_SORT_CHOICES)),
             column(if (length(all_assays_ge) > 1) 4 else 6, selectizeInput("genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
                                      options = list(placeholder = "Type one or more gene symbols...")))
           ),
@@ -963,47 +967,76 @@ server <- function(input, output, session) {
     tabs <- c(tabs, list(tabPanel(
       "Marker Plot",
       wellPanel(
+        # Plot type is the FIRST thing to choose; everything below adapts to it.
+        fluidRow(
+          column(12, radioButtons("marker_plot_type", "Plot type:", inline = TRUE,
+                                  choices = c("Dot plot" = "dot", "Violin" = "violin"), selected = "dot"))
+        ),
         fluidRow(
           column(3, selectInput("dot_group_var", "Group by:", choices = grouping_choices, width = "100%")),
           if (length(all_assays_ge) > 1)
             column(2, selectInput("dot_assay", "Assay:", choices = all_assays_ge,
                                   selected = def_assay_ge, width = "100%")),
-          column(3, uiOutput("dot_layer_ui")),
-          column(if (length(all_assays_ge) > 1) 4 else 6,
-                 radioButtons("dot_gene_mode", "Genes:",
-                              choices = c("Top markers per group (auto)" = "auto",
-                                          "Choose manually" = "manual"),
-                              selected = "auto", inline = TRUE))
+          column(if (length(all_assays_ge) > 1) 3 else 4, uiOutput("dot_layer_ui"))
         ),
-        # AUTO: find each group's top markers (one group vs the rest). Gated behind
-        # a button because it computes markers for EVERY group (heavier than the
-        # single-group Cluster Markers tab).
+        # ---- DOT PLOT options: auto top markers, or a manual gene set ----
         conditionalPanel(
-          condition = "input.dot_gene_mode == 'auto'",
+          condition = "input.marker_plot_type == 'dot'",
           fluidRow(
-            column(3, numericInput("dot_top_n", "Top markers / group:", value = 3, min = 1, max = 15, width = "100%")),
-            column(3, selectInput("dot_test", "Test type:", choices = de_test_choices, width = "100%")),
-            column(3, div(style = "margin-top: 25px;",
-                          actionButton("dot_compute", "Compute markers",
-                                       style = "background-color: #39FF14; color: #1a1a1a; border-color: #39FF14; font-weight: 600;")))
+            column(12, radioButtons("dot_gene_mode", "Genes:", inline = TRUE,
+                                    choices = c("Top markers per group (auto)" = "auto",
+                                                "Choose manually" = "manual"), selected = "auto"))
+          ),
+          # AUTO: find each group's top markers (gated behind a button -- it computes
+          # markers for EVERY group).
+          conditionalPanel(
+            condition = "input.dot_gene_mode == 'auto'",
+            fluidRow(
+              column(3, numericInput("dot_top_n", "Top markers / group:", value = 3, min = 1, max = 15, width = "100%")),
+              column(3, selectInput("dot_test", "Test type:", choices = de_test_choices, width = "100%")),
+              column(3, div(style = "margin-top: 25px;",
+                            actionButton("dot_compute", "Compute markers",
+                                         style = "background-color: #39FF14; color: #1a1a1a; border-color: #39FF14; font-weight: 600;")))
+            )
+          ),
+          # MANUAL: pick genes yourself (e.g. from the Cluster Markers table).
+          conditionalPanel(
+            condition = "input.dot_gene_mode == 'manual'",
+            fluidRow(
+              column(3, selectInput("dot_gene_sort", "Sort genes by:", width = "100%",
+                                    choices = GENE_SORT_CHOICES)),
+              column(9, selectizeInput("dot_genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
+                                       options = list(placeholder = "Type marker genes (e.g. from Cluster Markers)...")))
+            )
           )
         ),
-        # MANUAL: pick genes yourself (e.g. copied from the Cluster Markers table).
+        # ---- VIOLIN options: just pick the genes to show ----
         conditionalPanel(
-          condition = "input.dot_gene_mode == 'manual'",
+          condition = "input.marker_plot_type == 'violin'",
           fluidRow(
-            column(3, selectInput("dot_gene_sort", "Sort genes by:", width = "100%",
-                                  choices = c("Alphabetical", "Highest average expression", "Lowest average expression"))),
-            column(9, selectizeInput("dot_genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
-                                     options = list(placeholder = "Type marker genes (e.g. from Cluster Markers)...")))
+            column(3, selectInput("violin_gene_sort", "Sort genes by:", width = "100%",
+                                  choices = GENE_SORT_CHOICES)),
+            column(9, selectizeInput("violin_genes", "Genes to show (violin):",
+                                     choices = NULL, multiple = TRUE, width = "100%",
+                                     options = list(placeholder = "Type or pick genes to show as violins...")))
           )
         ),
-        helpText("Dot size = % of cells in the group expressing the gene; colour = average expression, z-scored per gene across groups (blue = low, red = high in that group). In auto mode, each group's top markers (group vs all other cells) are found and shown.")
+        helpText("Dot plot: dot size = % of cells in the group expressing the gene, colour = average expression z-scored per gene across groups. Violin: the expression distribution per group of the genes you pick above (one row per gene). In auto mode, each group's top markers (group vs all other cells) are found and shown.")
       ),
-      div(class = "plot-dl-wrap", style = "position: relative;",
-          plot_dl_btn("dot_plot", "marker_dotplot"),
-          withSpinner(plotlyOutput("dot_plot", height = "600px"),
-                      caption = "Computing markers / rendering...", color = "#39FF14"))
+      conditionalPanel(
+        condition = "input.marker_plot_type == 'dot'",
+        div(class = "plot-dl-wrap", style = "position: relative;",
+            plot_dl_btn("dot_plot", "marker_dotplot"),
+            withSpinner(plotlyOutput("dot_plot", height = "600px"),
+                        caption = "Computing markers / rendering...", color = "#39FF14"))
+      ),
+      conditionalPanel(
+        condition = "input.marker_plot_type == 'violin'",
+        div(class = "plot-dl-wrap", style = "position: relative; width: 100%;",
+            plot_dl_btn("violin_plot", "marker_violin"),
+            withSpinner(uiOutput("violin_plot_ui"),
+                        caption = "Computing markers / rendering...", color = "#39FF14"))
+      )
     )))
 
     # Contrasts tab. Precomputed scdrake @misc$contrasts if present, otherwise
@@ -1060,7 +1093,7 @@ server <- function(input, output, session) {
           column(3, selectInput("agg_group_var", "Aggregate by:",
                                 choices = grouping_choices, width = "100%")),
           column(3, selectInput("agg_gene_sort", "Sort genes by:", width = "100%",
-                                choices = c("Alphabetical", "Highest average expression", "Lowest average expression"))),
+                                choices = GENE_SORT_CHOICES)),
           column(6, selectizeInput("agg_genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
                                    options = list(placeholder = "Type one or more gene symbols...")))
         ),
@@ -1100,7 +1133,7 @@ server <- function(input, output, session) {
           column(2, selectInput("split_then", "Then by (optional):",
                                 choices = c("(none)" = "", grouping_choices), width = "100%")),
           column(3, selectInput("split_gene_sort", "Sort genes by:", width = "100%",
-                                choices = c("Alphabetical", "Highest average expression", "Lowest average expression"))),
+                                choices = GENE_SORT_CHOICES)),
           column(3, selectizeInput("split_gene", "Gene:", choices = NULL, multiple = FALSE, width = "100%",
                                    options = list(placeholder = "Type a gene symbol..."))),
           column(2, numericInput("split_ncol", "Panels per row:", value = 3, min = 1, max = 5, width = "100%"))
@@ -1762,20 +1795,26 @@ server <- function(input, output, session) {
 
   # dot_data(): per gene x group, the % expressing and the mean expression, plus
   # the mean z-scored per gene across groups (for colour).
+  # Shared by the dot plot and violin: the (genes x cells) matrix for `genes_sel`
+  # in the current assay/layer, plus the group vector and its sorted levels.
+  marker_gene_matrix <- function(genes_sel) {
+    assay_use <- dot_assay_val(); layer_use <- dot_layer()
+    full <- GetAssayData(seu(), layer = layer_use, assay = assay_use)   # genes x cells
+    genes <- genes_sel[genes_sel %in% rownames(full)]
+    validate(need(length(genes) > 0,
+                  paste0("None of the selected genes are in the '", layer_use,
+                         "' layer of assay '", assay_use, "'.")))
+    grp <- as.character(seu()@meta.data[[input$dot_group_var]]); grp[is.na(grp)] <- "NA"
+    list(mat = full[genes, , drop = FALSE], genes = genes, grp = grp, groups = sort_levels(grp))
+  }
+
   dot_data <- reactive({
     req(input$dot_group_var)
     gsel <- dot_genes_final()
     validate(need(length(gsel) > 0,
                   "Pick genes (manual mode) or click 'Compute markers' (auto mode)."))
-    assay_use <- dot_assay_val(); layer_use <- dot_layer()
-    full <- GetAssayData(seu(), layer = layer_use, assay = assay_use)   # genes x cells
-    genes <- gsel[gsel %in% rownames(full)]
-    validate(need(length(genes) > 0,
-                  paste0("None of the selected genes are in the '", layer_use,
-                         "' layer of assay '", assay_use, "'.")))
-    m <- full[genes, , drop = FALSE]
-    grp <- as.character(seu()@meta.data[[input$dot_group_var]]); grp[is.na(grp)] <- "NA"
-    groups <- sort_levels(grp)
+    mm <- marker_gene_matrix(gsel)
+    genes <- mm$genes; m <- mm$mat; grp <- mm$grp; groups <- mm$groups
 
     pct <- matrix(0, length(genes), length(groups), dimnames = list(genes, groups))
     avg <- matrix(0, length(genes), length(groups), dimnames = list(genes, groups))
@@ -1819,6 +1858,78 @@ server <- function(input, output, session) {
                      categoryorder = "array", categoryarray = rev(d$groups)),
         margin = list(l = 130, r = 10, t = 50, b = 120)
       ) %>%
+      plotly::config(displayModeBar = FALSE)
+  })
+
+  # ---- Marker Plot: Violin variant --------------------------------------------
+  # Non-erroring view of the current gene set (dot_genes_final validates-out when
+  # markers are stale / not picked; here we just want "" instead of an error).
+  dot_genes_safe <- reactive({
+    tryCatch(dot_genes_final(), error = function(e) character(0))
+  })
+
+  # Fill the violin gene picker with ALL genes (a searchable dropdown -- type to
+  # find any gene), defaulting to the first few current markers when they exist.
+  # Keeps the user's own selection when it's already set.
+  observeEvent(list(seu(), input$marker_plot_type, input$violin_gene_sort, dot_genes_safe()), {
+    req(seu(), identical(input$marker_plot_type, "violin"))
+    sort_mode <- if (is.null(input$violin_gene_sort)) "Alphabetical" else input$violin_gene_sort
+    cur <- isolate(input$violin_genes)
+    sel <- cur[nchar(cur) > 0]
+    if (length(sel) == 0) sel <- head(dot_genes_safe(), 4)   # default to the computed markers, if any
+    updateSelectizeInput(session, "violin_genes",
+                         choices = ordered_gene_choices(sort_mode),
+                         selected = sel, server = TRUE)
+  })
+
+  # One stacked row of violins per selected gene (x = group), sharing the group
+  # axis. Cells are downsampled for responsiveness -- a violin only needs the shape.
+  violin_data <- reactive({
+    req(input$dot_group_var)
+    validate(need(length(input$violin_genes) > 0,
+                  "Pick one or more genes above to show as violins."))
+    mm <- marker_gene_matrix(head(input$violin_genes, 20))   # cap rows (stacked violins get tall)
+    grp <- mm$grp
+    keep <- seq_along(grp)
+    if (length(keep) > 6000) { set.seed(1); keep <- sort(sample(keep, 6000)) }   # downsample (points are drawn)
+    list(mat = as.matrix(mm$mat[, keep, drop = FALSE]),
+         grp = grp[keep], genes = mm$genes, groups = mm$groups)
+  })
+
+  # Height grows with the number of genes so each violin row stays readable.
+  output$violin_plot_ui <- renderUI({
+    n <- length(violin_data()$genes)
+    plotlyOutput("violin_plot", width = "100%", height = paste0(max(560, 340 * n), "px"))
+  })
+
+  output$violin_plot <- renderPlotly({
+    d <- violin_data()
+    pal <- setNames(scales::hue_pal()(length(d$groups)), d$groups)
+    gf <- factor(d$grp, levels = d$groups)
+    panels <- lapply(seq_along(d$genes), function(i) {
+      g <- d$genes[i]
+      df <- data.frame(group = gf, value = d$mat[i, ], stringsAsFactors = FALSE)
+      plot_ly(df, x = ~group, y = ~value, type = "violin", color = ~group, colors = pal,
+              # jittered individual cells + an inner box (median/quartiles), like a
+              # standard single-cell violin. Light, small points so dense zero-heavy
+              # genes don't turn into a black bar.
+              points = "all", jitter = 0.35, pointpos = 0,
+              marker = list(size = 1.5, color = "rgba(50,50,50,0.18)"),
+              box = list(visible = TRUE, width = 0.15), meanline = list(visible = TRUE),
+              scalemode = "width",
+              # hover on: points show a cell's exact value, the box shows the
+              # quartile stats, the violin outline shows the local density value.
+              showlegend = FALSE, hoveron = "violins+points+kde") %>%
+        plotly::layout(
+          yaxis = list(title = list(text = g, font = list(size = 12)), zeroline = FALSE),
+          xaxis = list(title = "", tickangle = -45))
+    })
+    subplot(panels, nrows = length(d$genes), shareX = TRUE, titleY = TRUE, margin = 0.004) %>%
+      plotly::layout(
+        title = list(text = paste0("Marker violins by ", pretty_label(input$dot_group_var)),
+                     x = 0, xref = "paper", xanchor = "left",
+                     font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
+        margin = list(l = 90, r = 10, t = 50, b = 120)) %>%
       plotly::config(displayModeBar = FALSE)
   })
 
