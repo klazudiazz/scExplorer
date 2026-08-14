@@ -815,7 +815,7 @@ server <- function(input, output, session) {
     # Still excludes huge text columns (barcodes) so the UMAP can't get thousands
     # of discrete colours.
     color_cols <- all_cols[vapply(all_cols, function(col) {
-      if (col %in% clust_cols_r()) return(TRUE)                     # clusterings: always colourable, any count
+      if (col %in% clust_cols_r()) return(FALSE)                    # clusterings live ONLY in the Resolution picker, not here
       x <- seu()@meta.data[[col]]
       if (is_continuous_col(col)) return(TRUE)                      # gradient
       (is.factor(x) || is.character(x) || is.logical(x) || is.numeric(x)) &&
@@ -875,7 +875,7 @@ server <- function(input, output, session) {
           ),
           mainPanel(
             div(style = "display: flex; justify-content: flex-start; width: 100%; overflow: hidden;",
-                div(id = "umap_plot_box", class = "plot-dl-wrap", style = "position: relative; width: calc(min(100vh - 230px, 100vw - 800px) + 40px); height: min(100vh - 230px, 100vw - 800px);",
+                div(id = "umap_plot_box", class = "plot-dl-wrap", style = "position: relative; width: calc(min(100vh - 230px, 100vw - 800px) + 260px); height: min(100vh - 230px, 100vw - 800px);",
                     plot_dl_btn("umap_plot", "UMAP"),
                     withSpinner(plotlyOutput("umap_plot", width = "100%", height = "100%"), caption = "Rendering plot...", color = "#39FF14"))
             )
@@ -1163,32 +1163,30 @@ server <- function(input, output, session) {
     do.call(tabsetPanel, tabs)
   })
 
-  # Two-way sync between the "Resolution / clustering" quick-pick and "Color UMAP
-  # by", so they never show conflicting clusterings.
-  # (a) picking a resolution colours the UMAP by that clustering column.
-  observeEvent(input$resolution_pick, {
-    req(input$resolution_pick)
-    if (!identical(isolate(input$group_var), input$resolution_pick))
-      updateSelectInput(session, "group_var", selected = input$resolution_pick)
-  }, ignoreInit = TRUE)
-  # (b) choosing a clustering column in "Color UMAP by" moves the Resolution box
-  # to match. Non-clustering columns leave the Resolution box untouched. The
-  # identical() guards stop the two observers from ping-ponging.
-  observeEvent(input$group_var, {
-    req(input$group_var)
-    if (input$group_var %in% clust_cols_r() &&
-        !identical(isolate(input$resolution_pick), input$group_var))
-      updateSelectInput(session, "resolution_pick", selected = input$group_var)
-  }, ignoreInit = TRUE)
+  # Which metadata column the Clusters/Metadata UMAP is coloured by. TWO controls
+  # can drive it and they hold DIFFERENT columns: "Color UMAP by" (non-clustering
+  # columns only) and the "Resolution / clustering" quick-pick (clustering columns
+  # only). We colour by whichever the user changed most recently -- so clusterings
+  # appear ONLY in the Resolution picker, never duplicated in "Color UMAP by".
+  color_col <- reactiveVal(NULL)
+  observeEvent(input$group_var,       color_col(input$group_var),       ignoreInit = TRUE)
+  observeEvent(input$resolution_pick, color_col(input$resolution_pick), ignoreInit = TRUE)
+  # The active colour column: whatever was last picked, falling back to the
+  # "Color UMAP by" default until the user touches either control.
+  active_group <- reactive({
+    cc <- color_col()
+    if (is.null(cc)) req(input$group_var) else cc
+  })
 
   # The per-category show/hide checkboxes under "Color UMAP by". Rebuilt every
   # time the colouring column changes; NA (unlabelled) cells become an "NA" box.
   output$category_filter_ui <- renderUI({
-    req(input$group_var)
+    gv <- active_group()
+    req(gv)
     # Continuous columns: a gradient + a value-range slider. Cells outside the
     # range go grey; cells inside keep the gradient. Defaults span the full range.
-    if (is_continuous_col(input$group_var)) {
-      x <- suppressWarnings(as.numeric(as.character(seu()@meta.data[[input$group_var]])))
+    if (is_continuous_col(gv)) {
+      x <- suppressWarnings(as.numeric(as.character(seu()@meta.data[[gv]])))
       rng <- range(x, na.rm = TRUE)
       step <- signif(diff(rng) / 100, 2)
       return(tagList(
@@ -1199,7 +1197,7 @@ server <- function(input, output, session) {
         )
       ))
     }
-    vals <- as.character(seu()@meta.data[[input$group_var]])
+    vals <- as.character(seu()@meta.data[[gv]])
     vals[is.na(vals)] <- "NA"
     vals <- sort_levels(vals)
     checkboxGroupInput("categories_shown", "Show categories:", choices = vals, selected = vals)
@@ -1239,17 +1237,18 @@ server <- function(input, output, session) {
   # that toggling categories doesn't rebuild it (the observer below just
   # recolours the existing plot in place). Branches on continuous vs categorical.
   umap_base <- reactive({
-    req(input$group_var)
+    gv <- active_group()
+    req(gv)
     emb <- umap_emb()
-    raw <- seu()@meta.data[[input$group_var]]
+    raw <- seu()@meta.data[[gv]]
     set.seed(1)
     ord <- sample(nrow(emb))             # fixed interleaved order (avoids stacking)
     df <- data.frame(UMAP_1 = emb[ord, 1], UMAP_2 = emb[ord, 2], stringsAsFactors = FALSE)
 
-    if (is_continuous_col(input$group_var)) {
+    if (is_continuous_col(gv)) {
       v <- suppressWarnings(as.numeric(as.character(raw)))[ord]   # handles numeric stored as text
       df$value <- v
-      df$tooltip <- paste0(pretty_label(input$group_var), ": ", round(v, 3))
+      df$tooltip <- paste0(pretty_label(gv), ": ", round(v, 3))
       return(list(df = df, continuous = TRUE))
     }
 
@@ -1280,6 +1279,7 @@ server <- function(input, output, session) {
   output$umap_plot <- renderPlotly({
     base <- umap_base()
     df <- base$df
+    gv <- active_group()
 
     # ---- Continuous column: viridis gradient + a typed Min/Max range. Cells in
     # range keep the gradient; cells outside go grey. Colour limits are the FULL
@@ -1304,14 +1304,14 @@ server <- function(input, output, session) {
                        marker = list(size = 4, color = ~value, colorscale = "Viridis",
                                      cmin = full[1], cmax = full[2],
                                      # Title on the SIDE (vertical, along the bar)
-                                     colorbar = list(title = list(text = pretty_label(input$group_var), side = "right"),
+                                     colorbar = list(title = list(text = pretty_label(gv), side = "right"),
                                                      thickness = 15, len = 0.5, outlinewidth = 0,
                                                      x = 1.02, xanchor = "left", y = 0.5, yanchor = "middle")),
                        text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
       }
       p <- plotly::layout(
         p, hovermode = "closest",
-        title = list(text = paste("UMAP colored by", pretty_label(input$group_var)),
+        title = list(text = paste("UMAP colored by", pretty_label(gv)),
                      x = 0, xref = "paper", xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
         xaxis = list(title = "UMAP_1", zeroline = FALSE, range = umap_range(),
@@ -1355,7 +1355,7 @@ server <- function(input, output, session) {
 
     p <- plotly::layout(
       p, hovermode = "closest",
-      title = list(text = paste("UMAP colored by", pretty_label(input$group_var)), x = 0, xref = "paper", xanchor = "left",
+      title = list(text = paste("UMAP colored by", pretty_label(gv)), x = 0, xref = "paper", xanchor = "left",
                    font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
       xaxis = list(title = "UMAP_1", zeroline = FALSE, range = umap_range(),
                    tick0 = 0, dtick = umap_dtick(),
@@ -1364,7 +1364,7 @@ server <- function(input, output, session) {
                    tick0 = 0, dtick = umap_dtick(),
                    constrain = "domain", constraintoward = "middle", range = umap_range()),
       showlegend = TRUE,
-      legend = list(title = list(text = pretty_label(input$group_var)), itemsizing = "constant",
+      legend = list(title = list(text = pretty_label(gv)), itemsizing = "constant",
                     y = 0.5, yanchor = "middle"),
       margin = list(l = 50, r = 10, t = 40, b = 40)
     )
@@ -1373,7 +1373,7 @@ server <- function(input, output, session) {
 
   # Toggling a category recolours the EXISTING plot via plotly restyle
   observeEvent(input$categories_shown, {
-    req(input$group_var)
+    req(active_group())
     base <- umap_base()
     if (isTRUE(base$continuous)) return()   # gradient mode has no category toggles
     cols <- umap_point_cols(base, input$categories_shown)
