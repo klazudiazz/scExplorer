@@ -893,6 +893,12 @@ server <- function(input, output, session) {
     color_choices <- setNames(color_cols, pretty_label(color_cols))
     color_choices <- color_choices[order(names(color_choices))]
 
+    # Numeric / score columns (continuous) -- prediction-confidence scores, QC
+    # metrics, etc. Used by the Annotation tab's "Confidence by group" view.
+    score_cols <- all_cols[vapply(all_cols, function(col) isTRUE(is_continuous_col(col)), logical(1))]
+    score_choices <- setNames(score_cols, pretty_label(score_cols))
+    score_choices <- score_choices[order(names(score_choices))]
+
     # Clustering / resolution columns (e.g. SCT_snn_res.0.1, integrated_snn_res.0.5,
     # seurat_clusters, final_clusters) -> a tidy "Resolution" quick-pick that shows
     # the resolution + cluster count and just colours the UMAP by that column.
@@ -1262,6 +1268,70 @@ server <- function(input, output, session) {
         helpText("One panel per selected group. Optionally split again by a second column (e.g. cell type then condition) to get a grid - then pick which of its groups to show too. Panels are coloured by the gene's expression on a shared scale (raw values of the selected data layer).")
       ),
       uiOutput("split_plots")
+    )))
+
+    # ---- Annotation ------------------------------------------------------
+    # Marker-free exploration/validation of cell-type labels (e.g. foundation-
+    # model predictions): compare two label columns (confusion matrix), inspect
+    # a confidence score per group, or see composition per sample/condition.
+    anno_x2 <- if (length(grouping_choices) > 1) grouping_choices[[2]] else grouping_choices[[1]]
+    tabs <- c(tabs, list(tabPanel(
+      "Annotation",
+      help_details(
+        tags$p("Explore and validate cell-type annotations WITHOUT marker genes - useful for foundation-model (scFM) predictions, which don't rely on markers. All three views use metadata columns already in the object (predicted labels, confidence scores, manual labels)."),
+        tags$p("Label comparison = a confusion matrix between two label columns (does the model agree with your labels, and where not?). Confidence by group = the distribution of a numeric score per group. Composition = cell-type proportions per sample/condition.")),
+      wellPanel(
+        fluidRow(
+          column(12, radioButtons("anno_type", "View:", inline = TRUE,
+                                  choices = c("Label comparison (confusion matrix)" = "confusion",
+                                              "Confidence by group" = "confidence",
+                                              "Composition" = "composition"),
+                                  selected = "confusion"))
+        ),
+        conditionalPanel(
+          condition = "input.anno_type == 'confusion'",
+          fluidRow(
+            column(4, selectInput("anno_x", "Rows (e.g. predicted):", choices = grouping_choices, width = "100%")),
+            column(4, selectInput("anno_y", "Columns (e.g. reference/manual):", choices = grouping_choices, selected = anno_x2, width = "100%")),
+            column(4, radioButtons("anno_norm", "Show:", inline = TRUE,
+                                   choices = c("Row %" = "row", "Cell counts" = "count"), selected = "row"))
+          )
+        ),
+        conditionalPanel(
+          condition = "input.anno_type == 'confidence'",
+          fluidRow(
+            column(4, selectInput("conf_value", "Value (e.g. prediction score):", choices = score_choices, width = "100%")),
+            column(4, selectInput("conf_group", "Group by (e.g. cell type):", choices = grouping_choices, width = "100%")),
+            column(4, radioButtons("conf_kind", "Plot:", inline = TRUE,
+                                   choices = c("Violin" = "violin", "Box" = "box"), selected = "violin"))
+          )
+        ),
+        conditionalPanel(
+          condition = "input.anno_type == 'composition'",
+          fluidRow(
+            column(4, selectInput("comp_group", "Group / x-axis (e.g. sample):", choices = grouping_choices, selected = anno_x2, width = "100%")),
+            column(4, selectInput("comp_fill", "Compose of (e.g. cell type):", choices = grouping_choices, width = "100%")),
+            column(4, radioButtons("comp_mode", "Show:", inline = TRUE,
+                                   choices = c("Proportion (%)" = "proportion", "Cell counts" = "count"), selected = "proportion"))
+          )
+        )
+      ),
+      conditionalPanel(
+        condition = "input.anno_type == 'confusion'",
+        div(class = "plot-dl-wrap", style = "position: relative;",
+            plot_dl_btn("anno_confusion", "confusion_matrix"),
+            withSpinner(plotlyOutput("anno_confusion", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
+        uiOutput("anno_agreement")),
+      conditionalPanel(
+        condition = "input.anno_type == 'confidence'",
+        div(class = "plot-dl-wrap", style = "position: relative;",
+            plot_dl_btn("anno_conf_plot", "confidence_by_group"),
+            withSpinner(plotlyOutput("anno_conf_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14"))),
+      conditionalPanel(
+        condition = "input.anno_type == 'composition'",
+        div(class = "plot-dl-wrap", style = "position: relative;",
+            plot_dl_btn("anno_comp_plot", "composition"),
+            withSpinner(plotlyOutput("anno_comp_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14")))
     )))
 
     do.call(tabsetPanel, tabs)
@@ -2632,6 +2702,120 @@ server <- function(input, output, session) {
           margin = list(l = 10, r = 10, t = 30, b = 10)) %>%
         plotly::config(displayModeBar = FALSE)
     })
+  })
+
+  # ===========================================================================
+  # Annotation tab: marker-free exploration/validation of cell-type labels.
+  #   * confusion matrix  -- cross-tabulate two categorical label columns
+  #   * confidence by group -- distribution of a numeric score per group
+  #   * composition       -- stacked cell-type proportions per group
+  # All use meta.data columns already in the object (e.g. scFM predictions).
+  # ===========================================================================
+
+  # Confusion matrix: how cells cross-tabulate between two label columns. Rows =
+  # first column's levels, columns = second's; colour = row-% or raw counts.
+  output$anno_confusion <- renderPlotly({
+    req(input$anno_x, input$anno_y)
+    md <- seu()@meta.data
+    x <- as.character(md[[input$anno_x]]); x[is.na(x)] <- "NA"
+    y <- as.character(md[[input$anno_y]]); y[is.na(y)] <- "NA"
+    rl <- sort_levels(x); cl <- sort_levels(y)
+    counts <- matrix(as.numeric(table(factor(x, rl), factor(y, cl))),
+                     nrow = length(rl), dimnames = list(rl, cl))
+    rowpct <- sweep(counts, 1, pmax(rowSums(counts), 1), "/") * 100
+    if (identical(input$anno_norm, "row")) { z <- rowpct; zlab <- "% of row" }
+    else { z <- counts; zlab <- "Cells" }
+    # Per-cell hover text (count + row-%), built once as a matrix.
+    txt <- outer(seq_along(rl), seq_along(cl), function(i, j)
+      sprintf("%s: %s<br>%s: %s<br>Cells: %d<br>Row %%: %.1f%%",
+              pretty_label(input$anno_x), rl[i], pretty_label(input$anno_y), cl[j],
+              counts[cbind(i, j)], rowpct[cbind(i, j)]))
+    plot_ly(x = cl, y = rl, z = z, type = "heatmap",
+            colorscale = list(c(0, "#f7fcf5"), c(0.5, "#74c476"), c(1, "#00441b")),
+            text = txt, hovertemplate = "%{text}<extra></extra>",
+            colorbar = list(title = list(text = zlab), thickness = 15, outlinewidth = 0)) %>%
+      plotly::layout(
+        title = list(text = paste0("Label comparison: ", pretty_label(input$anno_x),
+                                   " (rows) vs ", pretty_label(input$anno_y), " (columns)"),
+                     x = 0, xref = "paper", xanchor = "left",
+                     font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
+        xaxis = list(title = pretty_label(input$anno_y), tickangle = -45),
+        yaxis = list(title = pretty_label(input$anno_x), autorange = "reversed"),
+        margin = list(l = 150, r = 10, t = 50, b = 150)) %>%
+      plotly::config(displayModeBar = FALSE)
+  })
+
+  # Exact-label agreement caption (fraction of cells where both columns match).
+  output$anno_agreement <- renderUI({
+    req(input$anno_x, input$anno_y)
+    md <- seu()@meta.data
+    x <- as.character(md[[input$anno_x]]); y <- as.character(md[[input$anno_y]])
+    ok <- !is.na(x) & !is.na(y)
+    agree <- if (any(ok)) round(mean(x[ok] == y[ok]) * 100, 1) else NA_real_
+    helpText(sprintf(
+      "Exact-label agreement: %s of cells carry the SAME label in both columns. Only meaningful when the two columns use the same naming; otherwise read the heatmap for where one label maps onto the other.",
+      if (is.na(agree)) "-" else paste0(agree, "%")))
+  })
+
+  # Confidence by group: distribution of a numeric column (e.g. prediction score)
+  # per level of a categorical column (e.g. predicted cell type).
+  output$anno_conf_plot <- renderPlotly({
+    req(input$conf_value, input$conf_group)
+    md <- seu()@meta.data
+    v <- suppressWarnings(as.numeric(as.character(md[[input$conf_value]])))
+    g <- as.character(md[[input$conf_group]]); g[is.na(g)] <- "NA"
+    keep <- is.finite(v)
+    validate(need(any(keep), "The chosen value column is not numeric."))
+    g <- g[keep]; v <- v[keep]
+    gl <- sort_levels(g)
+    df <- data.frame(group = factor(g, levels = gl), value = v)
+    pal <- setNames(scales::hue_pal()(length(gl)), gl)
+    p <- if (identical(input$conf_kind, "box")) {
+      plot_ly(df, x = ~group, y = ~value, color = ~group, colors = pal,
+              type = "box", boxpoints = "outliers", showlegend = FALSE)
+    } else {
+      plot_ly(df, x = ~group, y = ~value, color = ~group, colors = pal,
+              type = "violin", box = list(visible = TRUE), points = "outliers",
+              spanmode = "hard", showlegend = FALSE)
+    }
+    p %>% plotly::layout(
+      title = list(text = paste0(pretty_label(input$conf_value), " by ", pretty_label(input$conf_group)),
+                   x = 0, xref = "paper", xanchor = "left",
+                   font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
+      xaxis = list(title = "", tickangle = -45),
+      yaxis = list(title = pretty_label(input$conf_value), zeroline = FALSE),
+      margin = list(l = 70, r = 10, t = 50, b = 150)) %>%
+      plotly::config(displayModeBar = FALSE)
+  })
+
+  # Composition: stacked bars of one categorical column's make-up per level of
+  # another (e.g. cell-type proportions per sample), as % or raw counts.
+  output$anno_comp_plot <- renderPlotly({
+    req(input$comp_group, input$comp_fill)
+    md <- seu()@meta.data
+    g <- as.character(md[[input$comp_group]]); g[is.na(g)] <- "NA"
+    f <- as.character(md[[input$comp_fill]]);  f[is.na(f)] <- "NA"
+    gl <- sort_levels(g); fl <- sort_levels(f)
+    m <- matrix(as.numeric(table(factor(g, gl), factor(f, fl))),
+                nrow = length(gl), dimnames = list(gl, fl))
+    if (identical(input$comp_mode, "proportion")) {
+      m <- sweep(m, 1, pmax(rowSums(m), 1), "/") * 100; ytitle <- "% of group"
+    } else ytitle <- "Cells"
+    pal <- setNames(scales::hue_pal()(length(fl)), fl)
+    p <- plot_ly()
+    for (ff in fl) p <- add_trace(p, x = gl, y = m[, ff], type = "bar", name = ff,
+                                  marker = list(color = pal[[ff]]))
+    p %>% plotly::layout(
+      barmode = "stack",
+      title = list(text = paste0("Composition of ", pretty_label(input$comp_group),
+                                 " by ", pretty_label(input$comp_fill)),
+                   x = 0, xref = "paper", xanchor = "left",
+                   font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
+      xaxis = list(title = pretty_label(input$comp_group), tickangle = -45),
+      yaxis = list(title = ytitle),
+      legend = list(title = list(text = pretty_label(input$comp_fill))),
+      margin = list(l = 60, r = 10, t = 50, b = 150)) %>%
+      plotly::config(displayModeBar = FALSE)
   })
 }
 
