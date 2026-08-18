@@ -184,6 +184,31 @@ plot_dl_all_btn <- function(ids, ncol, colorbar_id = NULL, filename = "plots",
               HTML(paste0("&#8615; ", label)))
 }
 
+# ---- In-app help ------------------------------------------------------------
+# Link to the full user guide (edit if you fork / rename the repo).
+GUIDE_URL <- "https://github.com/klazudiazz/scExplorer/blob/main/docs/USER_GUIDE.md"
+
+# Plain-language tooltips for the terms users most often stumble on, shown as a
+# small circled-i next to the control label (native browser tooltip -- no deps).
+INFO_ASSAY <- "Assay = WHICH data matrix. Assays can hold different genes and mean different things: RNA (raw counts), SCT (normalized), integrated (batch-corrected; not valid for DE), ADT (protein), etc. Pick the assay first, then a data layer within it."
+INFO_LAYER <- "Data layer = HOW the assay's values are transformed (same genes and cells): Normalized (log) is the usual expression, Raw counts are the integers, Scaled (z-score) is centered/scaled (variable genes only, has negatives)."
+INFO_TEST  <- "Statistical test for differential expression. Wilcoxon (default) and t / LR / bimod run on normalized values; Poisson uses raw counts; ROC reports an AUC 'power' instead of a p-value."
+INFO_RES   <- "A clustering column. The resolution sets HOW MANY clusters (higher = more, finer); the prefix (e.g. SCT vs integrated) is which assay's neighbor graph it was computed on. Colours the map by that clustering."
+
+# A small circled-i carrying a hover tooltip (native `title`, no JS).
+info_icon <- function(text) tags$span(class = "info-ic", title = text, "ⓘ")
+# A control label with the info icon appended (pass to a *Input's `label`).
+lbl <- function(text, info) tagList(text, info_icon(info))
+
+# A collapsible "How to use this tab" panel (native <details>, no JS), with a
+# link to the full guide appended after the body.
+help_details <- function(...) {
+  tags$details(class = "tab-help",
+    tags$summary("How to use this tab"),
+    tags$div(class = "tab-help-body", ...,
+             tags$p(tags$a(href = GUIDE_URL, target = "_blank", "Open the full user guide ↗"))))
+}
+
 ui <- fluidPage(
   tags$head(
     tags$style(HTML("
@@ -298,6 +323,16 @@ ui <- fluidPage(
         font-size: 12px; color: #8a8a8a; text-transform: uppercase; letter-spacing: 0.04em;
       }
       .stat-card .stat-value { font-size: 26px; font-weight: 700; color: #1a1a1a; line-height: 1.15; }
+
+      /* In-app help: circled-i tooltip icon + 'How to use this tab' panel */
+      .info-ic { cursor: help; color: #2ecc0f; font-weight: 700; margin-left: 4px; font-size: 12px; }
+      .tab-help { margin: 8px 0 12px; background: #fafafa; border: 1px solid #e6e6e6;
+        border-left: 3px solid #39FF14; border-radius: 6px; padding: 6px 12px; }
+      .tab-help > summary { cursor: pointer; font-weight: 600; color: #1a1a1a; outline: none; }
+      .tab-help > summary:hover { color: #2ecc0f; }
+      .tab-help-body { margin-top: 8px; color: #444; font-size: 13px; line-height: 1.5; }
+      .tab-help-body p { margin: 4px 0; }
+      .tab-help-body a { color: #2ecc0f; font-weight: 600; }
 
       /* Assay / layer info strip */
       .assay-layer-strip { margin: 0 0 10px; padding: 8px 14px; background: #fafafa;
@@ -665,7 +700,7 @@ server <- function(input, output, session) {
       checkboxGroupInput("feature_layers_show", "Layers to show:", choices = choices,
                          selected = character(0), inline = TRUE)
     } else {
-      selectInput("feature_layer", "Data layer:", choices = choices, width = "100%")
+      selectInput("feature_layer", lbl("Data layer:", INFO_LAYER), choices = choices, width = "100%")
     }
   })
 
@@ -683,11 +718,45 @@ server <- function(input, output, session) {
     expr_limits(as.vector(m))
   })
 
-  # Memoised UMAP embedding matrix -- every plot pulls from this one reactive
-  # instead of re-extracting Embeddings(seu(), "umap") on each render.
+  # ---- Embedding (reduction) selection ----------------------------------------
+  # The 2D+ reductions in the object (umap, tsne, pca, and foundation-model
+  # embeddings like scgpt / geneformer if they were saved as reductions). Every
+  # embedding plot in the app draws from the ONE selected here.
+  available_reductions <- reactive({
+    req(seu())
+    reds <- tryCatch(SeuratObject::Reductions(seu()), error = function(e) names(seu()@reductions))
+    reds[vapply(reds, function(r)
+      tryCatch(ncol(Embeddings(seu(), r)) >= 2, error = function(e) FALSE), logical(1))]
+  })
+
+  # The chosen reduction, defaulting to "umap" (then the first available).
+  reduction_val <- reactive({
+    reds <- available_reductions()
+    r <- input$reduction
+    if (!is.null(r) && r %in% reds) r
+    else if ("umap" %in% reds) "umap"
+    else if (length(reds)) reds[1] else "umap"
+  })
+
+  # Memoised embedding matrix of the selected reduction -- every plot pulls from
+  # this one reactive instead of re-extracting Embeddings() on each render.
   umap_emb <- reactive({
     req(seu())
-    Embeddings(seu(), "umap")
+    Embeddings(seu(), reduction_val())
+  })
+
+  # Axis titles for the current embedding (its own column names, e.g. UMAP_1 /
+  # scgptumap_1), so plots are labelled for whatever reduction is shown.
+  axis_labels <- reactive({
+    cn <- colnames(umap_emb())
+    if (length(cn) >= 2) cn[1:2] else c("Dim 1", "Dim 2")
+  })
+
+  # Display name of the current embedding for plot titles (UMAP/TSNE/PCA upper-cased,
+  # anything else as-is, e.g. a foundation-model reduction name).
+  embedding_label <- reactive({
+    r <- reduction_val()
+    if (tolower(r) %in% c("umap", "tsne", "pca")) toupper(r) else r
   })
 
   # One common square axis window (padded full extent of the UMAP embedding),
@@ -841,6 +910,11 @@ server <- function(input, output, session) {
     }
     res_choices <- if (length(clust_cols)) setNames(clust_cols, vapply(clust_cols, res_label, character(1))) else character(0)
 
+    # Embeddings (reductions) to offer -- only shown when the object has >1, so
+    # the picker appears exactly when there's a choice (e.g. umap + a
+    # foundation-model embedding). Applies to EVERY embedding plot in the app.
+    red_choices <- available_reductions()
+
     # Assay layers present (counts / data / scale.data) for the Gene Expression
     # "Data layer" toggle -- view raw values before/after normalization.
     # All assays (for the Gene Expression assay selector).
@@ -866,10 +940,16 @@ server <- function(input, output, session) {
     tabs <- list(
       tabPanel(
         "Clusters / Metadata",
+        help_details(
+          tags$p("Each point is a cell, placed by the UMAP. Pick a metadata column in \"Color UMAP by\" to colour the map; use the \"Resolution / clustering\" box to colour by a clustering (resolution = how many clusters)."),
+          tags$p("Categorical columns get discrete colours with show/hide toggles; numeric columns (scores, QC) get a gradient with a Min/Max filter.")),
         sidebarLayout(
           sidebarPanel(
+            if (length(red_choices) > 1)
+              selectInput("reduction", "Embedding:", choices = red_choices,
+                          selected = if ("umap" %in% red_choices) "umap" else red_choices[1]),
             if (length(res_choices) > 0)
-              selectInput("resolution_pick", "Resolution / clustering:", choices = res_choices),
+              selectInput("resolution_pick", lbl("Resolution / clustering:", INFO_RES), choices = res_choices),
             selectInput("group_var", "Color UMAP by:", choices = color_choices),
             uiOutput("category_filter_ui")
           ),
@@ -884,6 +964,9 @@ server <- function(input, output, session) {
       ),
       tabPanel(
         "Gene Expression",
+        help_details(
+          tags$p("One UMAP per selected gene, coloured by that gene's expression. Choose the Assay and Data layer (hover the ⓘ icons) to view raw counts vs normalized vs scaled values."),
+          tags$p("\"One gene across data layers\" shows the same gene side by side in each layer. \"Same scale for all genes\" makes panels comparable in magnitude; \"per gene\" makes each clearly visible. Up to 12 genes at once.")),
         wellPanel(
           fluidRow(
             column(3, radioButtons("compare_mode", "Compare:",
@@ -891,7 +974,7 @@ server <- function(input, output, session) {
                                                "One gene across data layers" = "layers"),
                                    selected = "genes", inline = FALSE)),
             if (length(all_assays_ge) > 1)
-              column(2, selectInput("feature_assay", "Assay:", choices = all_assays_ge,
+              column(2, selectInput("feature_assay", lbl("Assay:", INFO_ASSAY), choices = all_assays_ge,
                                     selected = def_assay_ge, width = "100%")),
             column(3, selectInput("gene_sort", "Sort genes by:", width = "100%",
                                   choices = GENE_SORT_CHOICES)),
@@ -919,11 +1002,14 @@ server <- function(input, output, session) {
     if (has_markers) {
       tabs <- c(tabs, list(tabPanel(
         "Cluster Markers",
+        help_details(
+          tags$p("Precomputed marker tables (genes that mark each cluster vs all other cells). Pick the clustering resolution, test, and cluster to view its markers."),
+          tags$p("Use Search to filter the table; \"Download Excel\" exports every row.")),
         wellPanel(
           fluidRow(
             column(3, selectInput("marker_resolution", "Clustering resolution:", width = "100%",
                                   choices = unique(seu()@misc$cluster_markers$source_column))),
-            column(2, selectInput("marker_test", "Test type:", width = "100%",
+            column(2, selectInput("marker_test", lbl("Test type:", INFO_TEST), width = "100%",
                                   choices = unique(seu()@misc$cluster_markers$test_type))),
             column(2, uiOutput("marker_cluster_ui")),
             column(3, selectInput("marker_search_field", "Search in:", width = "100%",
@@ -936,14 +1022,17 @@ server <- function(input, output, session) {
     } else {
       tabs <- c(tabs, list(tabPanel(
         "Cluster Markers",
+        help_details(
+          tags$p("Genes that mark a group vs all other cells. Pick the grouping column and a group, choose the Assay / Data layer / Test (hover the ⓘ icons), then click \"Compute markers\" - it is heavy, so it does not run automatically."),
+          tags$p("Scan by avg_log2FC and p_val_adj; Search filters the table; \"Download Excel\" exports every row.")),
         wellPanel(
           fluidRow(
             column(2, selectInput("gmarker_group", "Grouping column:", choices = grouping_choices, width = "100%")),
             if (length(de_assays) > 1)
-              column(2, selectInput("gmarker_assay", "Assay:", choices = de_assays, selected = def_de_assay, width = "100%")),
+              column(2, selectInput("gmarker_assay", lbl("Assay:", INFO_ASSAY), choices = de_assays, selected = def_de_assay, width = "100%")),
             column(2, uiOutput("gmarker_layer_ui")),
             column(2, uiOutput("gmarker_cluster_ui")),
-            column(2, selectInput("gmarker_test", "Test type:", choices = de_test_choices, width = "100%")),
+            column(2, selectInput("gmarker_test", lbl("Test type:", INFO_TEST), choices = de_test_choices, width = "100%")),
             column(2, textInput("gmarker_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
           ),
           fluidRow(
@@ -967,6 +1056,9 @@ server <- function(input, output, session) {
     # tables (copy top genes from Cluster Markers into the gene picker here).
     tabs <- c(tabs, list(tabPanel(
       "Marker Plot",
+      help_details(
+        tags$p("Compare chosen genes across groups. Dot plot: dot size = % of cells in the group expressing the gene, colour = mean expression z-scored per gene. Violin: the expression distribution per group (one row per gene)."),
+        tags$p("Pick genes manually, or (dot plot) auto-find each group's top markers - click \"Compute markers\" for the auto option.")),
       wellPanel(
         # Plot type is the FIRST thing to choose; everything below adapts to it.
         fluidRow(
@@ -976,7 +1068,7 @@ server <- function(input, output, session) {
         fluidRow(
           column(3, selectInput("dot_group_var", "Group by:", choices = grouping_choices, width = "100%")),
           if (length(all_assays_ge) > 1)
-            column(2, selectInput("dot_assay", "Assay:", choices = all_assays_ge,
+            column(2, selectInput("dot_assay", lbl("Assay:", INFO_ASSAY), choices = all_assays_ge,
                                   selected = def_assay_ge, width = "100%")),
           column(if (length(all_assays_ge) > 1) 3 else 4, uiOutput("dot_layer_ui"))
         ),
@@ -994,7 +1086,7 @@ server <- function(input, output, session) {
             condition = "input.dot_gene_mode == 'auto'",
             fluidRow(
               column(3, numericInput("dot_top_n", "Top markers / group:", value = 3, min = 1, max = 15, width = "100%")),
-              column(3, selectInput("dot_test", "Test type:", choices = de_test_choices, width = "100%")),
+              column(3, selectInput("dot_test", lbl("Test type:", INFO_TEST), choices = de_test_choices, width = "100%")),
               column(3, div(style = "margin-top: 25px;",
                             actionButton("dot_compute", "Compute markers",
                                          style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
@@ -1045,11 +1137,14 @@ server <- function(input, output, session) {
     if (has_contrasts) {
       tabs <- c(tabs, list(tabPanel(
         "Contrasts (DEA)",
+        help_details(
+          tags$p("Precomputed differential-expression tables between two groups (Target vs Reference). Pick a contrast (A vs B) and test to view its results."),
+          tags$p("Unlike Cluster Markers (a group vs everyone else), a contrast is one group vs one specific other group. Search filters; \"Download Excel\" exports every row.")),
         wellPanel(
           fluidRow(
             column(4, selectInput("contrast_choice", "Contrast:", width = "100%",
                                   choices = unique(paste0(seu()@misc$contrasts$target, " vs ", seu()@misc$contrasts$reference)))),
-            column(2, selectInput("contrast_test", "Test type:", width = "100%",
+            column(2, selectInput("contrast_test", lbl("Test type:", INFO_TEST), width = "100%",
                                   choices = unique(seu()@misc$contrasts$test_type))),
             column(3, selectInput("contrast_search_field", "Search in:", width = "100%",
                                   choices = c("All columns", "ENSEMBL", "ENTREZID", "SYMBOL", "GENENAME"))),
@@ -1061,15 +1156,18 @@ server <- function(input, output, session) {
     } else {
       tabs <- c(tabs, list(tabPanel(
         "Contrasts (DEA)",
+        help_details(
+          tags$p("Differential expression between two groups you choose: Target (A) vs Reference (B). Set the grouping column, the two groups, the Assay / Data layer / Test (hover the ⓘ icons), then click \"Compute contrast\" (heavy, so not automatic)."),
+          tags$p("Unlike Cluster Markers (a group vs everyone else), this is one group vs one specific other group.")),
         wellPanel(
           fluidRow(
             column(2, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
             if (length(de_assays) > 1)
-              column(2, selectInput("gcontrast_assay", "Assay:", choices = de_assays, selected = def_de_assay, width = "100%")),
+              column(2, selectInput("gcontrast_assay", lbl("Assay:", INFO_ASSAY), choices = de_assays, selected = def_de_assay, width = "100%")),
             column(2, uiOutput("gcontrast_layer_ui")),
             column(2, uiOutput("gcontrast_target_ui")),
             column(2, uiOutput("gcontrast_reference_ui")),
-            column(2, selectInput("gcontrast_test", "Test type:", choices = de_test_choices, width = "100%")),
+            column(2, selectInput("gcontrast_test", lbl("Test type:", INFO_TEST), choices = de_test_choices, width = "100%")),
             column(if (length(de_assays) > 1) 2 else 4, textInput("gcontrast_search_text", "Search:", width = "100%", placeholder = "Type to search..."))
           ),
           fluidRow(
@@ -1094,6 +1192,9 @@ server <- function(input, output, session) {
     # get the FULL page width (and a taller plot), rather than a narrow sidebar.
     tabs <- c(tabs, list(tabPanel(
       "Aggregated Expression",
+      help_details(
+        tags$p("Summarises each selected gene per group (mean / sum / median) as a heatmap and a table - a compact pseudobulk overview. Choose the grouping column, the genes, and the Assay / Data layer to summarise (hover the ⓘ icons)."),
+        tags$p("Colour is blue-white-red; the table's \"Download Excel\" exports every value.")),
       wellPanel(
         fluidRow(
           column(3, selectInput("agg_group_var", "Aggregate by:",
@@ -1109,7 +1210,7 @@ server <- function(input, output, session) {
           # Same pattern as the Gene Expression tab: aggregate the RAW values of the
           # chosen assay/layer (counts / data / scale.data).
           if (length(all_assays_ge) > 1)
-            column(2, selectInput("agg_assay", "Assay:", choices = all_assays_ge,
+            column(2, selectInput("agg_assay", lbl("Assay:", INFO_ASSAY), choices = all_assays_ge,
                                   selected = def_assay_ge, width = "100%")),
           column(3, uiOutput("agg_layer_ui")),
           column(if (length(all_assays_ge) > 1) 4 else 6, radioButtons("agg_fun", "Summary per group:",
@@ -1132,6 +1233,9 @@ server <- function(input, output, session) {
     # shared colour scale so the panels are directly comparable.
     tabs <- c(tabs, list(tabPanel(
       "Split by Group",
+      help_details(
+        tags$p("Shows ONE gene as a separate UMAP per group (e.g. per condition or cell type), each on a shared colour scale so the panels are directly comparable. Optionally split again by a second column for a grid (e.g. cell type x condition)."),
+        tags$p("Pick which groups to show (up to 12 panels). Choose the Assay / Data layer for the values shown (hover the ⓘ icons).")),
       wellPanel(
         fluidRow(
           column(2, selectInput("split_group", "Split by:",
@@ -1149,7 +1253,7 @@ server <- function(input, output, session) {
           # show the RAW values of the chosen assay/layer - consistent with the
           # Gene Expression tab (no app-side z-scoring).
           if (length(all_assays_ge) > 1)
-            column(2, selectInput("split_assay", "Assay:", choices = all_assays_ge,
+            column(2, selectInput("split_assay", lbl("Assay:", INFO_ASSAY), choices = all_assays_ge,
                                   selected = def_assay_ge, width = "100%")),
           column(3, uiOutput("split_layer_ui"))
         ),
@@ -1276,6 +1380,65 @@ server <- function(input, output, session) {
     list(points = col, legend = disp)
   }
 
+  # Axis range / tick step / labels for an arbitrary embedding matrix (used by the
+  # compare view, which frames each reduction on its own scale).
+  red_frame <- function(emb) {
+    r <- range(emb[, 1:2], na.rm = TRUE); pad <- diff(r) * 0.03
+    rng <- c(r[1] - pad, r[2] + pad)
+    raw <- diff(rng) / 6; mag <- 10^floor(log10(raw)); nice <- c(1, 2, 2.5, 5, 10)
+    cn <- colnames(emb)
+    list(rng = rng, dtick = mag * nice[which.min(abs(nice - raw / mag))],
+         xlab = if (length(cn) >= 2) cn[1] else "Dim 1",
+         ylab = if (length(cn) >= 2) cn[2] else "Dim 2")
+  }
+  red_label <- function(r) if (tolower(r) %in% c("umap", "tsne", "pca")) toupper(r) else r
+
+  # Build a full UMAP plotly from a base (colouring) + a frame -- used by the
+  # side-by-side compare view. (The MAIN single plot has its own render with the
+  # restyle optimisation; this one just re-renders, which is fine for a 2-up view.)
+  build_umap_plot <- function(base, cats_shown, fr, title) {
+    df <- base$df
+    if (isTRUE(base$continuous)) {
+      full <- range(df$value, na.rm = TRUE)
+      lo <- if (is.null(input$cont_min) || is.na(input$cont_min)) full[1] else input$cont_min
+      hi <- if (is.null(input$cont_max) || is.na(input$cont_max)) full[2] else input$cont_max
+      in_rng <- !is.na(df$value) & df$value >= lo & df$value <= hi
+      out_df <- df[!in_rng, ]; in_df <- df[in_rng, ]
+      p <- plot_ly()
+      if (nrow(out_df) > 0)
+        p <- add_trace(p, data = out_df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
+                       marker = list(size = 3, color = "#E8E8E8"), text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+      if (nrow(in_df) > 0)
+        p <- add_trace(p, data = in_df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
+                       marker = list(size = 4, color = ~value, colorscale = "Viridis", cmin = full[1], cmax = full[2],
+                                     colorbar = list(thickness = 12, len = 0.5, outlinewidth = 0,
+                                                     x = 1.02, xanchor = "left", y = 0.5, yanchor = "middle")),
+                       text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+      showlg <- FALSE; lg <- NULL
+    } else {
+      cols <- umap_point_cols(base, cats_shown); df$col <- cols$points
+      p <- plot_ly(df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
+                   marker = list(size = 4, color = ~col), text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+      for (cat in sort_levels(df$group)) {
+        idx <- which(df$group == cat)[1]
+        p <- add_trace(p, x = df$UMAP_1[idx], y = df$UMAP_2[idx], type = "scatter", mode = "markers",
+                       marker = list(size = 0.1, color = cols$legend[[cat]]), name = cat,
+                       showlegend = TRUE, hoverinfo = "skip", inherit = FALSE)
+      }
+      showlg <- TRUE; lg <- list(itemsizing = "constant", y = 0.5, yanchor = "middle")
+    }
+    p %>% plotly::layout(
+      hovermode = "closest",
+      title = list(text = title, x = 0, xref = "paper", xanchor = "left",
+                   font = list(size = 14, family = "Open Sans, verdana, arial, sans-serif")),
+      xaxis = list(title = fr$xlab, zeroline = FALSE, range = fr$rng, tick0 = 0, dtick = fr$dtick,
+                   constrain = "domain", constraintoward = "center"),
+      yaxis = list(title = fr$ylab, zeroline = FALSE, scaleanchor = "x", scaleratio = 1, tick0 = 0, dtick = fr$dtick,
+                   constrain = "domain", constraintoward = "middle", range = fr$rng),
+      showlegend = showlg, legend = lg, margin = list(l = 46, r = 10, t = 36, b = 40)
+    ) %>% plotly::config(displayModeBar = FALSE)
+  }
+
   output$umap_plot <- renderPlotly({
     base <- umap_base()
     df <- base$df
@@ -1311,13 +1474,13 @@ server <- function(input, output, session) {
       }
       p <- plotly::layout(
         p, hovermode = "closest",
-        title = list(text = paste("UMAP colored by", pretty_label(gv)),
+        title = list(text = paste(embedding_label(), "colored by", pretty_label(gv)),
                      x = 0, xref = "paper", xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-        xaxis = list(title = "UMAP_1", zeroline = FALSE, range = umap_range(),
+        xaxis = list(title = axis_labels()[1], zeroline = FALSE, range = umap_range(),
                      tick0 = 0, dtick = umap_dtick(),
                      constrain = "domain", constraintoward = "center"),
-        yaxis = list(title = "UMAP_2", zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
+        yaxis = list(title = axis_labels()[2], zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
                      tick0 = 0, dtick = umap_dtick(),
                      constrain = "domain", constraintoward = "middle", range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 40)
@@ -1355,12 +1518,12 @@ server <- function(input, output, session) {
 
     p <- plotly::layout(
       p, hovermode = "closest",
-      title = list(text = paste("UMAP colored by", pretty_label(gv)), x = 0, xref = "paper", xanchor = "left",
+      title = list(text = paste(embedding_label(), "colored by", pretty_label(gv)), x = 0, xref = "paper", xanchor = "left",
                    font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-      xaxis = list(title = "UMAP_1", zeroline = FALSE, range = umap_range(),
+      xaxis = list(title = axis_labels()[1], zeroline = FALSE, range = umap_range(),
                    tick0 = 0, dtick = umap_dtick(),
                    constrain = "domain", constraintoward = "center"),
-      yaxis = list(title = "UMAP_2", zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
+      yaxis = list(title = axis_labels()[2], zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
                    tick0 = 0, dtick = umap_dtick(),
                    constrain = "domain", constraintoward = "middle", range = umap_range()),
       showlegend = TRUE,
@@ -1627,9 +1790,9 @@ server <- function(input, output, session) {
         p,
         title = list(text = spec$title, x = 0, xref = "paper", xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-        xaxis = list(title = "UMAP_1", zeroline = FALSE, showline = FALSE, ticks = "",
+        xaxis = list(title = axis_labels()[1], zeroline = FALSE, showline = FALSE, ticks = "",
                      range = umap_range(), constrain = "range"),
-        yaxis = list(title = "UMAP_2", zeroline = FALSE, showline = FALSE, ticks = "",
+        yaxis = list(title = axis_labels()[2], zeroline = FALSE, showline = FALSE, ticks = "",
                      scaleanchor = "x", scaleratio = 1, constrain = "range",
                      range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 30)
@@ -1651,7 +1814,7 @@ server <- function(input, output, session) {
   output$agg_layer_ui <- renderUI({
     assay_use <- agg_assay_val()
     req(seu(), assay_use)
-    selectInput("agg_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
+    selectInput("agg_layer", lbl("Data layer:", INFO_LAYER), choices = layer_choices(seu(), assay_use), width = "100%")
   })
   agg_layer <- make_layer_val("agg_layer")
 
@@ -1744,7 +1907,7 @@ server <- function(input, output, session) {
   output$dot_layer_ui <- renderUI({
     assay_use <- dot_assay_val()
     req(seu(), assay_use)
-    selectInput("dot_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
+    selectInput("dot_layer", lbl("Data layer:", INFO_LAYER), choices = layer_choices(seu(), assay_use), width = "100%")
   })
   dot_layer <- make_layer_val("dot_layer")
 
@@ -2095,13 +2258,13 @@ server <- function(input, output, session) {
   output$gmarker_layer_ui <- renderUI({
     assay_use <- gmarker_assay_val()
     req(seu(), assay_use)
-    selectInput("gmarker_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
+    selectInput("gmarker_layer", lbl("Data layer:", INFO_LAYER), choices = layer_choices(seu(), assay_use), width = "100%")
   })
 
   output$gcontrast_layer_ui <- renderUI({
     assay_use <- gcontrast_assay_val()
     req(seu(), assay_use)
-    selectInput("gcontrast_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
+    selectInput("gcontrast_layer", lbl("Data layer:", INFO_LAYER), choices = layer_choices(seu(), assay_use), width = "100%")
   })
 
   # Gated behind the "Compute markers" button. FindMarkers over the whole object
@@ -2252,7 +2415,7 @@ server <- function(input, output, session) {
   output$split_layer_ui <- renderUI({
     assay_use <- split_assay_val()
     req(seu(), assay_use)
-    selectInput("split_layer", "Data layer:", choices = layer_choices(seu(), assay_use), width = "100%")
+    selectInput("split_layer", lbl("Data layer:", INFO_LAYER), choices = layer_choices(seu(), assay_use), width = "100%")
   })
   split_layer <- make_layer_val("split_layer")
 

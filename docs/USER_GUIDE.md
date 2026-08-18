@@ -50,9 +50,18 @@ actually present. (E.g. an RNA assay with only `counts` has never been normalize
 
 ## Two concepts used across many tabs
 
+In one line: the Assay is WHICH data, the Data layer is HOW it is transformed. They
+are two separate choices - you pick an assay first, then a layer within it (which is
+why the Data-layer menu changes when you switch assays: each assay carries its own
+layers). Assays can hold different genes and mean different things (raw RNA vs
+normalized SCT vs batch-corrected integrated vs a different modality like protein);
+layers are just versions of the SAME assay's matrix (raw counts, normalized, scaled).
+
 ### Assay
 Seurat objects can hold several assays (e.g. `RNA`, `SCT`, `integrated`, `ADT`).
-Where an Assay dropdown appears, it selects which assay's values to use. Notes:
+Where an Assay dropdown appears, it selects which assay's values to use. Each assay is
+a separate features x cells matrix - a different measurement or processing stage, and
+they can contain different genes. Notes:
 
 - It only appears when the object has more than one assay.
 - On Gene Expression it includes *all* assays (viewing any assay is harmless).
