@@ -996,8 +996,8 @@ server <- function(input, output, session) {
       tabPanel(
         "Gene Expression",
         help_details(
-          tags$p("Explore gene expression two ways, via the sub-tabs below: \"Per-gene maps\" draws one UMAP per selected gene; \"Aggregated (pseudobulk)\" summarises the selected genes per group as a heatmap + table."),
-          tags$p("Both let you choose the Assay and Data layer (hover the ⓘ icons) to view raw counts vs normalized vs scaled values.")),
+          tags$p("Explore gene expression three ways, using the sub tabs below. \"Per-gene maps\" draws one umap per selected gene. \"Aggregated (pseudobulk)\" summarises the selected genes per group as a heatmap and a table. \"Split by Group\" shows one gene as a separate umap per group (for example per condition or cell type), on a shared scale so the panels are comparable."),
+          tags$p("They all let you choose the assay and data layer to view raw counts, normalized, or scaled values.")),
         div(class = "sub-tabs", tabsetPanel(
           type = "pills",
           tabPanel(
@@ -1108,8 +1108,7 @@ server <- function(input, output, session) {
       tabs <- c(tabs, list(tabPanel(
         "Cluster Markers",
         help_details(
-          tags$p("Genes that mark a group vs all other cells. Pick the grouping column and a group, choose the Assay / Data layer / Test (hover the ⓘ icons), then click \"Compute markers\" - it is heavy, so it does not run automatically."),
-          tags$p("Scan by avg_log2FC and p_val_adj; Search filters the table; \"Download Excel\" exports every row.")),
+          tags$p("Genes that mark a group versus all other cells. Pick the grouping column and a group, choose the assay, data layer and test, then click \"Compute markers\".")),
         wellPanel(
           fluidRow(
             column(2, selectInput("gmarker_group", "Grouping column:", choices = grouping_choices, width = "100%")),
@@ -1141,8 +1140,8 @@ server <- function(input, output, session) {
     tabs <- c(tabs, list(tabPanel(
       "Marker Plot",
       help_details(
-        tags$p("Compare chosen genes across groups. Dot plot: dot size = % of cells in the group expressing the gene, colour = mean expression z-scored per gene. Violin: the expression distribution per group (one row per gene)."),
-        tags$p("Pick genes manually, or (dot plot) auto-find each group's top markers - click \"Compute markers\" for the auto option.")),
+        tags$p("Compare chosen genes across groups. Dot plot: dot size is the percent of cells in the group expressing the gene, colour is mean expression z scored per gene. Violin: the expression distribution per group, one row per gene."),
+        tags$p("Pick genes manually, or in dot plot mode find each group's top markers automatically by clicking \"Compute markers\".")),
       wellPanel(
         # Plot type is the FIRST thing to choose; everything below adapts to it.
         fluidRow(
@@ -1222,8 +1221,8 @@ server <- function(input, output, session) {
       tabs <- c(tabs, list(tabPanel(
         "Differential expression",
         help_details(
-          tags$p("Precomputed differential-expression tables between two groups (Target vs Reference). Pick a contrast (A vs B) and test to view its results."),
-          tags$p("Unlike Cluster Markers (a group vs everyone else), a contrast is one group vs one specific other group. Search filters; \"Download Excel\" exports every row.")),
+          tags$p("Precomputed differential expression tables between two groups (target versus reference). Pick a contrast (A vs B) and a test to view its results."),
+          tags$p("Unlike cluster markers (a group versus everyone else), a contrast is one group versus one specific other group. Search filters the table, and \"Download Excel\" exports every row.")),
         wellPanel(
           fluidRow(
             column(4, selectInput("contrast_choice", "Contrast:", width = "100%",
@@ -1238,30 +1237,53 @@ server <- function(input, output, session) {
       tabs <- c(tabs, list(tabPanel(
         "Differential expression",
         help_details(
-          tags$p("Differential expression between two groups you choose: Target (A) vs Reference (B). Set the grouping column, the two groups, the Assay / Data layer / Test (hover the ⓘ icons), then click \"Compute contrast\" (heavy, so not automatic)."),
-          tags$p("Unlike Cluster Markers (a group vs everyone else), this is one group vs one specific other group.")),
+          tags$p("Differential expression between two groups (target A versus reference B). Two methods. \"Per cell test\" (Wilcoxon and similar) is fast and exploratory. \"Pseudobulk (DESeq2)\" sums raw counts per sample within each group, and is the recommended way to compare conditions across samples, because per cell tests inflate false positives there."),
+          tags$p("Unlike cluster markers (a group versus everyone else), this is one group versus one specific other group.")),
         wellPanel(
+          fluidRow(column(12, radioButtons("gcontrast_method", "Method:", inline = TRUE,
+                                  choices = c("Per-cell test (exploratory)" = "percell",
+                                              "Pseudobulk DESeq2 (recommended for conditions)" = "pseudobulk"),
+                                  selected = "percell"))),
           fluidRow(
-            column(2, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
+            column(3, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
             if (length(de_assays) > 1)
-              column(2, selectInput("gcontrast_assay", lbl("Assay:", INFO_ASSAY), choices = de_assays, selected = def_de_assay, width = "100%")),
-            column(2, uiOutput("gcontrast_layer_ui")),
-            column(2, uiOutput("gcontrast_target_ui")),
-            column(2, uiOutput("gcontrast_reference_ui")),
-            column(2, selectInput("gcontrast_test", lbl("Test type:", INFO_TEST), choices = de_test_choices, width = "100%"))
+              column(3, selectInput("gcontrast_assay", lbl("Assay:", INFO_ASSAY), choices = de_assays, selected = def_de_assay, width = "100%")),
+            column(3, uiOutput("gcontrast_target_ui")),
+            column(3, uiOutput("gcontrast_reference_ui"))
           ),
-          fluidRow(
-            column(3, div(style = "margin-top: 5px;",
-                          actionButton("gcontrast_compute", "Compute contrast",
-                                       style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
+          # ---- Per-cell test options ----
+          conditionalPanel(
+            condition = "input.gcontrast_method == 'percell'",
+            fluidRow(
+              column(3, uiOutput("gcontrast_layer_ui")),
+              column(3, selectInput("gcontrast_test", lbl("Test type:", INFO_TEST), choices = de_test_choices, width = "100%")),
+              column(3, div(style = "margin-top: 25px;",
+                            actionButton("gcontrast_compute", "Compute contrast",
+                                         style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
+            ),
+            helpText("Per-cell test, target vs reference. Fast, but treats each cell as an independent replicate -- inflates false positives for condition comparisons across samples (use Pseudobulk for those). Click 'Compute contrast'.")
           ),
-          helpText(
-            "Differential expression, target vs reference group. Set the options, then click 'Compute contrast' -- it is heavy on large objects, so it does NOT run automatically.",
-            if (length(de_assays) > 1) " 'integrated' is excluded because DE on batch-corrected values is statistically invalid.",
-            " Layer: 'data' = log-normalized (default for most tests); 'counts' = raw (used by count-based tests like Poisson)."
+          # ---- Pseudobulk (DESeq2) options ----
+          conditionalPanel(
+            condition = "input.gcontrast_method == 'pseudobulk'",
+            fluidRow(
+              column(3, selectInput("gcontrast_pb_sample", "Sample / replicate column:", choices = grouping_choices, width = "100%")),
+              column(3, selectInput("gcontrast_pb_subset_col", "Restrict to (optional):", choices = c("(all cells)" = "", grouping_choices), width = "100%")),
+              column(3, uiOutput("gcontrast_pb_subset_level_ui")),
+              column(3, div(style = "margin-top: 25px;",
+                            actionButton("gcontrast_pb_compute", "Compute pseudobulk DE",
+                                         style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
+            ),
+            helpText("Pseudobulk: raw counts (the assay's 'counts' layer) are SUMMED per sample within each group, then DESeq2 compares the two groups. Recommended for condition comparisons across samples. Needs at least 2 samples per group; optionally restrict to one cell type / cluster.")
           )
         ),
-        withSpinner(DTOutput("gcontrast_table"), caption = "Computing contrast...", color = "#39FF14")
+        conditionalPanel(
+          condition = "input.gcontrast_method == 'percell'",
+          withSpinner(DTOutput("gcontrast_table"), caption = "Computing contrast...", color = "#39FF14")),
+        conditionalPanel(
+          condition = "input.gcontrast_method == 'pseudobulk'",
+          uiOutput("gcontrast_pb_caption"),
+          withSpinner(DTOutput("gcontrast_pb_table"), caption = "Running DESeq2...", color = "#39FF14"))
       )))
     }
 
@@ -1273,8 +1295,8 @@ server <- function(input, output, session) {
     tabs <- c(tabs, list(tabPanel(
       "Annotation",
       help_details(
-        tags$p("Explore and validate cell-type annotations WITHOUT marker genes - useful for foundation-model (scFM) predictions, which don't rely on markers. All three views use metadata columns already in the object (predicted labels, confidence scores, manual labels)."),
-        tags$p("Label comparison = a confusion matrix between two label columns (does the model agree with your labels, and where not?). Confidence by group = the distribution of a numeric score per group. Composition = cell-type proportions per sample/condition.")),
+        tags$p("Explore and validate cell type annotations without marker genes, which is handy for foundation model (scFM) predictions that do not rely on markers. All three views use metadata columns already in the object (predicted labels, confidence scores, manual labels)."),
+        tags$p("Label comparison is a confusion matrix between two label columns (does the model agree with your labels, and where not). Confidence by group is the distribution of a numeric score per group. Composition is cell type proportions per sample or condition.")),
       wellPanel(
         fluidRow(
           column(12, radioButtons("anno_type", "View:", inline = TRUE,
@@ -1348,11 +1370,16 @@ server <- function(input, output, session) {
     def_2d  <- if ("umap" %in% red_choices) "umap" else red_choices[1]
     def_hi  <- if ("pca" %in% red_choices) "pca" else red_choices[1]
     def_b   <- if (length(red_choices) > 1) red_choices[2] else red_choices[1]
+    # A sensible "colour by batch/sample" default for the integration check.
+    def_batch <- {
+      hit <- grouping_choices[grepl("sample|batch|orig|donor|condition", grouping_choices, ignore.case = TRUE)]
+      if (length(hit)) hit[[1]] else if (length(grouping_choices) > 1) grouping_choices[[2]] else grouping_choices[[1]]
+    }
     tabs <- c(tabs, list(tabPanel(
       "scFM Explorer",
       help_details(
-        tags$p("A dedicated layer for exploring and validating foundation-model (scFM) outputs on the same cells - no code. Pick a sub-tab below."),
-        tags$p("Compare embeddings = two maps side by side with matched colours and linked highlighting. Neighbourhood preservation = how faithfully a 2D map keeps the high-dimensional neighbourhoods (embedding quality). Model agreement = where several annotations (e.g. different models, or model vs manual) agree or disagree.")),
+        tags$p("A dedicated space for exploring and validating foundation model (scFM) outputs on the same cells."),
+        tags$p("Compare embeddings shows the same cells on several maps side by side with matched colours. Neighbourhood preservation shows how faithfully a 2D map keeps the high dimensional neighbourhoods (embedding quality). Model agreement shows where several annotations agree or disagree. Embedding heatmap shows each group's signature across the embedding dimensions. Integration check shows the same embedding coloured two ways of your choice, for example by cell type and by batch, so you can check whether the batches mix while cell types stay separate.")),
       div(class = "sub-tabs",
       tabsetPanel(
         type = "pills",
@@ -1402,6 +1429,41 @@ server <- function(input, output, session) {
           uiOutput("agree_caption"),
           tags$hr(),
           withSpinner(DTOutput("agree_table"), caption = "Loading table...", color = "#39FF14")
+        ),
+        # ---- Embedding heatmap (per-group embedding signature; scGPT Fig 2c/5c) ----
+        tabPanel(
+          "Embedding heatmap",
+          wellPanel(fluidRow(
+            column(4, selectInput("heat_emb", "Embedding:", choices = red_choices, selected = def_hi)),
+            column(4, selectInput("heat_group", "Group by (rows):", choices = grouping_choices)),
+            column(4, radioButtons("heat_scale", "Values:", inline = TRUE,
+                                   choices = c("Z-score per dimension" = "z", "Mean" = "mean"), selected = "z"))
+          ), helpText("Mean embedding value per group per dimension (rows = groups, columns = the embedding's dimensions), reordered by clustering so similar groups/dimensions sit together. Z-score per dimension shows each group's relative signature. Best on a multi-dimensional reduction (PCA or a foundation-model embedding), not a 2D UMAP.")),
+          div(class = "plot-dl-wrap", style = "position: relative;",
+              plot_dl_btn("heat_plot", "embedding_heatmap"),
+              withSpinner(plotlyOutput("heat_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
+          tags$hr(),
+          withSpinner(DTOutput("heat_table"), caption = "Loading table...", color = "#39FF14")
+        ),
+        # ---- Integration check (same embedding, two colourings; scGPT Fig 4) ----
+        tabPanel(
+          "Integration check",
+          wellPanel(fluidRow(
+            column(4, selectInput("intg_emb", "Embedding:", choices = red_choices, selected = def_2d)),
+            column(4, selectInput("intg_color1", "Colour LEFT by (e.g. cell type):", choices = grouping_choices)),
+            column(4, selectInput("intg_color2", "Colour RIGHT by (e.g. batch/sample):", choices = grouping_choices, selected = def_batch))
+          ), helpText("The same embedding coloured two ways. A good embedding / integration separates cell types (left) while MIXING batches or samples (right). If batches form their own separate islands, batch effects remain.")),
+          div(style = "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; max-width: 1600px; margin: 0 auto;",
+              div(style = "display: flex; align-items: flex-start; gap: 10px;",
+                  div(class = "plot-dl-wrap scfm-square", style = "flex: 1 1 auto; min-width: 0;",
+                      plot_dl_btn("intg_plot_a", "integration_left"),
+                      withSpinner(plotlyOutput("intg_plot_a", width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14")),
+                  div(style = "flex: 0 0 auto;", uiOutput("intg_legend_a"))),
+              div(style = "display: flex; align-items: flex-start; gap: 10px;",
+                  div(class = "plot-dl-wrap scfm-square", style = "flex: 1 1 auto; min-width: 0;",
+                      plot_dl_btn("intg_plot_b", "integration_right"),
+                      withSpinner(plotlyOutput("intg_plot_b", width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14")),
+                  div(style = "flex: 0 0 auto;", uiOutput("intg_legend_b"))))
         )
       ))
     )))
@@ -2509,6 +2571,94 @@ server <- function(input, output, session) {
     dt_with_excel(out, safe_fname(paste0("contrasts_DEA_", input$gcontrast_target, "_vs_", input$gcontrast_reference)))
   }, server = FALSE)
 
+  # ---- Pseudobulk differential expression (DESeq2) --------------------------
+  # Sum raw counts per sample within each group, then DESeq2 on the group factor.
+  # The recommended way to compare conditions across samples (avoids the pseudo-
+  # replication false positives of per-cell tests; Squair et al. 2021).
+
+  # Optional "restrict to a cell type / cluster" level picker.
+  output$gcontrast_pb_subset_level_ui <- renderUI({
+    col <- input$gcontrast_pb_subset_col
+    if (is.null(col) || !nzchar(col)) return(helpText("(no restriction)"))
+    selectInput("gcontrast_pb_subset_level", "Restrict to level:",
+                choices = sort_levels(seu()@meta.data[[col]]), width = "100%")
+  })
+
+  gcontrast_pb_res <- eventReactive(input$gcontrast_pb_compute, {
+    req(seu(), input$gcontrast_group, input$gcontrast_target, input$gcontrast_reference, input$gcontrast_pb_sample)
+    validate(need(input$gcontrast_target != input$gcontrast_reference, "Pick two different groups."))
+    validate(need(requireNamespace("DESeq2", quietly = TRUE),
+                  "The DESeq2 package is required for pseudobulk mode (install it on the server)."))
+    assay_use <- gcontrast_assay_val()
+    cnt <- tryCatch(GetAssayData(seu(), layer = "counts", assay = assay_use), error = function(e) NULL)
+    validate(need(!is.null(cnt) && nrow(cnt) > 0, paste0("Assay '", assay_use, "' has no raw 'counts' layer for pseudobulk.")))
+    md <- seu()@meta.data
+    cond <- as.character(md[[input$gcontrast_group]])
+    samp <- as.character(md[[input$gcontrast_pb_sample]])
+    keep <- cond %in% c(input$gcontrast_target, input$gcontrast_reference) & !is.na(samp)
+    sub_col <- input$gcontrast_pb_subset_col
+    if (!is.null(sub_col) && nzchar(sub_col) && !is.null(input$gcontrast_pb_subset_level))
+      keep <- keep & !is.na(md[[sub_col]]) & as.character(md[[sub_col]]) == input$gcontrast_pb_subset_level
+    validate(need(sum(keep) > 0, "No cells match the chosen groups / restriction."))
+    cnt <- cnt[, keep, drop = FALSE]; cond <- cond[keep]; samp <- samp[keep]
+
+    # Sum counts per sample (genes x samples) via an indicator matrix.
+    sf <- factor(samp)
+    ind <- Matrix::sparse.model.matrix(~ 0 + sf)
+    pb <- as.matrix(cnt %*% ind)
+    colnames(pb) <- levels(sf)
+    # Each sample's group = its cells' (majority) condition.
+    samp_group <- tapply(cond, samp, function(x) names(sort(table(x), decreasing = TRUE))[1])
+    groups <- samp_group[colnames(pb)]
+    ok <- groups %in% c(input$gcontrast_target, input$gcontrast_reference)
+    pb <- pb[, ok, drop = FALSE]; groups <- groups[ok]
+    n_t <- sum(groups == input$gcontrast_target); n_r <- sum(groups == input$gcontrast_reference)
+    validate(need(n_t >= 2 && n_r >= 2, sprintf(
+      "Pseudobulk needs at least 2 samples per group (found %d in '%s', %d in '%s'). Pick a sample column that actually has replicates.",
+      n_t, input$gcontrast_target, n_r, input$gcontrast_reference)))
+
+    pb <- round(pb)
+    pb <- pb[rowSums(pb) >= 10, , drop = FALSE]   # drop all-but-empty genes
+    coldata <- data.frame(group = factor(groups, levels = c(input$gcontrast_reference, input$gcontrast_target)))
+    rownames(coldata) <- colnames(pb)
+    res <- tryCatch({
+      dds <- DESeq2::DESeqDataSetFromMatrix(countData = pb, colData = coldata, design = ~ group)
+      dds <- DESeq2::DESeq(dds, quiet = TRUE)
+      as.data.frame(DESeq2::results(dds, contrast = c("group", input$gcontrast_target, input$gcontrast_reference)))
+    }, error = function(e) e)
+    list(res = res, n_t = n_t, n_r = n_r, group = input$gcontrast_group,
+         target = input$gcontrast_target, reference = input$gcontrast_reference,
+         sample = input$gcontrast_pb_sample, assay = assay_use,
+         subset = if (!is.null(sub_col) && nzchar(sub_col)) paste0(sub_col, " = ", input$gcontrast_pb_subset_level) else "all cells")
+  })
+
+  output$gcontrast_pb_caption <- renderUI({
+    req(isTRUE(input$gcontrast_pb_compute > 0))
+    a <- gcontrast_pb_res()
+    if (inherits(a$res, "error")) return(NULL)
+    helpText(sprintf("Pseudobulk DESeq2: %d samples in '%s' vs %d in '%s', on %s (assay '%s', raw counts). log2FoldChange is %s vs %s.",
+                     a$n_t, a$target, a$n_r, a$reference, a$subset, a$assay, a$target, a$reference))
+  })
+
+  output$gcontrast_pb_table <- renderDT({
+    validate(need(isTRUE(input$gcontrast_pb_compute > 0),
+                  "Set the options above, then click 'Compute pseudobulk DE'."))
+    a <- gcontrast_pb_res()
+    validate(need(identical(a$group, input$gcontrast_group) &&
+                  identical(a$target, input$gcontrast_target) &&
+                  identical(a$reference, input$gcontrast_reference) &&
+                  identical(a$sample, input$gcontrast_pb_sample) &&
+                  identical(a$assay, gcontrast_assay_val()),
+                  "Inputs changed. Click 'Compute pseudobulk DE' to update the table."))
+    res <- a$res
+    if (inherits(res, "error")) validate(need(FALSE, paste("DESeq2 failed:", conditionMessage(res))))
+    df <- data.frame(gene = rownames(res), res, row.names = NULL, check.names = FALSE)
+    df <- df[order(df$padj, na.last = TRUE), ]
+    num <- vapply(df, is.numeric, logical(1))
+    df[num] <- lapply(df[num], function(x) signif(x, 3))
+    dt_with_excel(df, safe_fname(paste0("pseudobulk_DESeq2_", a$target, "_vs_", a$reference)))
+  }, server = FALSE)
+
   # ===========================================================================
   # Split by Group: one gene shown as a separate expression UMAP per level of a
   # grouping column. Each panel plots that group's cells (coloured by the gene's
@@ -3153,6 +3303,94 @@ server <- function(input, output, session) {
     tb$Percent <- round(tb$Cells / sum(tb$Cells) * 100, 2)
     dt_with_excel(tb, "model_agreement_distribution")
   }, server = FALSE)   # client-side so the Excel button exports ALL rows
+
+  # ---- Embedding heatmap: mean embedding value per group per dimension --------
+  # Rows = groups, columns = the embedding's dimensions; clustered so structure shows.
+  heat_data <- reactive({
+    req(seu(), input$heat_emb, input$heat_group)
+    emb <- Embeddings(seu(), input$heat_emb)                       # cells x dims
+    grp <- as.character(seu()@meta.data[[input$heat_group]]); grp[is.na(grp)] <- "NA"
+    m <- rowsum(emb, grp)                                          # groups x dims (sum)
+    m <- m / as.numeric(table(grp)[rownames(m)])                  # -> mean per group
+    m
+  })
+
+  output$heat_plot <- renderPlotly({
+    m <- heat_data()
+    validate(need(ncol(m) >= 2,
+                  "This embedding has fewer than 2 dimensions - pick a multi-dimensional reduction (PCA or a foundation-model embedding), not a 2D UMAP."))
+    if (identical(input$heat_scale, "z")) {
+      z <- scale(m); z[!is.finite(z)] <- 0                        # z-score each dimension
+      lim <- max(abs(z)); if (!is.finite(lim) || lim <= 0) lim <- 1
+      cs <- EXPR_COLORSCALE; zmin <- -lim; zmax <- lim; lab <- "z-score"
+    } else {
+      z <- m; cs <- "Viridis"; zmin <- min(z, na.rm = TRUE); zmax <- max(z, na.rm = TRUE); lab <- "mean"
+    }
+    ro <- if (nrow(z) > 2) tryCatch(stats::hclust(stats::dist(z))$order, error = function(e) seq_len(nrow(z))) else seq_len(nrow(z))
+    co <- if (ncol(z) > 2) tryCatch(stats::hclust(stats::dist(t(z)))$order, error = function(e) seq_len(ncol(z))) else seq_len(ncol(z))
+    z <- z[ro, co, drop = FALSE]
+    plot_ly(x = colnames(z), y = rownames(z), z = z, type = "heatmap",
+            colorscale = cs, zmin = zmin, zmax = zmax, zauto = FALSE,
+            colorbar = list(title = list(text = lab), thickness = 15, outlinewidth = 0),
+            hovertemplate = paste0(pretty_label(input$heat_group), ": %{y}<br>dim: %{x}<br>", lab, ": %{z:.3f}<extra></extra>")) %>%
+      plotly::layout(
+        title = list(text = paste0("Embedding signature per ", pretty_label(input$heat_group), " (", input$heat_emb, ")"),
+                     x = 0, xref = "paper", xanchor = "left",
+                     font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
+        xaxis = list(title = "embedding dimension", showticklabels = (ncol(z) <= 60), tickangle = -90),
+        yaxis = list(title = ""),
+        margin = list(l = 150, r = 10, t = 50, b = 70)) %>%
+      plotly::config(displayModeBar = FALSE)
+  })
+
+  output$heat_table <- renderDT({
+    m <- round(heat_data(), 4)
+    df <- data.frame(Group = rownames(m), m, check.names = FALSE, row.names = NULL)
+    dt_with_excel(df, "embedding_heatmap")
+  }, server = FALSE)   # client-side so the Excel button exports ALL rows
+
+  # ---- Integration check: the same embedding coloured two ways ---------------
+  intg_scatter <- function(red, color_col) {
+    req(seu(), red, color_col)
+    e <- Embeddings(seu(), red)[, 1:2, drop = FALSE]
+    col <- as.character(seu()@meta.data[[color_col]]); col[is.na(col)] <- "NA"
+    cats <- sort_levels(col); non_na <- setdiff(cats, "NA")
+    pal <- setNames(scales::hue_pal()(length(non_na)), non_na)
+    if ("NA" %in% cats) pal[["NA"]] <- "#B3B3B3"
+    ptcol <- unname(pal[col]); ptcol[is.na(ptcol)] <- "#B3B3B3"
+    set.seed(1); ord <- sample(nrow(e))
+    df <- data.frame(x = e[ord, 1], y = e[ord, 2], c = ptcol[ord], g = col[ord], stringsAsFactors = FALSE)
+    rng <- emb_range(e)
+    plot_ly(df, x = ~x, y = ~y, type = "scattergl", mode = "markers",
+            marker = list(size = 4, color = ~c), text = ~g, hoverinfo = "text", showlegend = FALSE) %>%
+      plotly::layout(
+        title = list(text = paste0(red, " · ", pretty_label(color_col)), x = 0, xref = "paper", xanchor = "left",
+                     font = list(size = 14, family = "Open Sans, verdana, arial, sans-serif")),
+        xaxis = list(title = "", zeroline = FALSE, showticklabels = FALSE, showgrid = TRUE, gridcolor = "#e6e6e6",
+                     nticks = 6, range = rng, constrain = "range"),
+        yaxis = list(title = "", zeroline = FALSE, showticklabels = FALSE, showgrid = TRUE, gridcolor = "#e6e6e6",
+                     nticks = 6, scaleanchor = "x", scaleratio = 1, range = rng, constrain = "range"),
+        margin = list(l = 10, r = 10, t = 30, b = 10)) %>%
+      plotly::config(displayModeBar = FALSE)
+  }
+  intg_legend <- function(color_col) {
+    req(seu(), color_col)
+    col <- as.character(seu()@meta.data[[color_col]]); col[is.na(col)] <- "NA"
+    cats <- sort_levels(col); non_na <- setdiff(cats, "NA")
+    pal <- setNames(scales::hue_pal()(length(non_na)), non_na)
+    if ("NA" %in% cats) pal[["NA"]] <- "#B3B3B3"
+    items <- lapply(cats, function(cc)
+      tags$span(style = "display: flex; align-items: center; margin-bottom: 5px; font-size: 11px; white-space: nowrap;",
+                tags$span(style = sprintf("width: 11px; height: 11px; border-radius: 50%%; background: %s; display: inline-block; margin-right: 6px; flex: 0 0 auto;", pal[[cc]])),
+                cc))
+    # Vertical legend, shown to the RIGHT of its plot.
+    div(style = "display: flex; flex-direction: column; padding-top: 30px; max-height: 80vh; overflow-y: auto;",
+        tags$strong(style = "margin-bottom: 6px;", paste0(pretty_label(color_col), ":")), items)
+  }
+  output$intg_plot_a  <- renderPlotly({ intg_scatter(input$intg_emb, input$intg_color1) })
+  output$intg_plot_b  <- renderPlotly({ intg_scatter(input$intg_emb, input$intg_color2) })
+  output$intg_legend_a <- renderUI({ req(input$intg_color1); intg_legend(input$intg_color1) })
+  output$intg_legend_b <- renderUI({ req(input$intg_color2); intg_legend(input$intg_color2) })
 }
 
 shinyApp(ui, server)
