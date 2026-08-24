@@ -203,11 +203,11 @@ lbl <- function(text, info) tagList(text, info_icon(info))
 
 # A collapsible "How to use this tab" panel (native <details>, no JS), with a
 # link to the full guide appended after the body.
-help_details <- function(...) {
+help_details <- function(..., .summary = "How to use this tab", .guide = TRUE) {
   tags$details(class = "tab-help",
-    tags$summary("How to use this tab"),
+    tags$summary(.summary),
     tags$div(class = "tab-help-body", ...,
-             tags$p(tags$a(href = GUIDE_URL, target = "_blank", "Open the full user guide ↗"))))
+             if (.guide) tags$p(tags$a(href = GUIDE_URL, target = "_blank", "Open the full user guide ↗"))))
 }
 
 ui <- fluidPage(
@@ -360,6 +360,8 @@ ui <- fluidPage(
       .tab-help > summary:hover { color: #2ecc0f; }
       .tab-help-body { margin-top: 8px; color: #444; font-size: 13px; line-height: 1.5; }
       .tab-help-body p { margin: 4px 0; }
+      .tab-help-body ol, .tab-help-body ul { margin: 6px 0; padding-left: 20px; }
+      .tab-help-body ol li, .tab-help-body ul li { margin: 3px 0; }
       .tab-help-body a { color: #2ecc0f; font-weight: 600; }
 
       /* Assay / layer info strip */
@@ -975,8 +977,13 @@ server <- function(input, output, session) {
       tabPanel(
         "Clusters / Metadata",
         help_details(
-          tags$p("Each point is a cell, placed by the UMAP. Pick a metadata column in \"Color UMAP by\" to colour the map; use the \"Resolution / clustering\" box to colour by a clustering (resolution = how many clusters)."),
-          tags$p("Categorical columns get discrete colours with show/hide toggles; numeric columns (scores, QC) get a gradient with a Min/Max filter.")),
+          tags$p("Colours the UMAP (one point per cell) by any metadata column, so you can see how cell types, conditions, clusters, or scores are laid out."),
+          tags$ol(
+            tags$li("Pick a column in \"Color UMAP by\" to colour the map."),
+            tags$li("To colour by a clustering instead, pick one in \"Resolution / clustering\" (resolution sets how many clusters)."),
+            tags$li("For a categorical column, tick or untick the categories in the sidebar to show or hide them."),
+            tags$li("For a numeric column (scores, QC), type a Min or Max to grey out cells outside that range."),
+            tags$li("Hover a point to read its value; use the PNG button to save the plot."))),
         sidebarLayout(
           sidebarPanel(
             if (length(res_choices) > 0)
@@ -996,12 +1003,23 @@ server <- function(input, output, session) {
       tabPanel(
         "Gene Expression",
         help_details(
-          tags$p("Explore gene expression three ways, using the sub tabs below. \"Per-gene maps\" draws one umap per selected gene. \"Aggregated (pseudobulk)\" summarises the selected genes per group as a heatmap and a table. \"Split by Group\" shows one gene as a separate umap per group (for example per condition or cell type), on a shared scale so the panels are comparable."),
-          tags$p("They all let you choose the assay and data layer to view raw counts, normalized, or scaled values.")),
+          tags$p("Explore gene expression three ways, using the sub tabs below (the smaller green buttons). All three let you choose the assay and data layer to view raw counts, normalized, or scaled values. Each sub tab has its own \"How to use\" panel with steps."),
+          tags$ul(
+            tags$li("Per-gene maps: one UMAP per gene, coloured by expression."),
+            tags$li("Aggregated (pseudobulk): the selected genes summarised per group as a heatmap and table."),
+            tags$li("Split by Group: one gene shown as a separate UMAP per group, on a shared scale so the panels are comparable."))),
         div(class = "sub-tabs", tabsetPanel(
           type = "pills",
           tabPanel(
             "Per-gene maps",
+            help_details(.summary = "How to use: Per-gene maps", .guide = FALSE,
+              tags$p("One UMAP per gene, coloured by expression on a blue to white to red scale (raw values of the chosen data layer)."),
+              tags$ol(
+                tags$li("Type gene symbols in the \"Gene(s):\" box."),
+                tags$li("Choose the assay and \"Data layer\" (raw counts, normalized, or scaled)."),
+                tags$li("Set \"Plots per row\" and \"Color scale\" (same scale for all genes to compare, or adjusted per gene)."),
+                tags$li("To compare one gene across layers instead, set \"Compare\" to \"One gene across data layers\" and tick the layers under \"Layers to show\" (each panel gets its own scale, and Color scale is ignored)."),
+                tags$li("Save a panel with its PNG button, or all panels with \"Download all as one PNG\"."))),
         wellPanel(
           fluidRow(
             column(3, radioButtons("compare_mode", "Compare:",
@@ -1023,8 +1041,7 @@ server <- function(input, output, session) {
             column(7, radioButtons("scale_mode", "Color scale:",
                                    choices = c("Same scale for all genes (comparable)" = "shared",
                                                "Scale adjusted per gene (all clearly visible)" = "per_gene"),
-                                   selected = "shared")),
-            column(12, helpText("In \"One gene across data layers\" mode the FIRST selected gene is shown side by side in each layer you tick under \"Layers to show\" (each panel gets its own scale); Color scale is ignored."))
+                                   selected = "shared"))
           )
         ),
         uiOutput("dynamic_feature_plots")   # (centres its own grid internally, like Split)
@@ -1032,6 +1049,13 @@ server <- function(input, output, session) {
           # ---- Aggregated (pseudobulk): heatmap + table, nested under Gene Expression ----
           tabPanel(
             "Aggregated (pseudobulk)",
+            help_details(.summary = "How to use: Aggregated (pseudobulk)", .guide = FALSE,
+              tags$p("Summarises the selected genes per group as a heatmap and a table, a compact pseudobulk overview."),
+              tags$ol(
+                tags$li("Pick the \"Aggregate by\" column (the groups)."),
+                tags$li("Type genes in the \"Gene(s):\" box."),
+                tags$li("Choose the assay, data layer, and \"Summary per group\" (mean, sum, or median)."),
+                tags$li("Save the heatmap with the PNG button, or the table with \"Download Excel\"."))),
             wellPanel(
               fluidRow(
                 column(3, selectInput("agg_group_var", "Aggregate by:", choices = grouping_choices, width = "100%")),
@@ -1047,8 +1071,7 @@ server <- function(input, output, session) {
                 column(if (length(all_assays_ge) > 1) 4 else 6, radioButtons("agg_fun", "Summary per group:",
                                        choices = c("Mean" = "mean", "Sum" = "sum", "Median" = "median"),
                                        selected = "mean", inline = TRUE))
-              ),
-              helpText("Summarises each selected gene per group (mean / sum / median) - a compact pseudobulk overview (blue-white-red heatmap + table).")
+              )
             ),
             div(class = "plot-dl-wrap", style = "position: relative;",
                 plot_dl_btn("agg_heatmap", "aggregated_expression"),
@@ -1059,6 +1082,14 @@ server <- function(input, output, session) {
           # ---- Split by Group: one gene per group, nested under Gene Expression ----
           tabPanel(
             "Split by Group",
+            help_details(.summary = "How to use: Split by Group", .guide = FALSE,
+              tags$p("One gene shown as a separate UMAP per group, on a shared colour scale so the panels are comparable."),
+              tags$ol(
+                tags$li("Pick the \"Split by\" column, and optionally \"Then by\" a second column for a grid (for example cell type by condition)."),
+                tags$li("Type a gene in the \"Gene:\" box."),
+                tags$li("Choose the assay and data layer."),
+                tags$li("Pick which groups to show (up to 12 panels)."),
+                tags$li("Save a panel with its PNG button, or all panels with \"Download all as one PNG\"."))),
             wellPanel(
               fluidRow(
                 column(2, selectInput("split_group", "Split by:", choices = grouping_choices, width = "100%")),
@@ -1075,8 +1106,7 @@ server <- function(input, output, session) {
                 column(3, uiOutput("split_layer_ui"))
               ),
               uiOutput("split_levels_ui"),
-              uiOutput("split_levels2_ui"),
-              helpText("One gene shown as a separate UMAP per group (e.g. per condition or cell type), on a shared colour scale so panels are comparable. Optionally split again by a second column for a grid (e.g. cell type x condition). Pick which groups to show (up to 12 panels).")
+              uiOutput("split_levels2_ui")
             ),
             uiOutput("split_plots")
           )
@@ -1091,8 +1121,12 @@ server <- function(input, output, session) {
       tabs <- c(tabs, list(tabPanel(
         "Cluster Markers",
         help_details(
-          tags$p("Precomputed marker tables (genes that mark each cluster vs all other cells). Pick the clustering resolution, test, and cluster to view its markers."),
-          tags$p("Use Search to filter the table; \"Download Excel\" exports every row.")),
+          tags$p("Precomputed marker tables: genes that mark each cluster versus all other cells."),
+          tags$ol(
+            tags$li("Pick a \"Clustering resolution\" (which clustering to use)."),
+            tags$li("Pick a \"Test type\"."),
+            tags$li("Pick a cluster to view its markers."),
+            tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
         wellPanel(
           fluidRow(
             column(3, selectInput("marker_resolution", "Clustering resolution:", width = "100%",
@@ -1108,7 +1142,12 @@ server <- function(input, output, session) {
       tabs <- c(tabs, list(tabPanel(
         "Cluster Markers",
         help_details(
-          tags$p("Genes that mark a group versus all other cells. Pick the grouping column and a group, choose the assay, data layer and test, then click \"Compute markers\".")),
+          tags$p("Finds genes that mark one group versus all other cells, computed live from the object."),
+          tags$ol(
+            tags$li("Pick the \"Grouping column\" and the group whose markers you want."),
+            tags$li("Set the assay, data layer, and \"Test type\". The \"integrated\" assay is excluded, because differential expression on batch-corrected values is not valid. Layer \"data\" is log-normalized (used by most tests); \"counts\" is raw (used by count-based tests like Poisson)."),
+            tags$li("Click \"Compute markers\". It is heavy on large objects, so it does not run automatically."),
+            tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
         wellPanel(
           fluidRow(
             column(2, selectInput("gmarker_group", "Grouping column:", choices = grouping_choices, width = "100%")),
@@ -1122,11 +1161,6 @@ server <- function(input, output, session) {
             column(3, div(style = "margin-top: 5px;",
                           actionButton("gmarker_compute", "Compute markers",
                                        style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
-          ),
-          helpText(
-            "Markers of the chosen group vs all other cells. Set the options, then click 'Compute markers' -- it is heavy on large objects, so it does NOT run automatically.",
-            if (length(de_assays) > 1) " 'integrated' is excluded because DE on batch-corrected values is statistically invalid.",
-            " Layer: 'data' = log-normalized (default for most tests); 'counts' = raw (used by count-based tests like Poisson)."
           )
         ),
         withSpinner(DTOutput("gmarker_table"), caption = "Computing markers...", color = "#39FF14")
@@ -1140,8 +1174,12 @@ server <- function(input, output, session) {
     tabs <- c(tabs, list(tabPanel(
       "Marker Plot",
       help_details(
-        tags$p("Compare chosen genes across groups. Dot plot: dot size is the percent of cells in the group expressing the gene, colour is mean expression z scored per gene. Violin: the expression distribution per group, one row per gene."),
-        tags$p("Pick genes manually, or in dot plot mode find each group's top markers automatically by clicking \"Compute markers\".")),
+        tags$p("Compares chosen genes across groups, as a dot plot or violins. Dot plot: dot size is the percent of cells in the group expressing the gene, colour is mean expression z scored per gene. Violin: the expression distribution per group, one row per gene."),
+        tags$ol(
+          tags$li("Choose a \"Plot type\": dot plot or violin."),
+          tags$li("Pick the \"Group by\" column, and the assay and data layer."),
+          tags$li("Dot plot: choose genes manually, or pick \"Top markers per group (auto)\" and click \"Compute markers\". Violin: type the genes to show."),
+          tags$li("Use the PNG button to save the plot."))),
       wellPanel(
         # Plot type is the FIRST thing to choose; everything below adapts to it.
         fluidRow(
@@ -1196,8 +1234,7 @@ server <- function(input, output, session) {
                                      choices = NULL, multiple = TRUE, width = "100%",
                                      options = list(placeholder = "Type or pick genes to show as violins...", sortField = list(list(field = "$order")))))
           )
-        ),
-        helpText("Dot plot: dot size = % of cells in the group expressing the gene, colour = average expression z-scored per gene across groups. Violin: the expression distribution per group of the genes you pick above (one row per gene). In auto mode, each group's top markers (group vs all other cells) are found and shown.")
+        )
       ),
       conditionalPanel(
         condition = "input.marker_plot_type == 'dot'",
@@ -1221,8 +1258,11 @@ server <- function(input, output, session) {
       tabs <- c(tabs, list(tabPanel(
         "Differential expression",
         help_details(
-          tags$p("Precomputed differential expression tables between two groups (target versus reference). Pick a contrast (A vs B) and a test to view its results."),
-          tags$p("Unlike cluster markers (a group versus everyone else), a contrast is one group versus one specific other group. Search filters the table, and \"Download Excel\" exports every row.")),
+          tags$p("Precomputed differential expression tables between two groups (target versus reference). Unlike cluster markers (a group versus everyone else), a contrast is one group versus one specific other group."),
+          tags$ol(
+            tags$li("Pick a \"Contrast\" (the A vs B pair)."),
+            tags$li("Pick a \"Test type\"."),
+            tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
         wellPanel(
           fluidRow(
             column(4, selectInput("contrast_choice", "Contrast:", width = "100%",
@@ -1237,8 +1277,13 @@ server <- function(input, output, session) {
       tabs <- c(tabs, list(tabPanel(
         "Differential expression",
         help_details(
-          tags$p("Differential expression between two groups (target A versus reference B). Two methods. \"Per cell test\" (Wilcoxon and similar) is fast and exploratory. \"Pseudobulk (DESeq2)\" sums raw counts per sample within each group, and is the recommended way to compare conditions across samples, because per cell tests inflate false positives there."),
-          tags$p("Unlike cluster markers (a group versus everyone else), this is one group versus one specific other group.")),
+          tags$p("Finds genes that differ between two groups you choose (target A versus reference B), for example one condition versus another. Unlike cluster markers (a group versus everyone else), this is one group versus one specific other group."),
+          tags$ol(
+            tags$li("Choose a \"Method\": \"Per cell test\" is fast and exploratory; \"Pseudobulk DESeq2\" is recommended for comparing conditions across samples, because per cell tests inflate false positives there."),
+            tags$li("Pick the \"Grouping column\" that holds your two groups, then the target group (A) and the reference group (B)."),
+            tags$li("Per cell test: set the assay, data layer, and \"Test type\". Pseudobulk: set the \"Sample / replicate column\" (it needs at least two samples per group), and optionally \"Restrict to\" one cell type."),
+            tags$li("Click \"Compute contrast\" (or \"Compute pseudobulk DE\"). It does not run automatically."),
+            tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
         wellPanel(
           fluidRow(column(12, radioButtons("gcontrast_method", "Method:", inline = TRUE,
                                   choices = c("Per-cell test (exploratory)" = "percell",
@@ -1260,8 +1305,7 @@ server <- function(input, output, session) {
               column(3, div(style = "margin-top: 25px;",
                             actionButton("gcontrast_compute", "Compute contrast",
                                          style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
-            ),
-            helpText("Per-cell test, target vs reference. Fast, but treats each cell as an independent replicate -- inflates false positives for condition comparisons across samples (use Pseudobulk for those). Click 'Compute contrast'.")
+            )
           ),
           # ---- Pseudobulk (DESeq2) options ----
           conditionalPanel(
@@ -1273,8 +1317,7 @@ server <- function(input, output, session) {
               column(3, div(style = "margin-top: 25px;",
                             actionButton("gcontrast_pb_compute", "Compute pseudobulk DE",
                                          style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
-            ),
-            helpText("Pseudobulk: raw counts (the assay's 'counts' layer) are SUMMED per sample within each group, then DESeq2 compares the two groups. Recommended for condition comparisons across samples. Needs at least 2 samples per group; optionally restrict to one cell type / cluster.")
+            )
           )
         ),
         conditionalPanel(
@@ -1287,75 +1330,9 @@ server <- function(input, output, session) {
       )))
     }
 
-    # ---- Annotation ------------------------------------------------------
-    # Marker-free exploration/validation of cell-type labels (e.g. foundation-
-    # model predictions): compare two label columns (confusion matrix), inspect
-    # a confidence score per group, or see composition per sample/condition.
+    # anno_x2: a sensible default "second" column for the Annotation sub-tab
+    # (now nested under scFM Explorer, below). Defined here so it is in scope.
     anno_x2 <- if (length(grouping_choices) > 1) grouping_choices[[2]] else grouping_choices[[1]]
-    tabs <- c(tabs, list(tabPanel(
-      "Annotation",
-      help_details(
-        tags$p("Explore and validate cell type annotations without marker genes, which is handy for foundation model (scFM) predictions that do not rely on markers. All three views use metadata columns already in the object (predicted labels, confidence scores, manual labels)."),
-        tags$p("Label comparison is a confusion matrix between two label columns (does the model agree with your labels, and where not). Confidence by group is the distribution of a numeric score per group. Composition is cell type proportions per sample or condition.")),
-      wellPanel(
-        fluidRow(
-          column(12, radioButtons("anno_type", "View:", inline = TRUE,
-                                  choices = c("Label comparison (confusion matrix)" = "confusion",
-                                              "Confidence by group" = "confidence",
-                                              "Composition" = "composition"),
-                                  selected = "confusion"))
-        ),
-        conditionalPanel(
-          condition = "input.anno_type == 'confusion'",
-          fluidRow(
-            column(4, selectInput("anno_x", "Rows (e.g. predicted):", choices = grouping_choices, width = "100%")),
-            column(4, selectInput("anno_y", "Columns (e.g. reference/manual):", choices = grouping_choices, selected = anno_x2, width = "100%")),
-            column(4, radioButtons("anno_norm", "Show:", inline = TRUE,
-                                   choices = c("Row %" = "row", "Cell counts" = "count"), selected = "row"))
-          )
-        ),
-        conditionalPanel(
-          condition = "input.anno_type == 'confidence'",
-          fluidRow(
-            column(4, selectInput("conf_value", "Value (e.g. prediction score):", choices = score_choices, width = "100%")),
-            column(4, selectInput("conf_group", "Group by (e.g. cell type):", choices = grouping_choices, width = "100%")),
-            column(4, radioButtons("conf_kind", "Plot:", inline = TRUE,
-                                   choices = c("Violin" = "violin", "Box" = "box"), selected = "violin"))
-          )
-        ),
-        conditionalPanel(
-          condition = "input.anno_type == 'composition'",
-          fluidRow(
-            column(4, selectInput("comp_group", "Group / x-axis (e.g. sample):", choices = grouping_choices, selected = anno_x2, width = "100%")),
-            column(4, selectInput("comp_fill", "Compose of (e.g. cell type):", choices = grouping_choices, width = "100%")),
-            column(4, radioButtons("comp_mode", "Show:", inline = TRUE,
-                                   choices = c("Proportion (%)" = "proportion", "Cell counts" = "count"), selected = "proportion"))
-          )
-        )
-      ),
-      conditionalPanel(
-        condition = "input.anno_type == 'confusion'",
-        div(class = "plot-dl-wrap", style = "position: relative;",
-            plot_dl_btn("anno_confusion", "confusion_matrix"),
-            withSpinner(plotlyOutput("anno_confusion", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
-        uiOutput("anno_agreement"),
-        tags$hr(),
-        withSpinner(DTOutput("anno_confusion_table"), caption = "Loading table...", color = "#39FF14")),
-      conditionalPanel(
-        condition = "input.anno_type == 'confidence'",
-        div(class = "plot-dl-wrap", style = "position: relative;",
-            plot_dl_btn("anno_conf_plot", "confidence_by_group"),
-            withSpinner(plotlyOutput("anno_conf_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
-        tags$hr(),
-        withSpinner(DTOutput("anno_conf_table"), caption = "Loading table...", color = "#39FF14")),
-      conditionalPanel(
-        condition = "input.anno_type == 'composition'",
-        div(class = "plot-dl-wrap", style = "position: relative;",
-            plot_dl_btn("anno_comp_plot", "composition"),
-            withSpinner(plotlyOutput("anno_comp_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
-        tags$hr(),
-        withSpinner(DTOutput("anno_comp_table"), caption = "Loading table...", color = "#39FF14"))
-    )))
 
     # ---- scFM Explorer -------------------------------------------------------
     # A dedicated layer for exploring/validating foundation-model outputs, kept in
@@ -1364,8 +1341,8 @@ server <- function(input, output, session) {
     #                             linked group-highlighting (e.g. standard UMAP vs scGPT).
     #   * Neighbourhood preservation -- per-cell kNN overlap between a high-D reference
     #                             space and a 2D map, coloured on the map (embedding QC).
-    #   * Model agreement      -- per-cell agreement across several label columns
-    #                             (e.g. scGPT vs Geneformer vs manual), on the map.
+    #   * Annotation           -- validate label columns: confusion matrix, a per-cell
+    #                             agreement map, confidence per group, and composition.
     green_btn <- "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;"
     def_2d  <- if ("umap" %in% red_choices) "umap" else red_choices[1]
     def_hi  <- if ("pca" %in% red_choices) "pca" else red_choices[1]
@@ -1378,14 +1355,26 @@ server <- function(input, output, session) {
     tabs <- c(tabs, list(tabPanel(
       "scFM Explorer",
       help_details(
-        tags$p("A dedicated space for exploring and validating foundation model (scFM) outputs on the same cells."),
-        tags$p("Compare embeddings shows the same cells on several maps side by side with matched colours. Neighbourhood preservation shows how faithfully a 2D map keeps the high dimensional neighbourhoods (embedding quality). Model agreement shows where several annotations agree or disagree. Embedding heatmap shows each group's signature across the embedding dimensions. Integration check shows the same embedding coloured two ways of your choice, for example by cell type and by batch, so you can check whether the batches mix while cell types stay separate.")),
+        tags$p("A dedicated space for exploring and validating foundation model (scFM) outputs on the same cells. Pick a sub tab below (the smaller green buttons); each answers a different question and has its own \"How to use\" panel with steps."),
+        tags$ul(
+          tags$li("Compare embeddings: the same cells drawn on several maps side by side with matched colours."),
+          tags$li("Neighbourhood preservation: how faithfully a 2D map keeps the high dimensional neighbourhoods (embedding quality)."),
+          tags$li("Annotation: validate cell type labels, by comparing label columns (confusion matrix and a per-cell agreement map), a confidence score per group, and composition per sample or condition."),
+          tags$li("Embedding heatmap: each group's signature across the embedding dimensions."),
+          tags$li("Integration check: the same embedding coloured two ways of your choice, to check whether batches mix while cell types stay separate."))),
       div(class = "sub-tabs",
       tabsetPanel(
         type = "pills",
         # ---- Compare embeddings (side by side + linked highlight) ----
         tabPanel(
           "Compare embeddings",
+          help_details(.summary = "How to use: Compare embeddings", .guide = FALSE,
+            tags$p("The same cells drawn on each chosen embedding with identical colours, so you can see where a cell type lands in each."),
+            tags$ol(
+              tags$li("Pick one, two or more embeddings in \"Embeddings to compare\"."),
+              tags$li("Choose a \"Color by\" column."),
+              tags$li("Set \"Panels per row\"."),
+              tags$li("Optionally pick groups in \"Highlight groups\" to light them up in all panels (others grey)."))),
           wellPanel(fluidRow(
             column(4, selectizeInput("cmp_embs", lbl("Embeddings to compare:", INFO_RED_CMP), choices = red_choices,
                                      selected = character(0),
@@ -1394,7 +1383,7 @@ server <- function(input, output, session) {
             column(2, numericInput("cmp_ncol", "Panels per row:", value = 2, min = 1, max = 6, width = "100%")),
             column(3, selectizeInput("cmp_highlight", "Highlight groups (optional):", choices = NULL, multiple = TRUE,
                                      options = list(placeholder = "All shown; pick some to highlight")))
-          ), helpText("The same cells drawn on each chosen embedding with identical colours. Pick one, two or more embeddings, and how many panels sit per row. Highlighting groups lights them up in ALL panels (others grey), so you can see where a cell type lands in each embedding.")),
+          )),
           div(style = "display: flex; align-items: flex-start; gap: 18px;",
               div(style = "flex: 1 1 auto; min-width: 0;", uiOutput("cmp_grid")),
               div(style = "flex: 0 0 auto;", uiOutput("cmp_legend")))
@@ -1402,43 +1391,133 @@ server <- function(input, output, session) {
         # ---- Neighbourhood preservation (kNN overlap) ----
         tabPanel(
           "Neighbourhood preservation",
+          help_details(.summary = "How to use: Neighbourhood preservation", .guide = FALSE,
+            tags$p("For each cell, the fraction of its nearest neighbours in a high dimensional reference space that are still neighbours in a 2D map. Low values (red or dark) mark regions where the 2D map distorts the real neighbourhood."),
+            tags$ol(
+              tags$li("Pick the \"Reference space (high-D)\" (for example pca or a foundation-model embedding)."),
+              tags$li("Pick the \"2D map to check\" (for example umap)."),
+              tags$li("Set \"k neighbours\"."),
+              tags$li("Click \"Compute preservation\". It runs over all cells, so it does not run automatically."))),
           wellPanel(fluidRow(
             column(3, selectInput("pres_emb_hi", "Reference space (high-D):", choices = red_choices, selected = def_hi)),
             column(3, selectInput("pres_emb_2d", "2D map to check:", choices = red_choices, selected = def_2d)),
             column(2, numericInput("pres_k", "k neighbours:", value = 30, min = 5, max = 100)),
             column(3, div(style = "margin-top: 25px;",
                           actionButton("pres_compute", "Compute preservation", style = green_btn)))
-          ), helpText("For each cell, the fraction of its k nearest neighbours in the reference (high-D) space that are still neighbours in the 2D map. Low values (red/dark) mark regions where the 2D map distorts the real neighbourhood - read those with caution. Computed on click (kNN over all cells).")),
+          )),
           div(class = "plot-dl-wrap scfm-square-single",
               plot_dl_btn("pres_plot", "neighborhood_preservation"),
               withSpinner(plotlyOutput("pres_plot", width = "100%", height = "100%"), caption = "Computing preservation...", color = "#39FF14")),
           uiOutput("pres_caption")
         ),
-        # ---- Model agreement (per-cell agreement across label columns) ----
+        # ---- Annotation (label validation: confusion matrix, agreement map, confidence, composition) ----
+        # Marker-free exploration/validation of cell-type labels (e.g. foundation-
+        # model predictions). The old standalone "Model agreement" view lives here
+        # now, as the "Agreement on map" view, next to the confusion matrix.
         tabPanel(
-          "Model agreement",
-          wellPanel(fluidRow(
-            column(6, selectizeInput("agree_cols", "Label columns to compare (2 or more):", choices = grouping_choices, multiple = TRUE,
-                                     selected = character(0),
-                                     options = list(placeholder = "e.g. scgpt_celltype, geneformer_celltype, manual"))),
-            column(3, selectInput("agree_emb", "Show on embedding:", choices = red_choices, selected = def_2d))
-          ), helpText("Per cell, how many of the chosen label columns agree: 1.0 = all identical (unanimous, green), lower = the labels disagree there (red). Disagreement hotspots often flag rare or novel cell types the models place differently. Only meaningful when the columns use the SAME label names.")),
-          div(class = "plot-dl-wrap scfm-square-single",
-              plot_dl_btn("agree_plot", "model_agreement"),
-              withSpinner(plotlyOutput("agree_plot", width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14")),
-          uiOutput("agree_caption"),
-          tags$hr(),
-          withSpinner(DTOutput("agree_table"), caption = "Loading table...", color = "#39FF14")
+          "Annotation",
+          help_details(.summary = "How to use: Annotation", .guide = FALSE,
+            tags$p("Explore and validate cell type annotations without marker genes, handy for foundation model (scFM) predictions. All views use metadata columns already in the object (predicted labels, confidence scores, manual labels)."),
+            tags$ol(
+              tags$li("Choose a \"View\": label comparison, agreement on map, confidence by group, or composition."),
+              tags$li("Label comparison: pick two label columns for the confusion matrix (does the model agree with your labels, and where not)."),
+              tags$li("Agreement on map: pick two or more label columns and an embedding to see, cell by cell, how many agree (unanimous green, disagreement red). Only meaningful when the columns use the same label names."),
+              tags$li("Confidence by group: pick a numeric score and a grouping column to see the score's distribution per group."),
+              tags$li("Composition: pick the x-axis group and the column to compose of, to see cell type proportions per sample or condition."),
+              tags$li("Each view has a table with \"Download Excel\"."))),
+          wellPanel(
+            fluidRow(
+              column(12, radioButtons("anno_type", "View:", inline = TRUE,
+                                      choices = c("Label comparison (confusion matrix)" = "confusion",
+                                                  "Agreement on map" = "agreement",
+                                                  "Confidence by group" = "confidence",
+                                                  "Composition" = "composition"),
+                                      selected = "confusion"))
+            ),
+            conditionalPanel(
+              condition = "input.anno_type == 'confusion'",
+              fluidRow(
+                column(4, selectInput("anno_x", "Rows (e.g. predicted):", choices = grouping_choices, width = "100%")),
+                column(4, selectInput("anno_y", "Columns (e.g. reference/manual):", choices = grouping_choices, selected = anno_x2, width = "100%")),
+                column(4, radioButtons("anno_norm", "Show:", inline = TRUE,
+                                       choices = c("Row %" = "row", "Cell counts" = "count"), selected = "row"))
+              )
+            ),
+            conditionalPanel(
+              condition = "input.anno_type == 'agreement'",
+              fluidRow(
+                column(8, selectizeInput("agree_cols", "Label columns to compare (2 or more):", choices = grouping_choices, multiple = TRUE,
+                                         selected = character(0),
+                                         options = list(placeholder = "e.g. scgpt_celltype, geneformer_celltype, manual"))),
+                column(4, selectInput("agree_emb", "Show on embedding:", choices = red_choices, selected = def_2d))
+              )
+            ),
+            conditionalPanel(
+              condition = "input.anno_type == 'confidence'",
+              fluidRow(
+                column(4, selectInput("conf_value", "Value (e.g. prediction score):", choices = score_choices, width = "100%")),
+                column(4, selectInput("conf_group", "Group by (e.g. cell type):", choices = grouping_choices, width = "100%")),
+                column(4, radioButtons("conf_kind", "Plot:", inline = TRUE,
+                                       choices = c("Violin" = "violin", "Box" = "box"), selected = "violin"))
+              )
+            ),
+            conditionalPanel(
+              condition = "input.anno_type == 'composition'",
+              fluidRow(
+                column(4, selectInput("comp_group", "Group / x-axis (e.g. sample):", choices = grouping_choices, selected = anno_x2, width = "100%")),
+                column(4, selectInput("comp_fill", "Compose of (e.g. cell type):", choices = grouping_choices, width = "100%")),
+                column(4, radioButtons("comp_mode", "Show:", inline = TRUE,
+                                       choices = c("Proportion (%)" = "proportion", "Cell counts" = "count"), selected = "proportion"))
+              )
+            )
+          ),
+          conditionalPanel(
+            condition = "input.anno_type == 'confusion'",
+            div(class = "plot-dl-wrap", style = "position: relative;",
+                plot_dl_btn("anno_confusion", "confusion_matrix"),
+                withSpinner(plotlyOutput("anno_confusion", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
+            uiOutput("anno_agreement"),
+            tags$hr(),
+            withSpinner(DTOutput("anno_confusion_table"), caption = "Loading table...", color = "#39FF14")),
+          conditionalPanel(
+            condition = "input.anno_type == 'agreement'",
+            div(class = "plot-dl-wrap scfm-square-single",
+                plot_dl_btn("agree_plot", "model_agreement"),
+                withSpinner(plotlyOutput("agree_plot", width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14")),
+            uiOutput("agree_caption"),
+            tags$hr(),
+            withSpinner(DTOutput("agree_table"), caption = "Loading table...", color = "#39FF14")),
+          conditionalPanel(
+            condition = "input.anno_type == 'confidence'",
+            div(class = "plot-dl-wrap", style = "position: relative;",
+                plot_dl_btn("anno_conf_plot", "confidence_by_group"),
+                withSpinner(plotlyOutput("anno_conf_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
+            tags$hr(),
+            withSpinner(DTOutput("anno_conf_table"), caption = "Loading table...", color = "#39FF14")),
+          conditionalPanel(
+            condition = "input.anno_type == 'composition'",
+            div(class = "plot-dl-wrap", style = "position: relative;",
+                plot_dl_btn("anno_comp_plot", "composition"),
+                withSpinner(plotlyOutput("anno_comp_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
+            tags$hr(),
+            withSpinner(DTOutput("anno_comp_table"), caption = "Loading table...", color = "#39FF14"))
         ),
         # ---- Embedding heatmap (per-group embedding signature; scGPT Fig 2c/5c) ----
         tabPanel(
           "Embedding heatmap",
+          help_details(.summary = "How to use: Embedding heatmap", .guide = FALSE,
+            tags$p("Mean embedding value per group per dimension (rows are groups, columns are the embedding's dimensions), reordered by clustering so similar groups and dimensions sit together. Best on a multi-dimensional reduction, not a 2D UMAP."),
+            tags$ol(
+              tags$li("Pick the \"Embedding\" (for example pca or a foundation-model embedding)."),
+              tags$li("Pick the \"Group by (rows)\" column."),
+              tags$li("Choose \"Values\": z-score per dimension (relative signature) or mean."),
+              tags$li("Save the heatmap with the PNG button, or the table with \"Download Excel\"."))),
           wellPanel(fluidRow(
             column(4, selectInput("heat_emb", "Embedding:", choices = red_choices, selected = def_hi)),
             column(4, selectInput("heat_group", "Group by (rows):", choices = grouping_choices)),
             column(4, radioButtons("heat_scale", "Values:", inline = TRUE,
                                    choices = c("Z-score per dimension" = "z", "Mean" = "mean"), selected = "z"))
-          ), helpText("Mean embedding value per group per dimension (rows = groups, columns = the embedding's dimensions), reordered by clustering so similar groups/dimensions sit together. Z-score per dimension shows each group's relative signature. Best on a multi-dimensional reduction (PCA or a foundation-model embedding), not a 2D UMAP.")),
+          )),
           div(class = "plot-dl-wrap", style = "position: relative;",
               plot_dl_btn("heat_plot", "embedding_heatmap"),
               withSpinner(plotlyOutput("heat_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
@@ -1448,22 +1527,33 @@ server <- function(input, output, session) {
         # ---- Integration check (same embedding, two colourings; scGPT Fig 4) ----
         tabPanel(
           "Integration check",
+          help_details(.summary = "How to use: Integration check", .guide = FALSE,
+            tags$p("The same embedding coloured two ways. A good embedding separates cell types (left) while mixing batches or samples (right). If batches form their own islands, batch effects remain."),
+            tags$ol(
+              tags$li("Pick the \"Embedding\"."),
+              tags$li("Choose \"Colour LEFT by\" (for example cell type)."),
+              tags$li("Choose \"Colour RIGHT by\" (for example batch or sample)."),
+              tags$li("Compare the two panels: cell types separated on the left, batches mixed on the right."))),
           wellPanel(fluidRow(
             column(4, selectInput("intg_emb", "Embedding:", choices = red_choices, selected = def_2d)),
             column(4, selectInput("intg_color1", "Colour LEFT by (e.g. cell type):", choices = grouping_choices)),
             column(4, selectInput("intg_color2", "Colour RIGHT by (e.g. batch/sample):", choices = grouping_choices, selected = def_batch))
-          ), helpText("The same embedding coloured two ways. A good embedding / integration separates cell types (left) while MIXING batches or samples (right). If batches form their own separate islands, batch effects remain.")),
-          div(style = "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; max-width: 1600px; margin: 0 auto;",
+          )),
+          # Same viewport-driven sizing as the other scFM sub-tabs (columns capped
+          # at min(88vh, 70vw), no fixed max-width) so the two squares are as large
+          # as the Compare embeddings / Neighbourhood preservation plots. Each cell
+          # holds its plot plus a fixed-width legend, so both plots stay equal size.
+          div(style = "display: grid; justify-content: center; gap: 14px; grid-template-columns: repeat(2, minmax(0, min(88vh, 70vw)));",
               div(style = "display: flex; align-items: flex-start; gap: 10px;",
                   div(class = "plot-dl-wrap scfm-square", style = "flex: 1 1 auto; min-width: 0;",
                       plot_dl_btn("intg_plot_a", "integration_left"),
                       withSpinner(plotlyOutput("intg_plot_a", width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14")),
-                  div(style = "flex: 0 0 auto;", uiOutput("intg_legend_a"))),
+                  div(style = "flex: 0 0 150px; min-width: 0;", uiOutput("intg_legend_a"))),
               div(style = "display: flex; align-items: flex-start; gap: 10px;",
                   div(class = "plot-dl-wrap scfm-square", style = "flex: 1 1 auto; min-width: 0;",
                       plot_dl_btn("intg_plot_b", "integration_right"),
                       withSpinner(plotlyOutput("intg_plot_b", width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14")),
-                  div(style = "flex: 0 0 auto;", uiOutput("intg_legend_b"))))
+                  div(style = "flex: 0 0 150px; min-width: 0;", uiOutput("intg_legend_b"))))
         )
       ))
     )))
@@ -2988,11 +3078,16 @@ server <- function(input, output, session) {
               type = "violin", box = list(visible = TRUE), points = "outliers",
               spanmode = "hard", showlegend = FALSE)
     }
+    # Fill the width: force each mark to 0.8 wide (trace attribute, via style() so
+    # it isn't confused with plot_ly's figure-width arg), then pin the category
+    # axis to [-0.4, n-0.6] so the outer marks touch the frame (no side padding).
+    p <- plotly::style(p, width = 0.8)
+    xr <- c(-0.4, length(gl) - 0.6)
     p %>% plotly::layout(
       title = list(text = paste0(pretty_label(input$conf_value), " by ", pretty_label(input$conf_group)),
                    x = 0, xref = "paper", xanchor = "left",
                    font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-      xaxis = list(title = "", tickangle = -45),
+      xaxis = list(title = "", tickangle = -45, range = xr),
       yaxis = list(title = pretty_label(input$conf_value), zeroline = FALSE),
       margin = list(l = 70, r = 10, t = 50, b = 150)) %>%
       plotly::config(displayModeBar = FALSE)
@@ -3015,13 +3110,17 @@ server <- function(input, output, session) {
     p <- plot_ly()
     for (ff in fl) p <- add_trace(p, x = gl, y = m[, ff], type = "bar", name = ff,
                                   marker = list(color = pal[[ff]]))
+    # Fill the width: bars are 0.8 wide (bargap 0.2), so pinning the category axis
+    # to [-0.4, n-0.6] makes the outer bars touch the frame edges (no empty side
+    # padding) while keeping the gap between bars.
+    xr <- c(-0.4, length(gl) - 0.6)
     p %>% plotly::layout(
-      barmode = "stack",
+      barmode = "stack", bargap = 0.2,
       title = list(text = paste0("Composition of ", pretty_label(input$comp_group),
                                  " by ", pretty_label(input$comp_fill)),
                    x = 0, xref = "paper", xanchor = "left",
                    font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-      xaxis = list(title = pretty_label(input$comp_group), tickangle = -45),
+      xaxis = list(title = pretty_label(input$comp_group), tickangle = -45, range = xr),
       yaxis = list(title = ytitle),
       legend = list(title = list(text = pretty_label(input$comp_fill))),
       margin = list(l = 60, r = 10, t = 50, b = 150)) %>%
@@ -3380,8 +3479,8 @@ server <- function(input, output, session) {
     pal <- setNames(scales::hue_pal()(length(non_na)), non_na)
     if ("NA" %in% cats) pal[["NA"]] <- "#B3B3B3"
     items <- lapply(cats, function(cc)
-      tags$span(style = "display: flex; align-items: center; margin-bottom: 5px; font-size: 11px; white-space: nowrap;",
-                tags$span(style = sprintf("width: 11px; height: 11px; border-radius: 50%%; background: %s; display: inline-block; margin-right: 6px; flex: 0 0 auto;", pal[[cc]])),
+      tags$span(style = "display: flex; align-items: flex-start; margin-bottom: 5px; font-size: 11px; line-height: 1.3;",
+                tags$span(style = sprintf("width: 11px; height: 11px; border-radius: 50%%; background: %s; display: inline-block; margin-right: 6px; margin-top: 2px; flex: 0 0 auto;", pal[[cc]])),
                 cc))
     # Vertical legend, shown to the RIGHT of its plot.
     div(style = "display: flex; flex-direction: column; padding-top: 30px; max-height: 80vh; overflow-y: auto;",
