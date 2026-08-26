@@ -344,14 +344,6 @@ ui <- fluidPage(
         border: 2px solid #39FF14; font-weight: 600;
       }
 
-      /* scFM Explorer: square plot boxes (fill width, page scrolls down). */
-      .scfm-square { position: relative; width: 100%; aspect-ratio: 1 / 1; }
-      .scfm-square .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
-      .scfm-square .html-widget { width: 100% !important; height: 100% !important; }
-      .scfm-square-single { position: relative; width: min(88vh, 70vw); aspect-ratio: 1 / 1; margin-left: auto; margin-right: auto; }
-      .scfm-square-single .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
-      .scfm-square-single .html-widget { width: 100% !important; height: 100% !important; }
-
       /* In-app help: circled-i tooltip icon + 'How to use this tab' panel */
       .info-ic { cursor: help; color: #2ecc0f; font-weight: 700; margin-left: 4px; font-size: 12px; }
       .tab-help { margin: 8px 0 12px; background: #fafafa; border: 1px solid #e6e6e6;
@@ -378,8 +370,9 @@ ui <- fluidPage(
       #dynamic_feature_plots .html-widget { width: 100% !important; height: 100% !important; }
       #umap_plot_box .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
       #umap_plot_box .html-widget { width: 100% !important; height: 100% !important; }
-      #split_plot_grid .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
-      #split_plot_grid .html-widget { width: 100% !important; height: 100% !important; }
+      /* Split-by-group panels: make the plotly widget fill its fixed square box. */
+      .umap-split-cell .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
+      .umap-split-cell .html-widget { width: 100% !important; height: 100% !important; }
     ")),
     tags$script(HTML("
       document.addEventListener('DOMContentLoaded', function() {
@@ -693,12 +686,24 @@ server <- function(input, output, session) {
   # these factories build the backing reactives from just the input id, so each
   # tab is a one-liner instead of a repeated block.
 
-  # Selected assay, defaulting to the object's DefaultAssay until the input exists
-  # (used by tabs that may view ANY assay: Gene Expression, Aggregated, Split).
+  # Preferred default assay for viewing: RNA (log-normalized) when it has a `data`
+  # layer -- the standard, interpretable choice for DE and cross-sample comparison;
+  # else SCT (which usually has `data`); else the object's DefaultAssay. Requiring a
+  # `data` layer keeps the app generic (an RNA assay with only counts falls through).
+  preferred_view_assay <- function(seu_obj) {
+    all_a <- tryCatch(SeuratObject::Assays(seu_obj), error = function(e) names(seu_obj@assays))
+    has_data <- function(a) isTRUE("data" %in% tryCatch(SeuratObject::Layers(seu_obj[[a]]), error = function(e) character(0)))
+    if ("RNA" %in% all_a && has_data("RNA")) return("RNA")
+    if ("SCT" %in% all_a && has_data("SCT")) return("SCT")
+    tryCatch(Seurat::DefaultAssay(seu_obj), error = function(e) all_a[1])
+  }
+
+  # Selected assay, defaulting to preferred_view_assay() until the input exists
+  # (used by tabs that may view ANY assay: Gene Expression, Aggregated, Marker Plot).
   make_assay_val <- function(id) reactive({
     a <- input[[id]]
     all_a <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
-    if (!is.null(a) && a %in% all_a) a else tryCatch(Seurat::DefaultAssay(seu()), error = function(e) all_a[1])
+    if (!is.null(a) && a %in% all_a) a else preferred_view_assay(seu())
   })
 
   # Selected assay for the DE tabs (Cluster Markers, Contrasts): restricted to
@@ -716,25 +721,8 @@ server <- function(input, output, session) {
 
   feature_assay_val <- make_assay_val("feature_assay")
 
-  # Dynamic layer control for the Gene Expression tab: updates when assay changes.
-  #  * "genes" mode  -> a single "Data layer" dropdown (which layer to view genes in).
-  #  * "layers" mode -> a "Layers to show" checkbox group, so the user picks WHICH
-  #    of the assay's layers to compare side by side (instead of all at once).
-  output$feature_layer_ui <- renderUI({
-    assay_use <- feature_assay_val()
-    req(seu(), assay_use)
-    choices <- layer_choices(seu(), assay_use)
-    if (identical(input$compare_mode, "layers")) {
-      # Start with NONE ticked: rendering every layer at once is a WebGL overload
-      # that can freeze the tab, so the user opts in to the layers they want.
-      checkboxGroupInput("feature_layers_show", "Layers to show:", choices = choices,
-                         selected = character(0), inline = TRUE)
-    } else {
-      selectInput("feature_layer", lbl("Data layer:", INFO_LAYER), choices = choices, width = "100%")
-    }
-  })
-
-  # The selected data layer for the Gene Expression plots (data / counts / scale.data).
+  # The data layer for the Gene Expression plots is fixed to "data" (Normalized log);
+  # the selector was removed, so make_layer_val falls back to "data".
   feature_layer <- make_layer_val("feature_layer")
 
   # Shared colour limits for "Same scale for all genes" mode: the pooled range of
@@ -858,8 +846,12 @@ server <- function(input, output, session) {
 
   default_de_assay <- reactive({
     req(seu())
-    def <- tryCatch(Seurat::DefaultAssay(seu()), error = function(e) NULL)
     choices <- de_assay_choices()
+    # Prefer RNA (log-normalized) as the default DE assay, else SCT; excludes
+    # integrated already. prepare_obj_for_de auto-normalizes RNA if it lacks `data`.
+    if ("RNA" %in% choices) return("RNA")
+    if ("SCT" %in% choices) return("SCT")
+    def <- tryCatch(Seurat::DefaultAssay(seu()), error = function(e) NULL)
     if (!is.null(def) && def %in% choices) def else choices[1]
   })
 
@@ -914,7 +906,7 @@ server <- function(input, output, session) {
     # Still excludes huge text columns (barcodes) so the UMAP can't get thousands
     # of discrete colours.
     color_cols <- all_cols[vapply(all_cols, function(col) {
-      if (col %in% clust_cols_r()) return(FALSE)                    # clusterings live ONLY in the Resolution picker, not here
+      if (col %in% clust_cols_r()) return(TRUE)                     # clusterings are categorical colourings (offered here now)
       x <- seu()@meta.data[[col]]
       if (is_continuous_col(col)) return(TRUE)                      # gradient
       (is.factor(x) || is.character(x) || is.logical(x) || is.numeric(x)) &&
@@ -922,29 +914,6 @@ server <- function(input, output, session) {
     }, logical(1))]
     color_choices <- setNames(color_cols, pretty_label(color_cols))
     color_choices <- color_choices[order(names(color_choices))]
-
-    # Numeric / score columns (continuous) -- prediction-confidence scores, QC
-    # metrics, etc. Used by the Annotation tab's "Confidence by group" view.
-    score_cols <- all_cols[vapply(all_cols, function(col) isTRUE(is_continuous_col(col)), logical(1))]
-    score_choices <- setNames(score_cols, pretty_label(score_cols))
-    score_choices <- score_choices[order(names(score_choices))]
-
-    # Clustering / resolution columns (e.g. SCT_snn_res.0.1, integrated_snn_res.0.5,
-    # seurat_clusters, final_clusters) -> a tidy "Resolution" quick-pick that shows
-    # the resolution + cluster count and just colours the UMAP by that column.
-    clust_cols <- clust_cols_r()
-    res_label <- function(col) {
-      n <- length(unique(seu()@meta.data[[col]][!is.na(seu()@meta.data[[col]])]))
-      m <- regmatches(col, regexpr("snn_res\\.[0-9.]+$", col))
-      if (length(m) && nzchar(m)) {
-        assay <- sub("_snn_res\\..*$", "", col)
-        resv  <- sub(".*snn_res\\.", "", col)
-        paste0(assay, " · res ", resv, " (", n, " clusters)")
-      } else {
-        paste0(pretty_label(col), " (", n, " clusters)")
-      }
-    }
-    res_choices <- if (length(clust_cols)) setNames(clust_cols, vapply(clust_cols, res_label, character(1))) else character(0)
 
     # Embeddings (reductions) to offer -- only shown when the object has >1, so
     # the picker appears exactly when there's a choice (e.g. umap + a
@@ -955,7 +924,7 @@ server <- function(input, output, session) {
     # "Data layer" toggle -- view raw values before/after normalization.
     # All assays (for the Gene Expression assay selector).
     all_assays_ge <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
-    def_assay_ge <- tryCatch(Seurat::DefaultAssay(seu()), error = function(e) all_assays_ge[1])
+    def_assay_ge <- preferred_view_assay(seu())
 
     has_markers <- !is.null(seu()@misc$cluster_markers)
     has_contrasts <- !is.null(seu()@misc$contrasts)
@@ -979,63 +948,66 @@ server <- function(input, output, session) {
         help_details(
           tags$p("Colours the UMAP (one point per cell) by any metadata column, so you can see how cell types, conditions, clusters, or scores are laid out."),
           tags$ol(
-            tags$li("Pick a column in \"Color UMAP by\" to colour the map."),
-            tags$li("To colour by a clustering instead, pick one in \"Resolution / clustering\" (resolution sets how many clusters)."),
+            tags$li("Pick a column in \"Color UMAP by\" to colour the map (clusterings are in this list too)."),
+            tags$li("Choose which embedding to plot on in \"Reduction (embedding)\" (for example umap or pca), when the object has more than one."),
             tags$li("For a categorical column, tick or untick the categories in the sidebar to show or hide them."),
             tags$li("For a numeric column (scores, QC), type a Min or Max to grey out cells outside that range."),
+            tags$li("To break the map out per group, tick \"Split by group\", pick a column, then choose which groups in \"Groups to show\" (starts empty; one panel per chosen group over a grey backdrop, up to 12)."),
             tags$li("Hover a point to read its value; use the PNG button to save the plot."))),
-        sidebarLayout(
-          sidebarPanel(
-            if (length(res_choices) > 0)
-              selectInput("resolution_pick", lbl("Resolution / clustering:", INFO_RES), choices = res_choices),
-            selectInput("group_var", "Color UMAP by:", choices = color_choices),
-            uiOutput("category_filter_ui")
-          ),
-          mainPanel(
-            div(style = "display: flex; justify-content: flex-start; width: 100%; overflow: hidden;",
-                div(id = "umap_plot_box", class = "plot-dl-wrap", style = "position: relative; width: calc(min(100vh - 230px, 100vw - 800px) + 260px); height: min(100vh - 230px, 100vw - 800px);",
-                    plot_dl_btn("umap_plot", "UMAP"),
-                    withSpinner(plotlyOutput("umap_plot", width = "100%", height = "100%"), caption = "Rendering plot...", color = "#39FF14"))
-            )
+        # Controls stacked vertically: Reduction, then Color UMAP by + its category
+        # filter, then the Split-by option (revealed by a checkbox). Plot renders below.
+        wellPanel(
+          if (length(red_choices) > 1)
+            fluidRow(column(4, selectInput("reduction", "Reduction:", choices = red_choices,
+                                           selected = if ("umap" %in% red_choices) "umap" else red_choices[1], width = "100%"))),
+          fluidRow(column(4, selectInput("group_var", "Color UMAP by:", choices = color_choices, width = "100%"))),
+          uiOutput("category_filter_ui"),
+          fluidRow(column(6, checkboxInput("split_on", "Split by group", value = FALSE))),
+          conditionalPanel(
+            condition = "input.split_on",
+            fluidRow(column(4, selectInput("split_by", "Split by:", choices = grouping_choices, width = "100%"))),
+            fluidRow(column(6, uiOutput("umap_split_levels_ui")))
           )
+        ),
+        # Not splitting: the single interactive UMAP (category toggles restyle it in place).
+        conditionalPanel(
+          condition = "!input.split_on",
+          div(style = "display: flex; justify-content: center; width: 100%; overflow: hidden;",
+              div(id = "umap_plot_box", class = "plot-dl-wrap", style = "position: relative; width: calc(min(100vh - 340px, 60vw) + 260px); height: min(100vh - 340px, 60vw);",
+                  plot_dl_btn("umap_plot", "UMAP"),
+                  withSpinner(plotlyOutput("umap_plot", width = "100%", height = "100%"), caption = "Rendering plot...", color = "#39FF14")))
+        ),
+        # Splitting: one UMAP panel per chosen group (up to 12).
+        conditionalPanel(
+          condition = "input.split_on",
+          uiOutput("umap_split_grid")
         )
       ),
       tabPanel(
         "Gene Expression",
         help_details(
-          tags$p("Explore gene expression three ways, using the sub tabs below (the smaller green buttons). All three let you choose the assay and data layer to view raw counts, normalized, or scaled values. Each sub tab has its own \"How to use\" panel with steps."),
+          tags$p("Explore gene expression two ways, using the sub tabs below (the smaller green buttons). Both use the RNA assay and Normalized (log) values. Each sub tab has its own \"How to use\" panel with steps."),
           tags$ul(
             tags$li("Per-gene maps: one UMAP per gene, coloured by expression."),
-            tags$li("Aggregated (pseudobulk): the selected genes summarised per group as a heatmap and table."),
-            tags$li("Split by Group: one gene shown as a separate UMAP per group, on a shared scale so the panels are comparable."))),
+            tags$li("Aggregated (pseudobulk): the selected genes summarised per group as a heatmap and table."))),
         div(class = "sub-tabs", tabsetPanel(
           type = "pills",
           tabPanel(
             "Per-gene maps",
             help_details(.summary = "How to use: Per-gene maps", .guide = FALSE,
-              tags$p("One UMAP per gene, coloured by expression on a blue to white to red scale (raw values of the chosen data layer)."),
+              tags$p("One UMAP per gene, coloured by expression on a blue to white to red scale. Uses the RNA assay and Normalized (log) values."),
               tags$ol(
                 tags$li("Type gene symbols in the \"Gene(s):\" box."),
-                tags$li("Choose the assay and \"Data layer\" (raw counts, normalized, or scaled)."),
                 tags$li("Set \"Plots per row\" and \"Color scale\" (same scale for all genes to compare, or adjusted per gene)."),
-                tags$li("To compare one gene across layers instead, set \"Compare\" to \"One gene across data layers\" and tick the layers under \"Layers to show\" (each panel gets its own scale, and Color scale is ignored)."),
                 tags$li("Save a panel with its PNG button, or all panels with \"Download all as one PNG\"."))),
         wellPanel(
           fluidRow(
-            column(3, radioButtons("compare_mode", "Compare:",
-                                   choices = c("Genes (in one data layer)" = "genes",
-                                               "One gene across data layers" = "layers"),
-                                   selected = "genes", inline = FALSE)),
-            if (length(all_assays_ge) > 1)
-              column(2, selectInput("feature_assay", lbl("Assay:", INFO_ASSAY), choices = all_assays_ge,
-                                    selected = def_assay_ge, width = "100%")),
-            column(3, selectInput("gene_sort", "Sort genes by:", width = "100%",
+            column(4, selectInput("gene_sort", "Sort genes by:", width = "100%",
                                   choices = GENE_SORT_CHOICES)),
-            column(if (length(all_assays_ge) > 1) 4 else 6, selectizeInput("genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
+            column(8, selectizeInput("genes", "Gene(s):", choices = NULL, multiple = TRUE, width = "100%",
                                      options = list(placeholder = "Type one or more gene symbols...", sortField = list(list(field = "$order")))))
           ),
           fluidRow(
-            column(3, uiOutput("feature_layer_ui")),
             # TWEAK: default / allowed plots-per-row for the Gene Expression grid.
             column(2, numericInput("feature_ncol", "Plots per row:", value = 2, min = 1, max = 4, width = "100%")),
             column(7, radioButtons("scale_mode", "Color scale:",
@@ -1044,17 +1016,17 @@ server <- function(input, output, session) {
                                    selected = "shared"))
           )
         ),
-        uiOutput("dynamic_feature_plots")   # (centres its own grid internally, like Split)
+        uiOutput("dynamic_feature_plots")   # (centres its own grid internally)
           ),
           # ---- Aggregated (pseudobulk): heatmap + table, nested under Gene Expression ----
           tabPanel(
             "Aggregated (pseudobulk)",
             help_details(.summary = "How to use: Aggregated (pseudobulk)", .guide = FALSE,
-              tags$p("Summarises the selected genes per group as a heatmap and a table, a compact pseudobulk overview."),
+              tags$p("Summarises the selected genes per group as a heatmap and a table, a compact pseudobulk overview. Uses the RNA assay and Normalized (log) values."),
               tags$ol(
                 tags$li("Pick the \"Aggregate by\" column (the groups)."),
                 tags$li("Type genes in the \"Gene(s):\" box."),
-                tags$li("Choose the assay, data layer, and \"Summary per group\" (mean, sum, or median)."),
+                tags$li("Choose the \"Summary per group\" (mean, sum, or median)."),
                 tags$li("Save the heatmap with the PNG button, or the table with \"Download Excel\"."))),
             wellPanel(
               fluidRow(
@@ -1064,11 +1036,7 @@ server <- function(input, output, session) {
                                          options = list(placeholder = "Type one or more gene symbols...", sortField = list(list(field = "$order")))))
               ),
               fluidRow(
-                if (length(all_assays_ge) > 1)
-                  column(2, selectInput("agg_assay", lbl("Assay:", INFO_ASSAY), choices = all_assays_ge,
-                                        selected = def_assay_ge, width = "100%")),
-                column(3, uiOutput("agg_layer_ui")),
-                column(if (length(all_assays_ge) > 1) 4 else 6, radioButtons("agg_fun", "Summary per group:",
+                column(6, radioButtons("agg_fun", "Summary per group:",
                                        choices = c("Mean" = "mean", "Sum" = "sum", "Median" = "median"),
                                        selected = "mean", inline = TRUE))
               )
@@ -1078,37 +1046,6 @@ server <- function(input, output, session) {
                 withSpinner(plotlyOutput("agg_heatmap", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
             tags$hr(),
             withSpinner(DTOutput("agg_table"), caption = "Loading table...", color = "#39FF14")
-          ),
-          # ---- Split by Group: one gene per group, nested under Gene Expression ----
-          tabPanel(
-            "Split by Group",
-            help_details(.summary = "How to use: Split by Group", .guide = FALSE,
-              tags$p("One gene shown as a separate UMAP per group, on a shared colour scale so the panels are comparable."),
-              tags$ol(
-                tags$li("Pick the \"Split by\" column, and optionally \"Then by\" a second column for a grid (for example cell type by condition)."),
-                tags$li("Type a gene in the \"Gene:\" box."),
-                tags$li("Choose the assay and data layer."),
-                tags$li("Pick which groups to show (up to 12 panels)."),
-                tags$li("Save a panel with its PNG button, or all panels with \"Download all as one PNG\"."))),
-            wellPanel(
-              fluidRow(
-                column(2, selectInput("split_group", "Split by:", choices = grouping_choices, width = "100%")),
-                column(2, selectInput("split_then", "Then by (optional):", choices = c("(none)" = "", grouping_choices), width = "100%")),
-                column(3, selectInput("split_gene_sort", "Sort genes by:", width = "100%", choices = GENE_SORT_CHOICES)),
-                column(3, selectizeInput("split_gene", "Gene:", choices = NULL, multiple = FALSE, width = "100%",
-                                         options = list(placeholder = "Type a gene symbol...", sortField = list(list(field = "$order"))))),
-                column(2, numericInput("split_ncol", "Panels per row:", value = 3, min = 1, max = 5, width = "100%"))
-              ),
-              fluidRow(
-                if (length(all_assays_ge) > 1)
-                  column(2, selectInput("split_assay", lbl("Assay:", INFO_ASSAY), choices = all_assays_ge,
-                                        selected = def_assay_ge, width = "100%")),
-                column(3, uiOutput("split_layer_ui"))
-              ),
-              uiOutput("split_levels_ui"),
-              uiOutput("split_levels2_ui")
-            ),
-            uiOutput("split_plots")
           )
         ))
       )
@@ -1121,18 +1058,15 @@ server <- function(input, output, session) {
       tabs <- c(tabs, list(tabPanel(
         "Cluster Markers",
         help_details(
-          tags$p("Precomputed marker tables: genes that mark each cluster versus all other cells."),
+          tags$p("Precomputed marker tables: genes that mark each cluster versus all other cells (Wilcoxon test)."),
           tags$ol(
             tags$li("Pick a \"Clustering resolution\" (which clustering to use)."),
-            tags$li("Pick a \"Test type\"."),
             tags$li("Pick a cluster to view its markers."),
             tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
         wellPanel(
           fluidRow(
             column(3, selectInput("marker_resolution", "Clustering resolution:", width = "100%",
                                   choices = unique(seu()@misc$cluster_markers$source_column))),
-            column(2, selectInput("marker_test", lbl("Test type:", INFO_TEST), width = "100%",
-                                  choices = unique(seu()@misc$cluster_markers$test_type))),
             column(2, uiOutput("marker_cluster_ui"))
           )
         ),
@@ -1142,20 +1076,15 @@ server <- function(input, output, session) {
       tabs <- c(tabs, list(tabPanel(
         "Cluster Markers",
         help_details(
-          tags$p("Finds genes that mark one group versus all other cells, computed live from the object."),
+          tags$p("Finds genes that mark one group versus all other cells, computed live from the object. Uses the RNA assay, Normalized (log) values, and the Wilcoxon test."),
           tags$ol(
             tags$li("Pick the \"Grouping column\" and the group whose markers you want."),
-            tags$li("Set the assay, data layer, and \"Test type\". The \"integrated\" assay is excluded, because differential expression on batch-corrected values is not valid. Layer \"data\" is log-normalized (used by most tests); \"counts\" is raw (used by count-based tests like Poisson)."),
             tags$li("Click \"Compute markers\". It is heavy on large objects, so it does not run automatically."),
             tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
         wellPanel(
           fluidRow(
             column(2, selectInput("gmarker_group", "Grouping column:", choices = grouping_choices, width = "100%")),
-            if (length(de_assays) > 1)
-              column(2, selectInput("gmarker_assay", lbl("Assay:", INFO_ASSAY), choices = de_assays, selected = def_de_assay, width = "100%")),
-            column(2, uiOutput("gmarker_layer_ui")),
-            column(2, uiOutput("gmarker_cluster_ui")),
-            column(2, selectInput("gmarker_test", lbl("Test type:", INFO_TEST), choices = de_test_choices, width = "100%"))
+            column(2, uiOutput("gmarker_cluster_ui"))
           ),
           fluidRow(
             column(3, div(style = "margin-top: 5px;",
@@ -1174,11 +1103,11 @@ server <- function(input, output, session) {
     tabs <- c(tabs, list(tabPanel(
       "Marker Plot",
       help_details(
-        tags$p("Compares chosen genes across groups, as a dot plot or violins. Dot plot: dot size is the percent of cells in the group expressing the gene, colour is mean expression z scored per gene. Violin: the expression distribution per group, one row per gene."),
+        tags$p("Compares chosen genes across groups, as a dot plot or violins. Dot plot: dot size is the percent of cells in the group expressing the gene, colour is mean expression z scored per gene. Violin: the expression distribution per group, one row per gene. Uses the RNA assay and Normalized (log) values."),
         tags$ol(
           tags$li("Choose a \"Plot type\": dot plot or violin."),
-          tags$li("Pick the \"Group by\" column, and the assay and data layer."),
-          tags$li("Dot plot: choose genes manually, or pick \"Top markers per group (auto)\" and click \"Compute markers\". Violin: type the genes to show."),
+          tags$li("Pick the \"Group by\" column."),
+          tags$li("Dot plot: choose genes manually, or pick \"Top markers per group (auto)\" and click \"Compute markers\" (Wilcoxon). Violin: type the genes to show."),
           tags$li("Use the PNG button to save the plot."))),
       wellPanel(
         # Plot type is the FIRST thing to choose; everything below adapts to it.
@@ -1187,11 +1116,7 @@ server <- function(input, output, session) {
                                   choices = c("Dot plot" = "dot", "Violin" = "violin"), selected = "dot"))
         ),
         fluidRow(
-          column(3, selectInput("dot_group_var", "Group by:", choices = grouping_choices, width = "100%")),
-          if (length(all_assays_ge) > 1)
-            column(2, selectInput("dot_assay", lbl("Assay:", INFO_ASSAY), choices = all_assays_ge,
-                                  selected = def_assay_ge, width = "100%")),
-          column(if (length(all_assays_ge) > 1) 3 else 4, uiOutput("dot_layer_ui"))
+          column(4, selectInput("dot_group_var", "Group by:", choices = grouping_choices, width = "100%"))
         ),
         # ---- DOT PLOT options: auto top markers, or a manual gene set ----
         conditionalPanel(
@@ -1207,7 +1132,6 @@ server <- function(input, output, session) {
             condition = "input.dot_gene_mode == 'auto'",
             fluidRow(
               column(3, numericInput("dot_top_n", "Top markers / group:", value = 3, min = 1, max = 15, width = "100%")),
-              column(3, selectInput("dot_test", lbl("Test type:", INFO_TEST), choices = de_test_choices, width = "100%")),
               column(3, div(style = "margin-top: 25px;",
                             actionButton("dot_compute", "Compute markers",
                                          style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
@@ -1261,14 +1185,11 @@ server <- function(input, output, session) {
           tags$p("Precomputed differential expression tables between two groups (target versus reference). Unlike cluster markers (a group versus everyone else), a contrast is one group versus one specific other group."),
           tags$ol(
             tags$li("Pick a \"Contrast\" (the A vs B pair)."),
-            tags$li("Pick a \"Test type\"."),
-            tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
+            tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row (Wilcoxon test)."))),
         wellPanel(
           fluidRow(
             column(4, selectInput("contrast_choice", "Contrast:", width = "100%",
-                                  choices = unique(paste0(seu()@misc$contrasts$target, " vs ", seu()@misc$contrasts$reference)))),
-            column(2, selectInput("contrast_test", lbl("Test type:", INFO_TEST), width = "100%",
-                                  choices = unique(seu()@misc$contrasts$test_type)))
+                                  choices = unique(paste0(seu()@misc$contrasts$target, " vs ", seu()@misc$contrasts$reference))))
           )
         ),
         withSpinner(DTOutput("contrast_table"), caption = "Loading table...", color = "#39FF14")
@@ -1281,7 +1202,7 @@ server <- function(input, output, session) {
           tags$ol(
             tags$li("Choose a \"Method\": \"Per cell test\" is fast and exploratory; \"Pseudobulk DESeq2\" is recommended for comparing conditions across samples, because per cell tests inflate false positives there."),
             tags$li("Pick the \"Grouping column\" that holds your two groups, then the target group (A) and the reference group (B)."),
-            tags$li("Per cell test: set the assay, data layer, and \"Test type\". Pseudobulk: set the \"Sample / replicate column\" (it needs at least two samples per group), and optionally \"Restrict to\" one cell type."),
+            tags$li("Per cell test uses the RNA assay, Normalized (log) values, and the Wilcoxon test. Pseudobulk: set the \"Sample / replicate column\" (it needs at least two samples per group), and optionally \"Restrict to\" one cell type; it sums raw RNA counts and runs DESeq2."),
             tags$li("Click \"Compute contrast\" (or \"Compute pseudobulk DE\"). It does not run automatically."),
             tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
         wellPanel(
@@ -1290,19 +1211,15 @@ server <- function(input, output, session) {
                                               "Pseudobulk DESeq2 (recommended for conditions)" = "pseudobulk"),
                                   selected = "percell"))),
           fluidRow(
-            column(3, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
-            if (length(de_assays) > 1)
-              column(3, selectInput("gcontrast_assay", lbl("Assay:", INFO_ASSAY), choices = de_assays, selected = def_de_assay, width = "100%")),
-            column(3, uiOutput("gcontrast_target_ui")),
-            column(3, uiOutput("gcontrast_reference_ui"))
+            column(4, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
+            column(4, uiOutput("gcontrast_target_ui")),
+            column(4, uiOutput("gcontrast_reference_ui"))
           ),
           # ---- Per-cell test options ----
           conditionalPanel(
             condition = "input.gcontrast_method == 'percell'",
             fluidRow(
-              column(3, uiOutput("gcontrast_layer_ui")),
-              column(3, selectInput("gcontrast_test", lbl("Test type:", INFO_TEST), choices = de_test_choices, width = "100%")),
-              column(3, div(style = "margin-top: 25px;",
+              column(3, div(style = "margin-top: 5px;",
                             actionButton("gcontrast_compute", "Compute contrast",
                                          style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
             )
@@ -1330,233 +1247,6 @@ server <- function(input, output, session) {
       )))
     }
 
-    # anno_x2: a sensible default "second" column for the Annotation sub-tab
-    # (now nested under scFM Explorer, below). Defined here so it is in scope.
-    anno_x2 <- if (length(grouping_choices) > 1) grouping_choices[[2]] else grouping_choices[[1]]
-
-    # ---- scFM Explorer -------------------------------------------------------
-    # A dedicated layer for exploring/validating foundation-model outputs, kept in
-    # its own tab (with sub-tabs) so it doesn't clutter the rest of the app:
-    #   * Compare embeddings   -- two embeddings side by side, same colouring, with
-    #                             linked group-highlighting (e.g. standard UMAP vs scGPT).
-    #   * Neighbourhood preservation -- per-cell kNN overlap between a high-D reference
-    #                             space and a 2D map, coloured on the map (embedding QC).
-    #   * Annotation           -- validate label columns: confusion matrix, a per-cell
-    #                             agreement map, confidence per group, and composition.
-    green_btn <- "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;"
-    def_2d  <- if ("umap" %in% red_choices) "umap" else red_choices[1]
-    def_hi  <- if ("pca" %in% red_choices) "pca" else red_choices[1]
-    def_b   <- if (length(red_choices) > 1) red_choices[2] else red_choices[1]
-    # A sensible "colour by batch/sample" default for the integration check.
-    def_batch <- {
-      hit <- grouping_choices[grepl("sample|batch|orig|donor|condition", grouping_choices, ignore.case = TRUE)]
-      if (length(hit)) hit[[1]] else if (length(grouping_choices) > 1) grouping_choices[[2]] else grouping_choices[[1]]
-    }
-    tabs <- c(tabs, list(tabPanel(
-      "scFM Explorer",
-      help_details(
-        tags$p("A dedicated space for exploring and validating foundation model (scFM) outputs on the same cells. Pick a sub tab below (the smaller green buttons); each answers a different question and has its own \"How to use\" panel with steps."),
-        tags$ul(
-          tags$li("Compare embeddings: the same cells drawn on several maps side by side with matched colours."),
-          tags$li("Neighbourhood preservation: how faithfully a 2D map keeps the high dimensional neighbourhoods (embedding quality)."),
-          tags$li("Annotation: validate cell type labels, by comparing label columns (confusion matrix and a per-cell agreement map), a confidence score per group, and composition per sample or condition."),
-          tags$li("Embedding heatmap: each group's signature across the embedding dimensions."),
-          tags$li("Integration check: the same embedding coloured two ways of your choice, to check whether batches mix while cell types stay separate."))),
-      div(class = "sub-tabs",
-      tabsetPanel(
-        type = "pills",
-        # ---- Compare embeddings (side by side + linked highlight) ----
-        tabPanel(
-          "Compare embeddings",
-          help_details(.summary = "How to use: Compare embeddings", .guide = FALSE,
-            tags$p("The same cells drawn on each chosen embedding with identical colours, so you can see where a cell type lands in each."),
-            tags$ol(
-              tags$li("Pick one, two or more embeddings in \"Embeddings to compare\"."),
-              tags$li("Choose a \"Color by\" column."),
-              tags$li("Set \"Panels per row\"."),
-              tags$li("Optionally pick groups in \"Highlight groups\" to light them up in all panels (others grey)."))),
-          wellPanel(fluidRow(
-            column(4, selectizeInput("cmp_embs", lbl("Embeddings to compare:", INFO_RED_CMP), choices = red_choices,
-                                     selected = character(0),
-                                     multiple = TRUE, options = list(placeholder = "Pick one, two or more embeddings"))),
-            column(3, selectInput("cmp_color", "Color by:", choices = grouping_choices)),
-            column(2, numericInput("cmp_ncol", "Panels per row:", value = 2, min = 1, max = 6, width = "100%")),
-            column(3, selectizeInput("cmp_highlight", "Highlight groups (optional):", choices = NULL, multiple = TRUE,
-                                     options = list(placeholder = "All shown; pick some to highlight")))
-          )),
-          div(style = "display: flex; align-items: flex-start; gap: 18px;",
-              div(style = "flex: 1 1 auto; min-width: 0;", uiOutput("cmp_grid")),
-              div(style = "flex: 0 0 auto;", uiOutput("cmp_legend")))
-        ),
-        # ---- Neighbourhood preservation (kNN overlap) ----
-        tabPanel(
-          "Neighbourhood preservation",
-          help_details(.summary = "How to use: Neighbourhood preservation", .guide = FALSE,
-            tags$p("For each cell, the fraction of its nearest neighbours in a high dimensional reference space that are still neighbours in a 2D map. Low values (red or dark) mark regions where the 2D map distorts the real neighbourhood."),
-            tags$ol(
-              tags$li("Pick the \"Reference space (high-D)\" (for example pca or a foundation-model embedding)."),
-              tags$li("Pick the \"2D map to check\" (for example umap)."),
-              tags$li("Set \"k neighbours\"."),
-              tags$li("Click \"Compute preservation\". It runs over all cells, so it does not run automatically."))),
-          wellPanel(fluidRow(
-            column(3, selectInput("pres_emb_hi", "Reference space (high-D):", choices = red_choices, selected = def_hi)),
-            column(3, selectInput("pres_emb_2d", "2D map to check:", choices = red_choices, selected = def_2d)),
-            column(2, numericInput("pres_k", "k neighbours:", value = 30, min = 5, max = 100)),
-            column(3, div(style = "margin-top: 25px;",
-                          actionButton("pres_compute", "Compute preservation", style = green_btn)))
-          )),
-          div(class = "plot-dl-wrap scfm-square-single",
-              plot_dl_btn("pres_plot", "neighborhood_preservation"),
-              withSpinner(plotlyOutput("pres_plot", width = "100%", height = "100%"), caption = "Computing preservation...", color = "#39FF14")),
-          uiOutput("pres_caption")
-        ),
-        # ---- Annotation (label validation: confusion matrix, agreement map, confidence, composition) ----
-        # Marker-free exploration/validation of cell-type labels (e.g. foundation-
-        # model predictions). The old standalone "Model agreement" view lives here
-        # now, as the "Agreement on map" view, next to the confusion matrix.
-        tabPanel(
-          "Annotation",
-          help_details(.summary = "How to use: Annotation", .guide = FALSE,
-            tags$p("Explore and validate cell type annotations without marker genes, handy for foundation model (scFM) predictions. All views use metadata columns already in the object (predicted labels, confidence scores, manual labels)."),
-            tags$ol(
-              tags$li("Choose a \"View\": label comparison, agreement on map, confidence by group, or composition."),
-              tags$li("Label comparison: pick two label columns for the confusion matrix (does the model agree with your labels, and where not)."),
-              tags$li("Agreement on map: pick two or more label columns and an embedding to see, cell by cell, how many agree (unanimous green, disagreement red). Only meaningful when the columns use the same label names."),
-              tags$li("Confidence by group: pick a numeric score and a grouping column to see the score's distribution per group."),
-              tags$li("Composition: pick the x-axis group and the column to compose of, to see cell type proportions per sample or condition."),
-              tags$li("Each view has a table with \"Download Excel\"."))),
-          wellPanel(
-            fluidRow(
-              column(12, radioButtons("anno_type", "View:", inline = TRUE,
-                                      choices = c("Label comparison (confusion matrix)" = "confusion",
-                                                  "Agreement on map" = "agreement",
-                                                  "Confidence by group" = "confidence",
-                                                  "Composition" = "composition"),
-                                      selected = "confusion"))
-            ),
-            conditionalPanel(
-              condition = "input.anno_type == 'confusion'",
-              fluidRow(
-                column(4, selectInput("anno_x", "Rows (e.g. predicted):", choices = grouping_choices, width = "100%")),
-                column(4, selectInput("anno_y", "Columns (e.g. reference/manual):", choices = grouping_choices, selected = anno_x2, width = "100%")),
-                column(4, radioButtons("anno_norm", "Show:", inline = TRUE,
-                                       choices = c("Row %" = "row", "Cell counts" = "count"), selected = "row"))
-              )
-            ),
-            conditionalPanel(
-              condition = "input.anno_type == 'agreement'",
-              fluidRow(
-                column(8, selectizeInput("agree_cols", "Label columns to compare (2 or more):", choices = grouping_choices, multiple = TRUE,
-                                         selected = character(0),
-                                         options = list(placeholder = "e.g. scgpt_celltype, geneformer_celltype, manual"))),
-                column(4, selectInput("agree_emb", "Show on embedding:", choices = red_choices, selected = def_2d))
-              )
-            ),
-            conditionalPanel(
-              condition = "input.anno_type == 'confidence'",
-              fluidRow(
-                column(4, selectInput("conf_value", "Value (e.g. prediction score):", choices = score_choices, width = "100%")),
-                column(4, selectInput("conf_group", "Group by (e.g. cell type):", choices = grouping_choices, width = "100%")),
-                column(4, radioButtons("conf_kind", "Plot:", inline = TRUE,
-                                       choices = c("Violin" = "violin", "Box" = "box"), selected = "violin"))
-              )
-            ),
-            conditionalPanel(
-              condition = "input.anno_type == 'composition'",
-              fluidRow(
-                column(4, selectInput("comp_group", "Group / x-axis (e.g. sample):", choices = grouping_choices, selected = anno_x2, width = "100%")),
-                column(4, selectInput("comp_fill", "Compose of (e.g. cell type):", choices = grouping_choices, width = "100%")),
-                column(4, radioButtons("comp_mode", "Show:", inline = TRUE,
-                                       choices = c("Proportion (%)" = "proportion", "Cell counts" = "count"), selected = "proportion"))
-              )
-            )
-          ),
-          conditionalPanel(
-            condition = "input.anno_type == 'confusion'",
-            div(class = "plot-dl-wrap", style = "position: relative;",
-                plot_dl_btn("anno_confusion", "confusion_matrix"),
-                withSpinner(plotlyOutput("anno_confusion", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
-            uiOutput("anno_agreement"),
-            tags$hr(),
-            withSpinner(DTOutput("anno_confusion_table"), caption = "Loading table...", color = "#39FF14")),
-          conditionalPanel(
-            condition = "input.anno_type == 'agreement'",
-            div(class = "plot-dl-wrap scfm-square-single",
-                plot_dl_btn("agree_plot", "model_agreement"),
-                withSpinner(plotlyOutput("agree_plot", width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14")),
-            uiOutput("agree_caption"),
-            tags$hr(),
-            withSpinner(DTOutput("agree_table"), caption = "Loading table...", color = "#39FF14")),
-          conditionalPanel(
-            condition = "input.anno_type == 'confidence'",
-            div(class = "plot-dl-wrap", style = "position: relative;",
-                plot_dl_btn("anno_conf_plot", "confidence_by_group"),
-                withSpinner(plotlyOutput("anno_conf_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
-            tags$hr(),
-            withSpinner(DTOutput("anno_conf_table"), caption = "Loading table...", color = "#39FF14")),
-          conditionalPanel(
-            condition = "input.anno_type == 'composition'",
-            div(class = "plot-dl-wrap", style = "position: relative;",
-                plot_dl_btn("anno_comp_plot", "composition"),
-                withSpinner(plotlyOutput("anno_comp_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
-            tags$hr(),
-            withSpinner(DTOutput("anno_comp_table"), caption = "Loading table...", color = "#39FF14"))
-        ),
-        # ---- Embedding heatmap (per-group embedding signature; scGPT Fig 2c/5c) ----
-        tabPanel(
-          "Embedding heatmap",
-          help_details(.summary = "How to use: Embedding heatmap", .guide = FALSE,
-            tags$p("Mean embedding value per group per dimension (rows are groups, columns are the embedding's dimensions), reordered by clustering so similar groups and dimensions sit together. Best on a multi-dimensional reduction, not a 2D UMAP."),
-            tags$ol(
-              tags$li("Pick the \"Embedding\" (for example pca or a foundation-model embedding)."),
-              tags$li("Pick the \"Group by (rows)\" column."),
-              tags$li("Choose \"Values\": z-score per dimension (relative signature) or mean."),
-              tags$li("Save the heatmap with the PNG button, or the table with \"Download Excel\"."))),
-          wellPanel(fluidRow(
-            column(4, selectInput("heat_emb", "Embedding:", choices = red_choices, selected = def_hi)),
-            column(4, selectInput("heat_group", "Group by (rows):", choices = grouping_choices)),
-            column(4, radioButtons("heat_scale", "Values:", inline = TRUE,
-                                   choices = c("Z-score per dimension" = "z", "Mean" = "mean"), selected = "z"))
-          )),
-          div(class = "plot-dl-wrap", style = "position: relative;",
-              plot_dl_btn("heat_plot", "embedding_heatmap"),
-              withSpinner(plotlyOutput("heat_plot", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
-          tags$hr(),
-          withSpinner(DTOutput("heat_table"), caption = "Loading table...", color = "#39FF14")
-        ),
-        # ---- Integration check (same embedding, two colourings; scGPT Fig 4) ----
-        tabPanel(
-          "Integration check",
-          help_details(.summary = "How to use: Integration check", .guide = FALSE,
-            tags$p("The same embedding coloured two ways. A good embedding separates cell types (left) while mixing batches or samples (right). If batches form their own islands, batch effects remain."),
-            tags$ol(
-              tags$li("Pick the \"Embedding\"."),
-              tags$li("Choose \"Colour LEFT by\" (for example cell type)."),
-              tags$li("Choose \"Colour RIGHT by\" (for example batch or sample)."),
-              tags$li("Compare the two panels: cell types separated on the left, batches mixed on the right."))),
-          wellPanel(fluidRow(
-            column(4, selectInput("intg_emb", "Embedding:", choices = red_choices, selected = def_2d)),
-            column(4, selectInput("intg_color1", "Colour LEFT by (e.g. cell type):", choices = grouping_choices)),
-            column(4, selectInput("intg_color2", "Colour RIGHT by (e.g. batch/sample):", choices = grouping_choices, selected = def_batch))
-          )),
-          # Same viewport-driven sizing as the other scFM sub-tabs (columns capped
-          # at min(88vh, 70vw), no fixed max-width) so the two squares are as large
-          # as the Compare embeddings / Neighbourhood preservation plots. Each cell
-          # holds its plot plus a fixed-width legend, so both plots stay equal size.
-          div(style = "display: grid; justify-content: center; gap: 14px; grid-template-columns: repeat(2, minmax(0, min(88vh, 70vw)));",
-              div(style = "display: flex; align-items: flex-start; gap: 10px;",
-                  div(class = "plot-dl-wrap scfm-square", style = "flex: 1 1 auto; min-width: 0;",
-                      plot_dl_btn("intg_plot_a", "integration_left"),
-                      withSpinner(plotlyOutput("intg_plot_a", width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14")),
-                  div(style = "flex: 0 0 150px; min-width: 0;", uiOutput("intg_legend_a"))),
-              div(style = "display: flex; align-items: flex-start; gap: 10px;",
-                  div(class = "plot-dl-wrap scfm-square", style = "flex: 1 1 auto; min-width: 0;",
-                      plot_dl_btn("intg_plot_b", "integration_right"),
-                      withSpinner(plotlyOutput("intg_plot_b", width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14")),
-                  div(style = "flex: 0 0 150px; min-width: 0;", uiOutput("intg_legend_b"))))
-        )
-      ))
-    )))
 
     do.call(tabsetPanel, tabs)
   })
@@ -1566,14 +1256,11 @@ server <- function(input, output, session) {
   # columns only) and the "Resolution / clustering" quick-pick (clustering columns
   # only). We colour by whichever the user changed most recently -- so clusterings
   # appear ONLY in the Resolution picker, never duplicated in "Color UMAP by".
-  color_col <- reactiveVal(NULL)
-  observeEvent(input$group_var,       color_col(input$group_var),       ignoreInit = TRUE)
-  observeEvent(input$resolution_pick, color_col(input$resolution_pick), ignoreInit = TRUE)
-  # The active colour column: whatever was last picked, falling back to the
-  # "Color UMAP by" default until the user touches either control.
+  # The active colour column for the Clusters/Metadata UMAP (clusterings now live
+  # in "Color UMAP by" too, so there's no separate Resolution picker to sync with).
   active_group <- reactive({
-    cc <- color_col()
-    if (is.null(cc)) req(input$group_var) else cc
+    req(input$group_var)
+    input$group_var
   })
 
   # The per-category show/hide checkboxes under "Color UMAP by". Rebuilt every
@@ -1598,7 +1285,7 @@ server <- function(input, output, session) {
     vals <- as.character(seu()@meta.data[[gv]])
     vals[is.na(vals)] <- "NA"
     vals <- sort_levels(vals)
-    checkboxGroupInput("categories_shown", "Show categories:", choices = vals, selected = vals)
+    checkboxGroupInput("categories_shown", "Show categories:", choices = vals, selected = vals, inline = TRUE)
   })
 
   # ---------------------------------------------------------------------------
@@ -1842,6 +1529,134 @@ server <- function(input, output, session) {
                       list(marker.color = as.list(leg_cols)),
                       as.list(seq_along(legend_order)))
   }, ignoreInit = TRUE)
+
+  # ---- Split by: one UMAP panel per level of a chosen column ----------------
+  # Same idea as Seurat's DimPlot(split.by=): break the metadata-coloured map out
+  # into small multiples, one per group, over a grey backdrop of all cells so the
+  # panels share the same frame and are directly comparable.
+  umap_split_max <- 12   # WebGL-context cap, like the Gene Expression grid.
+
+  # All levels of the chosen split column (choices for the "groups to show" picker).
+  umap_split_all_levels <- reactive({
+    sb <- input$split_by
+    req(!is.null(sb) && nzchar(sb))
+    v <- as.character(seu()@meta.data[[sb]]); v[is.na(v)] <- "NA"
+    sort_levels(unique(v))
+  })
+
+  # A "groups to show" picker (starts EMPTY): rendering every panel at once is a
+  # WebGL overload that freezes the tab, so the user opts into the groups to draw.
+  output$umap_split_levels_ui <- renderUI({
+    req(input$split_by, nzchar(input$split_by))
+    selectizeInput("umap_split_show", "Groups to show:", choices = umap_split_all_levels(),
+                   selected = character(0), multiple = TRUE,
+                   options = list(placeholder = "Pick groups to show (up to 12)..."))
+  })
+
+  # The selected groups, ignoring any stale picks left over from another column.
+  umap_split_sel <- reactive({
+    req(input$split_by, nzchar(input$split_by))
+    intersect(input$umap_split_show, umap_split_all_levels())
+  })
+
+  # Build one split panel: grey backdrop (all cells) + this group's cells coloured
+  # by the active "Color UMAP by" column, on the shared UMAP frame.
+  build_umap_split_panel <- function(level) {
+    base <- umap_base(); df <- base$df
+    emb  <- umap_emb(); set.seed(1); ord <- sample(nrow(emb))   # same shuffle umap_base() used
+    sb <- input$split_by
+    sval <- as.character(seu()@meta.data[[sb]])[ord]; sval[is.na(sval)] <- "NA"
+    ing <- sval == level
+    title <- paste0(pretty_label(sb), ": ", level, " (n=", sum(ing), ")")
+    p <- plot_ly()
+    # Grey backdrop = all cells (context for sparse groups).
+    p <- add_trace(p, data = df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
+                   marker = list(size = 3, color = "#E8E8E8"), hoverinfo = "skip", showlegend = FALSE)
+    if (isTRUE(base$continuous)) {
+      full <- range(df$value, na.rm = TRUE)
+      lo <- if (is.null(input$cont_min) || is.na(input$cont_min)) full[1] else input$cont_min
+      hi <- if (is.null(input$cont_max) || is.na(input$cont_max)) full[2] else input$cont_max
+      keep <- ing & !is.na(df$value) & df$value >= lo & df$value <= hi
+      if (any(keep))
+        p <- add_trace(p, data = df[keep, ], x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
+                       marker = list(size = 4, color = ~value, colorscale = "Viridis", cmin = full[1], cmax = full[2],
+                                     colorbar = list(title = list(text = pretty_label(active_group()), side = "right"),
+                                                     thickness = 12, len = 0.5, outlinewidth = 0,
+                                                     x = 1.02, xanchor = "left", y = 0.5, yanchor = "middle")),
+                       text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+      showlg <- FALSE; lg <- NULL
+    } else {
+      # Category colours reflect the current show/hide selection (read once; split
+      # panels don't live-restyle, so no reactive dependency on the checkboxes). No
+      # per-panel legend -- the grid shows ONE shared legend so the map fills the square.
+      cols <- umap_point_cols(base, isolate(input$categories_shown))
+      sub <- df[ing, ]; sub$col <- cols$points[ing]
+      if (nrow(sub) > 0)
+        p <- add_trace(p, data = sub, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
+                       marker = list(size = 4, color = ~col), text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+      showlg <- FALSE; lg <- NULL
+    }
+    p %>% plotly::layout(
+      hovermode = "closest",
+      title = list(text = title, x = 0, xref = "paper", xanchor = "left",
+                   font = list(size = 13, family = "Open Sans, verdana, arial, sans-serif")),
+      xaxis = list(title = axis_labels()[1], zeroline = FALSE, range = umap_range(), tick0 = 0, dtick = umap_dtick(),
+                   constrain = "domain", constraintoward = "center"),
+      yaxis = list(title = axis_labels()[2], zeroline = FALSE, scaleanchor = "x", scaleratio = 1, tick0 = 0, dtick = umap_dtick(),
+                   constrain = "domain", constraintoward = "middle", range = umap_range()),
+      showlegend = showlg, legend = lg, margin = list(l = 44, r = 10, t = 34, b = 38)
+    ) %>% plotly::config(displayModeBar = FALSE)
+  }
+
+  output$umap_split_grid <- renderUI({
+    req(input$split_by, nzchar(input$split_by))
+    levs <- umap_split_sel()
+    validate(need(length(levs) >= 1, "Pick one or more groups in \"Groups to show\" (in the sidebar)."))
+    validate(need(length(levs) <= umap_split_max,
+                  paste0("Showing at most ", umap_split_max, " panels at once; pick fewer groups.")))
+    # Every panel is the SAME fixed size as the single (non-split) plot. Panels sit
+    # side by side and wrap to the next row when they don't fit, instead of shrinking.
+    cells <- lapply(seq_along(levs), function(i) {
+      id <- paste0("umap_split_", i)
+      div(class = "plot-dl-wrap umap-split-cell", style = "position: relative; flex: 0 0 auto; width: min(100vh - 340px, 60vw); aspect-ratio: 1 / 1;",
+          plot_dl_btn(id, paste0("UMAP_", levs[i])),
+          withSpinner(plotlyOutput(id, width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14"))
+    })
+    # grid does NOT grow (flex:0 1 auto), so the shared legend sits snug on its right
+    # instead of being pushed to the far edge. Panels wrap when they don't fit.
+    grid <- div(style = "display:flex; flex-wrap:wrap; justify-content:center; gap:16px; flex:0 1 auto; min-width:0;", cells)
+    # "Download all as one PNG" (composites the panels), shown when >1 panel.
+    ids <- paste0("umap_split_", seq_along(levs))
+    dl_all <- if (length(levs) > 1)
+      div(style = "text-align:right; margin-bottom:6px;",
+          plot_dl_all_btn(ids, min(length(levs), 2), NULL, "umap_split_panels"))
+    # One shared legend for the whole grid (categorical only), so each panel's map
+    # isn't squeezed by its own legend. Continuous panels carry a thin colorbar.
+    base <- umap_base()
+    if (isTRUE(base$continuous))
+      return(tagList(dl_all, div(style = "display:flex; justify-content:center;", grid)))
+    pal <- base$palette
+    items <- lapply(sort_levels(base$cats), function(cc)
+      tags$div(style = "display:flex; align-items:center; margin-bottom:4px; font-size:12px; white-space:nowrap;",
+               tags$span(style = sprintf("width:11px; height:11px; border-radius:50%%; background:%s; display:inline-block; margin-right:6px; flex:0 0 auto;", pal[[cc]])),
+               cc))
+    legend <- div(style = "flex:0 0 auto; max-height:80vh; overflow-y:auto;",
+                  tags$strong(style = "display:block; margin-bottom:6px;", paste0(pretty_label(active_group()), ":")), items)
+    tagList(
+      dl_all,
+      # align-items:center -> legend sits vertically centred against the plots.
+      div(style = "display:flex; align-items:center; justify-content:center; gap:18px;", grid, legend)
+    )
+  })
+
+  lapply(seq_len(umap_split_max), function(i) {
+    force(i)
+    output[[paste0("umap_split_", i)]] <- renderPlotly({
+      levs <- umap_split_sel()
+      req(i <= length(levs))
+      build_umap_split_panel(levs[i])
+    })
+  })
 
   # Max Gene Expression panels drawn at once. Each gene is a full-resolution WebGL
   # UMAP, and browsers cap live WebGL contexts (~8-16) TWEAK: raise cautiously.
@@ -2103,13 +1918,8 @@ server <- function(input, output, session) {
   # and a table.
   # ===========================================================================
 
-  # Aggregated tab: assay + dynamic data-layer selector (any assay).
+  # Aggregated tab: fixed to RNA assay + "data" (Normalized log); selectors removed.
   agg_assay_val <- make_assay_val("agg_assay")
-  output$agg_layer_ui <- renderUI({
-    assay_use <- agg_assay_val()
-    req(seu(), assay_use)
-    selectInput("agg_layer", lbl("Data layer:", INFO_LAYER), choices = layer_choices(seu(), assay_use), width = "100%")
-  })
   agg_layer <- make_layer_val("agg_layer")
 
   # agg_matrix(): the genes x group-levels matrix of aggregated expression, using
@@ -2198,11 +2008,6 @@ server <- function(input, output, session) {
   # (so the diverging blue-white-red scale reads as "low/high in this group").
   # ===========================================================================
   dot_assay_val <- make_assay_val("dot_assay")
-  output$dot_layer_ui <- renderUI({
-    assay_use <- dot_assay_val()
-    req(seu(), assay_use)
-    selectInput("dot_layer", lbl("Data layer:", INFO_LAYER), choices = layer_choices(seu(), assay_use), width = "100%")
-  })
   dot_layer <- make_layer_val("dot_layer")
 
   # Populate the (manual-mode) gene picker in the chosen sort order.
@@ -2217,7 +2022,7 @@ server <- function(input, output, session) {
   # single-group Cluster Markers tab). Returns the raw results table (or an error :).
   dot_auto <- eventReactive(input$dot_compute, {
     req(input$dot_group_var)
-    grp <- input$dot_group_var; assay_use <- dot_assay_val(); test <- input$dot_test
+    grp <- input$dot_group_var; assay_use <- dot_assay_val(); test <- "wilcox"
     obj <- prepare_obj_for_de(seu(), assay_use)
     Seurat::Idents(obj) <- grp                         # use the grouping column as identities
     res <- tryCatch(
@@ -2241,7 +2046,7 @@ server <- function(input, output, session) {
       validate(need(!is.null(a) &&
                     identical(a$group, input$dot_group_var) &&
                     identical(a$assay, dot_assay_val()) &&
-                    identical(a$test, input$dot_test),
+                    identical(a$test, "wilcox"),
                     "Click 'Compute markers' to find the top markers for the current grouping."))
       res <- a$res
       validate(need(!inherits(res, "error"),
@@ -2410,9 +2215,11 @@ server <- function(input, output, session) {
 
   # Cluster dropdown for the Markers tab, numerically sorted (1,2,...,10 not 1,10,2).
   output$marker_cluster_ui <- renderUI({
-    req(input$marker_resolution, input$marker_test)
+    req(input$marker_resolution)
     df <- seu()@misc$cluster_markers
-    df <- df[df$source_column == input$marker_resolution & df$test_type == input$marker_test, ]
+    # Test type selector removed: default to wilcox if present, else the first test.
+    mt <- if ("wilcox" %in% df$test_type) "wilcox" else df$test_type[1]
+    df <- df[df$source_column == input$marker_resolution & df$test_type == mt, ]
     cluster_ids <- unique(df$group_level)
     cluster_ids <- cluster_ids[order(as.numeric(cluster_ids))]
     selectInput("marker_cluster", "Cluster:", choices = cluster_ids, width = "100%")
@@ -2434,9 +2241,10 @@ server <- function(input, output, session) {
   # search box (top-right of the table) handles filtering.
   # TWEAK: pageLength controls rows per page.
   output$marker_table <- renderDT({
-    req(input$marker_resolution, input$marker_test, input$marker_cluster)
+    req(input$marker_resolution, input$marker_cluster)
     df <- seu()@misc$cluster_markers
-    row <- df[df$source_column == input$marker_resolution & df$test_type == input$marker_test & df$group_level == input$marker_cluster, ]
+    mt <- if ("wilcox" %in% df$test_type) "wilcox" else df$test_type[1]
+    row <- df[df$source_column == input$marker_resolution & df$test_type == mt & df$group_level == input$marker_cluster, ]
     validate(need(nrow(row) == 1, "No data for this combination."))
     markers_df <- as.data.frame(row$markers[[1]])
     markers_df <- markers_df[order(markers_df$FDR), ]
@@ -2447,10 +2255,11 @@ server <- function(input, output, session) {
   # Contrast table: same idea as the marker table, but the row is chosen by the
   # "target vs reference" pair (split back apart here) plus the test type.
   output$contrast_table <- renderDT({
-    req(input$contrast_choice, input$contrast_test)
+    req(input$contrast_choice)
     parts <- strsplit(input$contrast_choice, " vs ")[[1]]
     df <- seu()@misc$contrasts
-    row <- df[df$target == parts[1] & df$reference == parts[2] & df$test_type == input$contrast_test, ]
+    ct <- if ("wilcox" %in% df$test_type) "wilcox" else df$test_type[1]
+    row <- df[df$target == parts[1] & df$reference == parts[2] & df$test_type == ct, ]
     validate(need(nrow(row) == 1, "No data for this combination."))
     contrast_df <- as.data.frame(row$markers[[1]])
     contrast_df <- contrast_df[order(contrast_df$FDR), ]
@@ -2529,18 +2338,9 @@ server <- function(input, output, session) {
     obj
   }
 
-  # Dynamic layer selectors for the DE tabs: show layers available for the chosen assay.
-  output$gmarker_layer_ui <- renderUI({
-    assay_use <- gmarker_assay_val()
-    req(seu(), assay_use)
-    selectInput("gmarker_layer", lbl("Data layer:", INFO_LAYER), choices = layer_choices(seu(), assay_use), width = "100%")
-  })
-
-  output$gcontrast_layer_ui <- renderUI({
-    assay_use <- gcontrast_assay_val()
-    req(seu(), assay_use)
-    selectInput("gcontrast_layer", lbl("Data layer:", INFO_LAYER), choices = layer_choices(seu(), assay_use), width = "100%")
-  })
+  # The DE tabs are fixed to the RNA assay + "data" (Normalized log); their assay
+  # and data-layer selectors were removed. input$gmarker_layer / input$gcontrast_layer
+  # are absent, so the slot logic below falls back to "data".
 
   # Gated behind the "Compute markers" button. FindMarkers over the whole object
   # is heavy (seconds to minutes on large data) and Shiny is single-threaded, so
@@ -2548,7 +2348,7 @@ server <- function(input, output, session) {
   # eventReactive only recomputes on click; the result is stamped with the inputs
   # it was computed for so the table can flag a stale selection (see gmarker_table).
   gmarker_res <- eventReactive(input$gmarker_compute, {
-    req(seu(), input$gmarker_group, input$gmarker_cluster, input$gmarker_test)
+    req(seu(), input$gmarker_group, input$gmarker_cluster)
     assay_use <- gmarker_assay_val()
     req(assay_use)
 
@@ -2557,7 +2357,7 @@ server <- function(input, output, session) {
     # Use the user-chosen layer, falling back to auto-detection by test type.
     slot <- if (!is.null(input$gmarker_layer) && nzchar(input$gmarker_layer)) {
       input$gmarker_layer
-    } else if (input$gmarker_test %in% c("negbinom", "poisson", "DESeq2")) {
+    } else if ("wilcox" %in% c("negbinom", "poisson", "DESeq2")) {
       "counts"
     } else {
       "data"
@@ -2567,13 +2367,13 @@ server <- function(input, output, session) {
       # convergence warning each - hundreds of lines. Errors are still caught.
       suppressWarnings(
         Seurat::FindMarkers(obj, ident.1 = input$gmarker_cluster, group.by = input$gmarker_group,
-                            test.use = input$gmarker_test, slot = slot, assay = assay_use)
+                            test.use = "wilcox", slot = slot, assay = assay_use)
       ),
       error = function(e) e
     )
     # Stamp what this was computed for, so an input change since can be detected.
     list(res = res, group = input$gmarker_group, cluster = input$gmarker_cluster,
-         assay = assay_use, layer = input$gmarker_layer, test = input$gmarker_test)
+         assay = assay_use, layer = input$gmarker_layer, test = "wilcox")
   })
 
   output$gmarker_table <- renderDT({
@@ -2587,7 +2387,7 @@ server <- function(input, output, session) {
                   identical(a$cluster, input$gmarker_cluster) &&
                   identical(a$assay, gmarker_assay_val()) &&
                   identical(a$layer, input$gmarker_layer) &&
-                  identical(a$test, input$gmarker_test),
+                  identical(a$test, "wilcox"),
                   "Inputs changed. Click 'Compute markers' to update the table."))
     res <- a$res
     if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute markers:", conditionMessage(res))))
@@ -2614,7 +2414,7 @@ server <- function(input, output, session) {
   # FindMarkers is heavy and Shiny is single-threaded). Only recomputes on click;
   # stamped with its inputs so the table can flag a stale selection.
   gcontrast_res <- eventReactive(input$gcontrast_compute, {
-    req(seu(), input$gcontrast_group, input$gcontrast_target, input$gcontrast_reference, input$gcontrast_test)
+    req(seu(), input$gcontrast_group, input$gcontrast_target, input$gcontrast_reference)
     validate(need(input$gcontrast_target != input$gcontrast_reference, "Pick two different groups."))
     assay_use <- gcontrast_assay_val()
     req(assay_use)
@@ -2624,7 +2424,7 @@ server <- function(input, output, session) {
     # Use the user-chosen layer, falling back to auto-detection by test type.
     slot <- if (!is.null(input$gcontrast_layer) && nzchar(input$gcontrast_layer)) {
       input$gcontrast_layer
-    } else if (input$gcontrast_test %in% c("negbinom", "poisson", "DESeq2")) {
+    } else if ("wilcox" %in% c("negbinom", "poisson", "DESeq2")) {
       "counts"
     } else {
       "data"
@@ -2635,13 +2435,13 @@ server <- function(input, output, session) {
       suppressWarnings(
         Seurat::FindMarkers(obj, ident.1 = input$gcontrast_target,
                             ident.2 = input$gcontrast_reference, group.by = input$gcontrast_group,
-                            test.use = input$gcontrast_test, slot = slot, assay = assay_use)
+                            test.use = "wilcox", slot = slot, assay = assay_use)
       ),
       error = function(e) e
     )
     list(res = res, group = input$gcontrast_group, target = input$gcontrast_target,
          reference = input$gcontrast_reference, assay = assay_use,
-         layer = input$gcontrast_layer, test = input$gcontrast_test)
+         layer = input$gcontrast_layer, test = "wilcox")
   })
 
   output$gcontrast_table <- renderDT({
@@ -2653,7 +2453,7 @@ server <- function(input, output, session) {
                   identical(a$reference, input$gcontrast_reference) &&
                   identical(a$assay, gcontrast_assay_val()) &&
                   identical(a$layer, input$gcontrast_layer) &&
-                  identical(a$test, input$gcontrast_test),
+                  identical(a$test, "wilcox"),
                   "Inputs changed. Click 'Compute contrast' to update the table."))
     res <- a$res
     if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute contrast:", conditionMessage(res))))
@@ -2749,747 +2549,6 @@ server <- function(input, output, session) {
     dt_with_excel(df, safe_fname(paste0("pseudobulk_DESeq2_", a$target, "_vs_", a$reference)))
   }, server = FALSE)
 
-  # ===========================================================================
-  # Split by Group: one gene shown as a separate expression UMAP per level of a
-  # grouping column. Each panel plots that group's cells (coloured by the gene's
-  # raw expression in the chosen layer) over a grey backdrop of all cells, on a
-  # shared colour scale (from expr_limits()) so the panels are directly comparable.
-  # ===========================================================================
-  # Hard limit on how many groups can be shown at once. The panels are WebGL
-  # (fast for many cells), and browsers cap live WebGL contexts, so we bound the
-  # panel count instead: the user picks which groups to show, up to this many.
-  # TWEAK: raise cautiously - too high risks the browser dropping plots.
-  split_max_panels <- 12
-
-  # Populate the Split gene selector when data loads: keep the current gene if
-  # still valid, else default to the first in the (alphabetical) order.
-  observeEvent(seu(), {
-    req(seu())
-    sort_mode <- if (is.null(input$split_gene_sort)) "Alphabetical" else input$split_gene_sort
-    ch <- ordered_gene_choices(sort_mode)
-    sel <- isolate(input$split_gene)
-    if (is.null(sel) || !(sel %in% ch)) sel <- ch[[1]]
-    updateSelectizeInput(session, "split_gene", choices = ch, selected = sel, server = TRUE)
-  })
-  # When the sort changes, re-order the list AND jump to the TOP gene of the new
-  # order (e.g. switching to "Highest average expression" selects the highest gene,
-  # so the picker starts from the beginning rather than keeping the previous gene).
-  observeEvent(input$split_gene_sort, {
-    req(seu(), input$split_gene_sort)
-    ch <- ordered_gene_choices(input$split_gene_sort)
-    updateSelectizeInput(session, "split_gene", choices = ch, selected = ch[[1]], server = TRUE)
-  }, ignoreInit = TRUE)
-
-  # Split tab: assay + dynamic data-layer selector (any assay).
-  split_assay_val <- make_assay_val("split_assay")
-  output$split_layer_ui <- renderUI({
-    assay_use <- split_assay_val()
-    req(seu(), assay_use)
-    selectInput("split_layer", lbl("Data layer:", INFO_LAYER), choices = layer_choices(seu(), assay_use), width = "100%")
-  })
-  split_layer <- make_layer_val("split_layer")
-
-  # Levels of the "Split by" column - pick which primary groups to show.
-  output$split_levels_ui <- renderUI({
-    req(input$split_group)
-    vals <- as.character(seu()@meta.data[[input$split_group]]); vals[is.na(vals)] <- "NA"
-    lvls <- sort_levels(vals)
-    selectizeInput("split_levels",
-                   paste0(pretty_label(input$split_group), " - groups to show:"),
-                   choices = lvls, selected = character(0), multiple = TRUE, width = "100%",
-                   options = list(maxItems = split_max_panels, placeholder = "Pick groups to show..."))
-  })
-
-  # Levels of the optional "Then by" column - pick which secondary groups to
-  # show. Only appears once a "Then by" column is chosen (req("") is falsy).
-  output$split_levels2_ui <- renderUI({
-    req(input$split_then)
-    vals <- as.character(seu()@meta.data[[input$split_then]]); vals[is.na(vals)] <- "NA"
-    lvls <- sort_levels(vals)
-    selectizeInput("split_levels2",
-                   paste0(pretty_label(input$split_then), " - groups to show:"),
-                   choices = lvls, selected = character(0), multiple = TRUE, width = "100%",
-                   options = list(maxItems = split_max_panels, placeholder = "Pick groups to show..."))
-  })
-
-  # Shared data + the list of panels to draw. Each panel is one group (or, when a
-  # second "Then by" column is chosen, one primary x secondary combination): a
-  # mask over all cells + a title. Nothing shows until the user picks groups.
-  split_data <- reactive({
-    req(input$split_group, input$split_gene)
-    g <- input$split_gene
-    assay_use <- split_assay_val()
-    layer_use <- split_layer()
-    full <- GetAssayData(seu(), layer = layer_use, assay = assay_use)   # genes x cells
-    validate(need(g %in% rownames(full),
-                  paste0("Gene '", g, "' is not present in the '", layer_use,
-                         "' layer of assay '", assay_use, "'.")))
-    emb <- umap_emb()
-    grp <- as.character(seu()@meta.data[[input$split_group]]); grp[is.na(grp)] <- "NA"
-    # RAW values of the chosen layer (no app-side z-scoring) - consistent with
-    # the Gene Expression tab. Colour range from expr_limits(): 0..max for
-    # non-negative layers (counts / data), symmetric about 0 for scale.data so 0
-    # reads white on the blue-white-red scale.
-    expr <- as.numeric(full[g, ])
-    lims <- expr_limits(expr)
-    layer_lab <- layer_label(layer_use)
-
-    all_levels <- sort_levels(grp)
-    sel <- input$split_levels[input$split_levels %in% all_levels]
-    sel <- head(sel, split_max_panels)   # primary groups the user picked
-
-    # Optional secondary grouping (the "Then by" column) + the user's picked
-    # secondary levels.
-    sec_col <- input$split_then
-    grp2 <- NULL; sec_sel <- NULL
-    if (!is.null(sec_col) && nzchar(sec_col) && sec_col %in% colnames(seu()@meta.data)) {
-      grp2 <- as.character(seu()@meta.data[[sec_col]]); grp2[is.na(grp2)] <- "NA"
-      all_sec <- sort_levels(grp2)
-      sec_sel <- input$split_levels2[input$split_levels2 %in% all_sec]
-    }
-
-    # Build one panel per primary group, or per (primary x secondary) combination.
-    # Titles lead with the gene so a downloaded panel is self-describing
-    # (e.g. "Malat1 · WT  (n=1234)").
-    panels <- list()
-    if (is.null(grp2)) {
-      for (p in sel) panels[[length(panels) + 1]] <-
-        list(mask = grp == p, title = paste0(g, " · ", p, "  (n=", sum(grp == p), ")"))
-      ncol_hint <- NA_integer_
-    } else {
-      for (p in sel) for (s in sec_sel) {
-        m <- grp == p & grp2 == s
-        panels[[length(panels) + 1]] <-
-          list(mask = m, title = paste0(g, " · ", p, " - ", s, "  (n=", sum(m), ")"))
-      }
-      ncol_hint <- if (length(sec_sel) > 0) length(sec_sel) else NA_integer_
-    }
-
-    # Per-cell hover string, built once here (not per panel): each panel just
-    # indexes into it, so the paste0 over ~19k cells runs once per selection
-    # instead of once for every one of the (up to 12) panels.
-    lbl <- if (is.null(grp2)) grp else paste0(grp, " - ", grp2)
-    tt <- paste0("Cell: ", rownames(emb), "<br>", lbl, "<br>", g, ": ", round(expr, 3))
-
-    list(emb = emb, grp = grp, grp2 = grp2, expr = expr, lims = lims,
-         layer_lab = layer_lab, gene = g, tt = tt,
-         panels = panels, ncol_hint = ncol_hint)
-  })
-
-  # Grid of one panel per group + a single shared colorbar on the right.
-  output$split_plots <- renderUI({
-    d <- split_data()
-    n <- length(d$panels)
-    validate(need(n > 0, "Pick one or more groups to show."))
-    validate(need(n <= split_max_panels,
-                  paste0("That makes ", n, " panels (max ", split_max_panels,
-                         "). Pick fewer groups, or a 'Then by' column with fewer categories.")))
-    # "Panels per row" always controls the layout (even with a "Then by" column).
-    ncol <- max(1, min(input$split_ncol, n))
-    nrow <- ceiling(n / ncol)
-    # Same square-cell sizing as the Gene Expression tab: cell = min(width per
-    # column, one viewport height), so plots and colorbar match that tab exactly.
-    gap <- 10
-    side_offset <- 90
-    top_offset  <- 380
-    cb_width    <- 150
-    w_term <- sprintf("calc((100vw - %dpx) / %d)", side_offset + cb_width + (ncol - 1) * gap, ncol)
-    h_cap  <- sprintf("calc(100vh - %dpx)", top_offset)
-    cell   <- sprintf("min(%s, %s)", w_term, h_cap)
-
-    cells <- lapply(seq_len(n), function(i) {
-      id <- paste0("split_panel_", i)
-      div(class = "plot-dl-wrap", style = "position: relative; width: 100%; height: 100%;",
-          plot_dl_btn(id, d$panels[[i]]$title),
-          withSpinner(plotlyOutput(id, width = "100%", height = "100%"),
-                      caption = "Rendering plot...", color = "#39FF14"))
-    })
-    grid_div <- div(
-      id = "split_plot_grid",
-      style = paste0("display: grid; grid-template-columns: repeat(", ncol,
-                     ", ", cell, "); grid-template-rows: repeat(", nrow,
-                     ", ", cell, "); gap: ", gap, "px; justify-content: center;",
-                     " align-content: start;"),
-      cells)
-    # Grid + shared colorbar, same structure as Gene Expression's shared mode.
-    body <- div(style = "display: flex; align-items: stretch; justify-content: center; gap: 15px;",
-        grid_div,
-        div(style = paste0("width: ", cb_width, "px; display: flex; align-items: center; justify-content: center;"),
-            div(style = paste0("width: 100%; height: ", cell, ";"),
-                plotlyOutput("split_colorbar", width = "100%", height = "100%"))))
-
-    # "Download all as one PNG" (all panels + the shared colorbar composited).
-    if (n > 1) {
-      ids <- paste0("split_panel_", seq_len(n))
-      tagList(div(style = "text-align: right; padding-right: 0;",
-                  plot_dl_all_btn(ids, ncol, "split_colorbar",
-                                  paste0(d$gene, "_split_panels"))), body)
-    } else {
-      body
-    }
-  })
-
-  # Single shared colorbar (blue -> white -> red), matching the panels' scale.
-  output$split_colorbar <- renderPlotly({
-    d <- split_data()
-    lims <- d$lims
-    plot_ly(x = c(0, 0), y = c(0, 1), type = "scatter", mode = "markers",
-            marker = list(color = lims,
-                          colorscale = EXPR_COLORSCALE,
-                          cmin = lims[1], cmax = lims[2], opacity = 0, showscale = TRUE,
-                          # bar anchored left so it sits right next to the panels
-                          # (on screen and in the combined PNG).
-                          colorbar = list(title = list(text = d$layer_lab), thickness = 15,
-                                          len = 0.5, outlinewidth = 0, x = 0, xanchor = "left"))) %>%
-      plotly::layout(xaxis = list(visible = FALSE, range = c(-1, 1)),
-                     yaxis = list(visible = FALSE, range = c(-1, 2)),
-                     margin = list(l = 0, r = 0, t = 10, b = 10),
-                     paper_bgcolor = "rgba(0,0,0,0)", plot_bgcolor = "rgba(0,0,0,0)") %>%
-      plotly::config(displayModeBar = FALSE)
-  })
-
-  # Pre-register up to split_max_panels panels; each renders group i's cells.
-  lapply(seq_len(split_max_panels), function(i) {
-    force(i)
-    output[[paste0("split_panel_", i)]] <- renderPlotly({
-      d <- split_data()
-      req(i <= length(d$panels))
-      pan <- d$panels[[i]]
-      sel <- pan$mask
-      rng <- umap_range()
-      # Two traces, same as the Gene Expression tab's style:
-      #  1) grey backdrop = every OTHER cell (context),
-      #  2) this panel's cells coloured by expression via a numeric blue->white->red
-      #     colourscale (numeric colour is what actually renders the gradient - a
-      #     character/hex vector is not applied by plotly and comes out all blue).
-      # both traces carry a tooltip (no hoverinfo="skip"), so hovering any cell
-      # works - exactly like Clusters / Gene Expression.
-      o <- which(!sel)
-      g <- which(sel)[order(d$expr[sel])]   # low->high so bright cells sit on top
-      mk_df <- function(idx) data.frame(
-        x = d$emb[idx, 1], y = d$emb[idx, 2], e = d$expr[idx],
-        tt = d$tt[idx],
-        stringsAsFactors = FALSE)
-      # Build traces only when they have cells - an empty (primary x secondary)
-      # combination would otherwise error on a zero-row data frame.
-      p <- plot_ly()
-      if (length(o) > 0) {
-        p <- add_trace(p, data = mk_df(o), x = ~x, y = ~y, type = "scattergl", mode = "markers",
-                       marker = list(size = 3, color = "#E8E8E8"),
-                       text = ~tt, hoverinfo = "text", showlegend = FALSE)
-      }
-      if (length(g) > 0) {
-        p <- add_trace(p, data = mk_df(g), x = ~x, y = ~y, type = "scattergl", mode = "markers",
-                       marker = list(size = 4, color = ~e,
-                                     colorscale = EXPR_COLORSCALE,
-                                     cmin = d$lims[1], cmax = d$lims[2], showscale = FALSE,
-                                     # Hidden on screen (one shared colorbar to the side); revealed
-                                     # only when a single panel is exported to PNG, so the file has a scale.
-                                     colorbar = list(title = list(text = d$layer_lab), thickness = 15,
-                                                     len = 0.5, outlinewidth = 0)),
-                       text = ~tt, hoverinfo = "text", showlegend = FALSE)
-      }
-      p %>%
-        plotly::layout(
-          hovermode = "closest",
-          title = list(text = pan$title, x = 0, xref = "paper", xanchor = "left",
-                       font = list(size = 14, family = "Open Sans, verdana, arial, sans-serif")),
-          xaxis = list(title = "", zeroline = FALSE, showline = FALSE, ticks = "",
-                       range = rng, constrain = "range"),
-          yaxis = list(title = "", zeroline = FALSE, showline = FALSE, ticks = "",
-                       scaleanchor = "x", scaleratio = 1, constrain = "range",
-                       range = rng),
-          margin = list(l = 10, r = 10, t = 30, b = 10)) %>%
-        plotly::config(displayModeBar = FALSE)
-    })
-  })
-
-  # ===========================================================================
-  # Annotation tab: marker-free exploration/validation of cell-type labels.
-  #   * confusion matrix  -- cross-tabulate two categorical label columns
-  #   * confidence by group -- distribution of a numeric score per group
-  #   * composition       -- stacked cell-type proportions per group
-  # All use meta.data columns already in the object (e.g. scFM predictions).
-  # ===========================================================================
-
-  # Confusion matrix: how cells cross-tabulate between two label columns. Rows =
-  # first column's levels, columns = second's; colour = row-% or raw counts.
-  output$anno_confusion <- renderPlotly({
-    req(input$anno_x, input$anno_y)
-    md <- seu()@meta.data
-    x <- as.character(md[[input$anno_x]]); x[is.na(x)] <- "NA"
-    y <- as.character(md[[input$anno_y]]); y[is.na(y)] <- "NA"
-    rl <- sort_levels(x); cl <- sort_levels(y)
-    counts <- matrix(as.numeric(table(factor(x, rl), factor(y, cl))),
-                     nrow = length(rl), dimnames = list(rl, cl))
-    rowpct <- sweep(counts, 1, pmax(rowSums(counts), 1), "/") * 100
-    if (identical(input$anno_norm, "row")) { z <- rowpct; zlab <- "% of row" }
-    else { z <- counts; zlab <- "Cells" }
-    # Per-cell hover text (count + row-%), built once as a matrix.
-    txt <- outer(seq_along(rl), seq_along(cl), function(i, j)
-      sprintf("%s: %s<br>%s: %s<br>Cells: %d<br>Row %%: %.1f%%",
-              pretty_label(input$anno_x), rl[i], pretty_label(input$anno_y), cl[j],
-              counts[cbind(i, j)], rowpct[cbind(i, j)]))
-    plot_ly(x = cl, y = rl, z = z, type = "heatmap",
-            colorscale = list(c(0, "#f7fcf5"), c(0.5, "#74c476"), c(1, "#00441b")),
-            text = txt, hovertemplate = "%{text}<extra></extra>",
-            colorbar = list(title = list(text = zlab), thickness = 15, outlinewidth = 0)) %>%
-      plotly::layout(
-        title = list(text = paste0("Label comparison: ", pretty_label(input$anno_x),
-                                   " (rows) vs ", pretty_label(input$anno_y), " (columns)"),
-                     x = 0, xref = "paper", xanchor = "left",
-                     font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-        xaxis = list(title = pretty_label(input$anno_y), tickangle = -45),
-        yaxis = list(title = pretty_label(input$anno_x), autorange = "reversed"),
-        margin = list(l = 150, r = 10, t = 50, b = 150)) %>%
-      plotly::config(displayModeBar = FALSE)
-  })
-
-  # Exact-label agreement caption (fraction of cells where both columns match).
-  output$anno_agreement <- renderUI({
-    req(input$anno_x, input$anno_y)
-    md <- seu()@meta.data
-    x <- as.character(md[[input$anno_x]]); y <- as.character(md[[input$anno_y]])
-    ok <- !is.na(x) & !is.na(y)
-    agree <- if (any(ok)) round(mean(x[ok] == y[ok]) * 100, 1) else NA_real_
-    helpText(sprintf(
-      "Exact-label agreement: %s of cells carry the SAME label in both columns. Only meaningful when the two columns use the same naming; otherwise read the heatmap for where one label maps onto the other.",
-      if (is.na(agree)) "-" else paste0(agree, "%")))
-  })
-
-  # Confidence by group: distribution of a numeric column (e.g. prediction score)
-  # per level of a categorical column (e.g. predicted cell type).
-  output$anno_conf_plot <- renderPlotly({
-    req(input$conf_value, input$conf_group)
-    md <- seu()@meta.data
-    v <- suppressWarnings(as.numeric(as.character(md[[input$conf_value]])))
-    g <- as.character(md[[input$conf_group]]); g[is.na(g)] <- "NA"
-    keep <- is.finite(v)
-    validate(need(any(keep), "The chosen value column is not numeric."))
-    g <- g[keep]; v <- v[keep]
-    gl <- sort_levels(g)
-    df <- data.frame(group = factor(g, levels = gl), value = v)
-    pal <- setNames(scales::hue_pal()(length(gl)), gl)
-    p <- if (identical(input$conf_kind, "box")) {
-      plot_ly(df, x = ~group, y = ~value, color = ~group, colors = pal,
-              type = "box", boxpoints = "outliers", showlegend = FALSE)
-    } else {
-      plot_ly(df, x = ~group, y = ~value, color = ~group, colors = pal,
-              type = "violin", box = list(visible = TRUE), points = "outliers",
-              spanmode = "hard", showlegend = FALSE)
-    }
-    # Fill the width: force each mark to 0.8 wide (trace attribute, via style() so
-    # it isn't confused with plot_ly's figure-width arg), then pin the category
-    # axis to [-0.4, n-0.6] so the outer marks touch the frame (no side padding).
-    p <- plotly::style(p, width = 0.8)
-    xr <- c(-0.4, length(gl) - 0.6)
-    p %>% plotly::layout(
-      title = list(text = paste0(pretty_label(input$conf_value), " by ", pretty_label(input$conf_group)),
-                   x = 0, xref = "paper", xanchor = "left",
-                   font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-      xaxis = list(title = "", tickangle = -45, range = xr),
-      yaxis = list(title = pretty_label(input$conf_value), zeroline = FALSE),
-      margin = list(l = 70, r = 10, t = 50, b = 150)) %>%
-      plotly::config(displayModeBar = FALSE)
-  })
-
-  # Composition: stacked bars of one categorical column's make-up per level of
-  # another (e.g. cell-type proportions per sample), as % or raw counts.
-  output$anno_comp_plot <- renderPlotly({
-    req(input$comp_group, input$comp_fill)
-    md <- seu()@meta.data
-    g <- as.character(md[[input$comp_group]]); g[is.na(g)] <- "NA"
-    f <- as.character(md[[input$comp_fill]]);  f[is.na(f)] <- "NA"
-    gl <- sort_levels(g); fl <- sort_levels(f)
-    m <- matrix(as.numeric(table(factor(g, gl), factor(f, fl))),
-                nrow = length(gl), dimnames = list(gl, fl))
-    if (identical(input$comp_mode, "proportion")) {
-      m <- sweep(m, 1, pmax(rowSums(m), 1), "/") * 100; ytitle <- "% of group"
-    } else ytitle <- "Cells"
-    pal <- setNames(scales::hue_pal()(length(fl)), fl)
-    p <- plot_ly()
-    for (ff in fl) p <- add_trace(p, x = gl, y = m[, ff], type = "bar", name = ff,
-                                  marker = list(color = pal[[ff]]))
-    # Fill the width: bars are 0.8 wide (bargap 0.2), so pinning the category axis
-    # to [-0.4, n-0.6] makes the outer bars touch the frame edges (no empty side
-    # padding) while keeping the gap between bars.
-    xr <- c(-0.4, length(gl) - 0.6)
-    p %>% plotly::layout(
-      barmode = "stack", bargap = 0.2,
-      title = list(text = paste0("Composition of ", pretty_label(input$comp_group),
-                                 " by ", pretty_label(input$comp_fill)),
-                   x = 0, xref = "paper", xanchor = "left",
-                   font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-      xaxis = list(title = pretty_label(input$comp_group), tickangle = -45, range = xr),
-      yaxis = list(title = ytitle),
-      legend = list(title = list(text = pretty_label(input$comp_fill))),
-      margin = list(l = 60, r = 10, t = 50, b = 150)) %>%
-      plotly::config(displayModeBar = FALSE)
-  })
-
-  # ---- Annotation tables (Excel-exportable, like Aggregated Expression) -------
-  # Confusion matrix as raw cell counts (row label + one column per col level).
-  output$anno_confusion_table <- renderDT({
-    req(input$anno_x, input$anno_y)
-    md <- seu()@meta.data
-    x <- as.character(md[[input$anno_x]]); x[is.na(x)] <- "NA"
-    y <- as.character(md[[input$anno_y]]); y[is.na(y)] <- "NA"
-    rl <- sort_levels(x); cl <- sort_levels(y)
-    counts <- matrix(as.numeric(table(factor(x, rl), factor(y, cl))),
-                     nrow = length(rl), dimnames = list(rl, cl))
-    # Match the plot's Row%/counts toggle so the table shows what the heatmap shows.
-    if (identical(input$anno_norm, "row")) {
-      m <- round(sweep(counts, 1, pmax(rowSums(counts), 1), "/") * 100, 2)
-      fname <- "confusion_matrix_row_pct"
-    } else {
-      m <- counts
-      fname <- "confusion_matrix_counts"
-    }
-    df <- cbind(setNames(data.frame(rl, stringsAsFactors = FALSE), pretty_label(input$anno_x)),
-                data.frame(m, check.names = FALSE))
-    rownames(df) <- NULL
-    dt_with_excel(df, fname)
-  }, server = FALSE)   # client-side so the Excel button exports ALL rows
-
-  # Confidence-by-group summary statistics per group.
-  output$anno_conf_table <- renderDT({
-    req(input$conf_value, input$conf_group)
-    md <- seu()@meta.data
-    v <- suppressWarnings(as.numeric(as.character(md[[input$conf_value]])))
-    g <- as.character(md[[input$conf_group]]); g[is.na(g)] <- "NA"
-    keep <- is.finite(v); v <- v[keep]; g <- g[keep]
-    validate(need(length(v) > 0, "The chosen value column is not numeric."))
-    gl <- sort_levels(g)
-    summ <- do.call(rbind, lapply(gl, function(lv) {
-      xx <- v[g == lv]
-      data.frame(Group = lv, n = length(xx),
-                 Mean = round(mean(xx), 3), Median = round(stats::median(xx), 3),
-                 SD = round(stats::sd(xx), 3), Min = round(min(xx), 3), Max = round(max(xx), 3),
-                 stringsAsFactors = FALSE)
-    }))
-    names(summ)[1] <- pretty_label(input$conf_group)
-    dt_with_excel(summ, "confidence_by_group")
-  }, server = FALSE)   # client-side so the Excel button exports ALL rows
-
-  # Composition as a group x fill matrix (counts, or % matching the plot toggle).
-  output$anno_comp_table <- renderDT({
-    req(input$comp_group, input$comp_fill)
-    md <- seu()@meta.data
-    g <- as.character(md[[input$comp_group]]); g[is.na(g)] <- "NA"
-    f <- as.character(md[[input$comp_fill]]);  f[is.na(f)] <- "NA"
-    gl <- sort_levels(g); fl <- sort_levels(f)
-    m <- matrix(as.numeric(table(factor(g, gl), factor(f, fl))),
-                nrow = length(gl), dimnames = list(gl, fl))
-    if (identical(input$comp_mode, "proportion"))
-      m <- round(sweep(m, 1, pmax(rowSums(m), 1), "/") * 100, 2)
-    df <- cbind(setNames(data.frame(gl, stringsAsFactors = FALSE), pretty_label(input$comp_group)),
-                data.frame(m, check.names = FALSE))
-    rownames(df) <- NULL
-    dt_with_excel(df, "composition")
-  }, server = FALSE)   # client-side so the Excel button exports ALL rows
-
-  # ===========================================================================
-  # scFM Explorer: compare embeddings, neighbourhood preservation, model agreement.
-  # ===========================================================================
-
-  # Square axis window (padded) for an arbitrary embedding's first two dims.
-  emb_range <- function(e) {
-    r <- range(e[, 1:2], na.rm = TRUE); pad <- diff(r) * 0.03
-    c(r[1] - pad, r[2] + pad)
-  }
-
-  # ---- Compare embeddings: two maps, same colours, linked group-highlight ----
-  # Keep the highlight picker in sync with the chosen colour column.
-  observeEvent(list(seu(), input$cmp_color), {
-    req(input$cmp_color)
-    vals <- as.character(seu()@meta.data[[input$cmp_color]]); vals[is.na(vals)] <- "NA"
-    updateSelectizeInput(session, "cmp_highlight", choices = sort_levels(vals),
-                         selected = character(0), server = TRUE)
-  })
-
-  # The embeddings chosen in the single multi-select (capped, valid only).
-  cmp_max <- 6
-  cmp_selected <- reactive({
-    e <- input$cmp_embs
-    e <- e[e %in% available_reductions()]
-    head(e, cmp_max)
-  })
-
-  # Shared HTML legend (one for all panels, so it never squeezes the square plots).
-  # Greyed swatch = a group not currently highlighted.
-  output$cmp_legend <- renderUI({
-    req(input$cmp_color)
-    col <- as.character(seu()@meta.data[[input$cmp_color]]); col[is.na(col)] <- "NA"
-    cats <- sort_levels(col); non_na <- setdiff(cats, "NA")
-    pal <- setNames(scales::hue_pal()(length(non_na)), non_na)
-    if ("NA" %in% cats) pal[["NA"]] <- "#B3B3B3"
-    hl <- input$cmp_highlight
-    shown <- if (is.null(hl) || length(hl) == 0) cats else hl
-    items <- lapply(cats, function(cc) {
-      color <- if (cc %in% shown) pal[[cc]] else "#E2E2E2"
-      tags$span(style = "display: flex; align-items: center; margin-bottom: 5px; font-size: 12px; white-space: nowrap;",
-                tags$span(style = sprintf("width: 12px; height: 12px; border-radius: 50%%; background: %s; display: inline-block; margin-right: 6px; flex: 0 0 auto;", color)),
-                cc)
-    })
-    # Vertical legend, shown to the RIGHT of the panels (shared by all of them).
-    div(style = "display: flex; flex-direction: column; padding-top: 28px; max-height: 80vh; overflow-y: auto;",
-        tags$strong(style = "margin-bottom: 8px;", paste0(pretty_label(input$cmp_color), ":")), items)
-  })
-
-  # One compare panel for a given reduction (shared palette + highlight state).
-  # Fixed nticks so every panel draws the SAME number of gridlines regardless of
-  # each embedding's own coordinate range.
-  cmp_panel <- function(red) {
-    req(seu(), red, input$cmp_color)
-    validate(need(red %in% tryCatch(SeuratObject::Reductions(seu()), error = function(e) names(seu()@reductions)),
-                  "This embedding is not in the object."))
-    e <- Embeddings(seu(), red)[, 1:2, drop = FALSE]
-    col <- as.character(seu()@meta.data[[input$cmp_color]]); col[is.na(col)] <- "NA"
-    cats <- sort_levels(col); non_na <- setdiff(cats, "NA")
-    pal <- setNames(scales::hue_pal()(length(non_na)), non_na)
-    if ("NA" %in% cats) pal[["NA"]] <- "#B3B3B3"
-    hl <- input$cmp_highlight
-    shown <- if (is.null(hl) || length(hl) == 0) cats else hl
-    ptcol <- ifelse(col %in% shown, unname(pal[col]), "#E2E2E2")
-    ptcol[is.na(ptcol)] <- "#E2E2E2"
-    set.seed(1); ord <- sample(nrow(e))
-    df <- data.frame(x = e[ord, 1], y = e[ord, 2], c = ptcol[ord], g = col[ord],
-                     stringsAsFactors = FALSE)
-    rng <- emb_range(e)
-    plot_ly(df, x = ~x, y = ~y, type = "scattergl", mode = "markers",
-            marker = list(size = 4, color = ~c), text = ~g, hoverinfo = "text", showlegend = FALSE) %>%
-      plotly::layout(
-        title = list(text = red, x = 0, xref = "paper", xanchor = "left",
-                     font = list(size = 14, family = "Open Sans, verdana, arial, sans-serif")),
-        xaxis = list(title = "", zeroline = FALSE, showticklabels = FALSE, nticks = 6,
-                     showgrid = TRUE, gridcolor = "#e6e6e6", gridwidth = 1, range = rng, constrain = "range"),
-        yaxis = list(title = "", zeroline = FALSE, showticklabels = FALSE, nticks = 6, scaleanchor = "x",
-                     showgrid = TRUE, gridcolor = "#e6e6e6", gridwidth = 1, scaleratio = 1, range = rng, constrain = "range"),
-        margin = list(l = 10, r = 10, t = 30, b = 10)) %>%
-      plotly::config(displayModeBar = FALSE)
-  }
-
-  # Grid of one square panel per selected embedding (1..cmp_max, side by side).
-  output$cmp_grid <- renderUI({
-    sel <- cmp_selected()
-    validate(need(length(sel) >= 1, "Pick at least one embedding above."))
-    n <- length(sel)
-    # How many panels per row (user-chosen), never more than there are panels.
-    ncol <- if (is.null(input$cmp_ncol) || is.na(input$cmp_ncol)) 2 else max(1, min(input$cmp_ncol, n))
-    cells <- lapply(seq_len(n), function(i) {
-      id <- paste0("cmp_plot_", i)
-      div(class = "plot-dl-wrap scfm-square",
-          plot_dl_btn(id, paste0("embedding_", sel[i])),
-          withSpinner(plotlyOutput(id, width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14"))
-    })
-    # Each column is capped at the same square size the other scFM plots use
-    # (min(88vh, 70vw)), so 1 panel doesn't blow up to full width; columns shrink
-    # to fit when more sit per row, and the whole grid is centred. Extra panels
-    # wrap onto new rows automatically.
-    div(style = paste0("display: grid; justify-content: center; gap: 14px; ",
-                       "grid-template-columns: repeat(", ncol, ", minmax(0, min(88vh, 70vw)));"),
-        cells)
-  })
-
-  # Pre-register up to cmp_max panels; each renders the i-th selected embedding.
-  lapply(seq_len(cmp_max), function(i) {
-    force(i)
-    output[[paste0("cmp_plot_", i)]] <- renderPlotly({
-      sel <- cmp_selected()
-      req(i <= length(sel))
-      cmp_panel(sel[i])
-    })
-  })
-
-  # ---- Neighbourhood preservation: per-cell kNN overlap (high-D vs 2D) ----
-  # Gated behind the button (kNN over all cells is a few seconds on large data).
-  pres_res <- eventReactive(input$pres_compute, {
-    req(seu(), input$pres_emb_hi, input$pres_emb_2d)
-    validate(need(requireNamespace("RANN", quietly = TRUE),
-                  "The RANN package is required for this view (it ships with Seurat)."))
-    hi <- Embeddings(seu(), input$pres_emb_hi)
-    lo <- Embeddings(seu(), input$pres_emb_2d)[, 1:2, drop = FALSE]
-    k  <- if (is.null(input$pres_k) || is.na(input$pres_k)) 30 else max(5, min(100, input$pres_k))
-    k  <- min(k, nrow(hi) - 1)
-    nn_hi <- RANN::nn2(hi, k = k + 1)$nn.idx[, -1, drop = FALSE]   # drop self
-    nn_lo <- RANN::nn2(lo, k = k + 1)$nn.idx[, -1, drop = FALSE]
-    ov <- vapply(seq_len(nrow(hi)),
-                 function(i) length(intersect(nn_hi[i, ], nn_lo[i, ])) / k, numeric(1))
-    list(emb = lo, ov = ov, k = k, hi = input$pres_emb_hi, lab2d = input$pres_emb_2d)
-  })
-
-  output$pres_plot <- renderPlotly({
-    validate(need(isTRUE(input$pres_compute > 0),
-                  "Set the options above, then click 'Compute preservation'."))
-    d <- pres_res()
-    df <- data.frame(x = d$emb[, 1], y = d$emb[, 2], ov = d$ov)
-    df <- df[order(df$ov, decreasing = TRUE), ]   # low overlap drawn last -> on top
-    rng <- emb_range(d$emb)
-    plot_ly(df, x = ~x, y = ~y, type = "scattergl", mode = "markers",
-            marker = list(size = 4, color = ~ov, colorscale = "Viridis", cmin = 0, cmax = 1,
-                          colorbar = list(title = list(text = "kNN overlap", side = "right"),
-                                          thickness = 15, len = 0.5, outlinewidth = 0, x = 1.02, xanchor = "left")),
-            hovertemplate = "preserved: %{marker.color:.2f}<extra></extra>") %>%
-      plotly::layout(
-        title = list(text = paste0("Neighbourhood preservation on ", d$lab2d, " (k=", d$k, ")"),
-                     x = 0, xref = "paper", xanchor = "left",
-                     font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-        xaxis = list(title = "", zeroline = FALSE, showticklabels = FALSE, range = rng, constrain = "range"),
-        yaxis = list(title = "", zeroline = FALSE, showticklabels = FALSE, scaleanchor = "x",
-                     scaleratio = 1, range = rng, constrain = "range"),
-        margin = list(l = 10, r = 10, t = 40, b = 10)) %>%
-      plotly::config(displayModeBar = FALSE)
-  })
-
-  output$pres_caption <- renderUI({
-    req(isTRUE(input$pres_compute > 0))
-    d <- pres_res()
-    helpText(sprintf(
-      "Mean neighbourhood preservation: %.2f - the fraction of each cell's k=%d high-D neighbours (%s) kept in the 2D map (%s), averaged over all cells. Lower = more distortion.",
-      mean(d$ov), d$k, d$hi, d$lab2d))
-  })
-
-  # ---- Model agreement: per-cell agreement across chosen label columns ----
-  agree_data <- reactive({
-    cols <- input$agree_cols
-    validate(need(length(cols) >= 2, "Pick at least two label columns to compare."))
-    md <- seu()@meta.data
-    M <- vapply(cols, function(cc) {
-      v <- as.character(md[[cc]]); v[is.na(v)] <- "NA"; v
-    }, character(nrow(md)))
-    # per cell: fraction of columns equal to that cell's most common label (1 = unanimous)
-    agr <- apply(M, 1, function(r) { tb <- table(r); max(tb) / length(r) })
-    list(agr = as.numeric(agr), ncols = length(cols))
-  })
-
-  output$agree_plot <- renderPlotly({
-    req(input$agree_emb)
-    d <- agree_data()
-    e <- Embeddings(seu(), input$agree_emb)[, 1:2, drop = FALSE]
-    df <- data.frame(x = e[, 1], y = e[, 2], a = d$agr)
-    df <- df[order(df$a, decreasing = TRUE), ]   # disagreement (low) drawn last -> on top
-    rng <- emb_range(e)
-    plot_ly(df, x = ~x, y = ~y, type = "scattergl", mode = "markers",
-            marker = list(size = 4, color = ~a,
-                          colorscale = list(c(0, "#d73027"), c(0.5, "#fee08b"), c(1, "#1a9850")),
-                          cmin = 0, cmax = 1,
-                          colorbar = list(title = list(text = "agreement", side = "right"),
-                                          thickness = 15, len = 0.5, outlinewidth = 0, x = 1.02, xanchor = "left")),
-            hovertemplate = "agreement: %{marker.color:.2f}<extra></extra>") %>%
-      plotly::layout(
-        title = list(text = paste0("Model agreement across ", d$ncols, " label columns"),
-                     x = 0, xref = "paper", xanchor = "left",
-                     font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-        xaxis = list(title = "", zeroline = FALSE, showticklabels = FALSE, range = rng, constrain = "range"),
-        yaxis = list(title = "", zeroline = FALSE, showticklabels = FALSE, scaleanchor = "x",
-                     scaleratio = 1, range = rng, constrain = "range"),
-        margin = list(l = 10, r = 10, t = 40, b = 10)) %>%
-      plotly::config(displayModeBar = FALSE)
-  })
-
-  output$agree_caption <- renderUI({
-    d <- agree_data()
-    helpText(sprintf(
-      "%.1f%% of cells are unanimous across the %d chosen columns (all identical). The rest are disagreement hotspots. Only meaningful when the columns share the same label naming.",
-      mean(d$agr == 1) * 100, d$ncols))
-  })
-
-  output$agree_table <- renderDT({
-    d <- agree_data()
-    tb <- as.data.frame(table(Agreement = round(d$agr, 3)), stringsAsFactors = FALSE)
-    names(tb) <- c("Agreement", "Cells")
-    tb$Cells <- as.integer(tb$Cells)
-    tb$Percent <- round(tb$Cells / sum(tb$Cells) * 100, 2)
-    dt_with_excel(tb, "model_agreement_distribution")
-  }, server = FALSE)   # client-side so the Excel button exports ALL rows
-
-  # ---- Embedding heatmap: mean embedding value per group per dimension --------
-  # Rows = groups, columns = the embedding's dimensions; clustered so structure shows.
-  heat_data <- reactive({
-    req(seu(), input$heat_emb, input$heat_group)
-    emb <- Embeddings(seu(), input$heat_emb)                       # cells x dims
-    grp <- as.character(seu()@meta.data[[input$heat_group]]); grp[is.na(grp)] <- "NA"
-    m <- rowsum(emb, grp)                                          # groups x dims (sum)
-    m <- m / as.numeric(table(grp)[rownames(m)])                  # -> mean per group
-    m
-  })
-
-  output$heat_plot <- renderPlotly({
-    m <- heat_data()
-    validate(need(ncol(m) >= 2,
-                  "This embedding has fewer than 2 dimensions - pick a multi-dimensional reduction (PCA or a foundation-model embedding), not a 2D UMAP."))
-    if (identical(input$heat_scale, "z")) {
-      z <- scale(m); z[!is.finite(z)] <- 0                        # z-score each dimension
-      lim <- max(abs(z)); if (!is.finite(lim) || lim <= 0) lim <- 1
-      cs <- EXPR_COLORSCALE; zmin <- -lim; zmax <- lim; lab <- "z-score"
-    } else {
-      z <- m; cs <- "Viridis"; zmin <- min(z, na.rm = TRUE); zmax <- max(z, na.rm = TRUE); lab <- "mean"
-    }
-    ro <- if (nrow(z) > 2) tryCatch(stats::hclust(stats::dist(z))$order, error = function(e) seq_len(nrow(z))) else seq_len(nrow(z))
-    co <- if (ncol(z) > 2) tryCatch(stats::hclust(stats::dist(t(z)))$order, error = function(e) seq_len(ncol(z))) else seq_len(ncol(z))
-    z <- z[ro, co, drop = FALSE]
-    plot_ly(x = colnames(z), y = rownames(z), z = z, type = "heatmap",
-            colorscale = cs, zmin = zmin, zmax = zmax, zauto = FALSE,
-            colorbar = list(title = list(text = lab), thickness = 15, outlinewidth = 0),
-            hovertemplate = paste0(pretty_label(input$heat_group), ": %{y}<br>dim: %{x}<br>", lab, ": %{z:.3f}<extra></extra>")) %>%
-      plotly::layout(
-        title = list(text = paste0("Embedding signature per ", pretty_label(input$heat_group), " (", input$heat_emb, ")"),
-                     x = 0, xref = "paper", xanchor = "left",
-                     font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
-        xaxis = list(title = "embedding dimension", showticklabels = (ncol(z) <= 60), tickangle = -90),
-        yaxis = list(title = ""),
-        margin = list(l = 150, r = 10, t = 50, b = 70)) %>%
-      plotly::config(displayModeBar = FALSE)
-  })
-
-  output$heat_table <- renderDT({
-    m <- round(heat_data(), 4)
-    df <- data.frame(Group = rownames(m), m, check.names = FALSE, row.names = NULL)
-    dt_with_excel(df, "embedding_heatmap")
-  }, server = FALSE)   # client-side so the Excel button exports ALL rows
-
-  # ---- Integration check: the same embedding coloured two ways ---------------
-  intg_scatter <- function(red, color_col) {
-    req(seu(), red, color_col)
-    e <- Embeddings(seu(), red)[, 1:2, drop = FALSE]
-    col <- as.character(seu()@meta.data[[color_col]]); col[is.na(col)] <- "NA"
-    cats <- sort_levels(col); non_na <- setdiff(cats, "NA")
-    pal <- setNames(scales::hue_pal()(length(non_na)), non_na)
-    if ("NA" %in% cats) pal[["NA"]] <- "#B3B3B3"
-    ptcol <- unname(pal[col]); ptcol[is.na(ptcol)] <- "#B3B3B3"
-    set.seed(1); ord <- sample(nrow(e))
-    df <- data.frame(x = e[ord, 1], y = e[ord, 2], c = ptcol[ord], g = col[ord], stringsAsFactors = FALSE)
-    rng <- emb_range(e)
-    plot_ly(df, x = ~x, y = ~y, type = "scattergl", mode = "markers",
-            marker = list(size = 4, color = ~c), text = ~g, hoverinfo = "text", showlegend = FALSE) %>%
-      plotly::layout(
-        title = list(text = paste0(red, " · ", pretty_label(color_col)), x = 0, xref = "paper", xanchor = "left",
-                     font = list(size = 14, family = "Open Sans, verdana, arial, sans-serif")),
-        xaxis = list(title = "", zeroline = FALSE, showticklabels = FALSE, showgrid = TRUE, gridcolor = "#e6e6e6",
-                     nticks = 6, range = rng, constrain = "range"),
-        yaxis = list(title = "", zeroline = FALSE, showticklabels = FALSE, showgrid = TRUE, gridcolor = "#e6e6e6",
-                     nticks = 6, scaleanchor = "x", scaleratio = 1, range = rng, constrain = "range"),
-        margin = list(l = 10, r = 10, t = 30, b = 10)) %>%
-      plotly::config(displayModeBar = FALSE)
-  }
-  intg_legend <- function(color_col) {
-    req(seu(), color_col)
-    col <- as.character(seu()@meta.data[[color_col]]); col[is.na(col)] <- "NA"
-    cats <- sort_levels(col); non_na <- setdiff(cats, "NA")
-    pal <- setNames(scales::hue_pal()(length(non_na)), non_na)
-    if ("NA" %in% cats) pal[["NA"]] <- "#B3B3B3"
-    items <- lapply(cats, function(cc)
-      tags$span(style = "display: flex; align-items: flex-start; margin-bottom: 5px; font-size: 11px; line-height: 1.3;",
-                tags$span(style = sprintf("width: 11px; height: 11px; border-radius: 50%%; background: %s; display: inline-block; margin-right: 6px; margin-top: 2px; flex: 0 0 auto;", pal[[cc]])),
-                cc))
-    # Vertical legend, shown to the RIGHT of its plot.
-    div(style = "display: flex; flex-direction: column; padding-top: 30px; max-height: 80vh; overflow-y: auto;",
-        tags$strong(style = "margin-bottom: 6px;", paste0(pretty_label(color_col), ":")), items)
-  }
-  output$intg_plot_a  <- renderPlotly({ intg_scatter(input$intg_emb, input$intg_color1) })
-  output$intg_plot_b  <- renderPlotly({ intg_scatter(input$intg_emb, input$intg_color2) })
-  output$intg_legend_a <- renderUI({ req(input$intg_color1); intg_legend(input$intg_color1) })
-  output$intg_legend_b <- renderUI({ req(input$intg_color2); intg_legend(input$intg_color2) })
 }
 
 shinyApp(ui, server)
