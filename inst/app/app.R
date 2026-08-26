@@ -166,11 +166,8 @@ dt_with_excel <- function(df, filename) {
 # Plots: a small "PNG" button that exports a plotly plot as a static PNG entirely
 # in the browser (Plotly.downloadImage -> see the dlPlot() JS in tags$head).`id` = the plotlyOutput id, `fname` = PNG name.
 safe_fname <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
-plot_dl_btn <- function(id, fname) {
-  tags$button(class = "png-dl-btn", type = "button", title = "Download PNG",
-              onclick = sprintf("dlPlot('%s','%s')", id, safe_fname(fname)),
-              HTML("&#8615; PNG"))
-}
+plot_dl_btn <- function(id, fname) NULL   # per-plot PNG now via plotly's native
+# modebar (camera icon); no-op keeps the many call sites unchanged.
 # "Download all as one PNG" button for a multi-panel grid: composites every
 # listed panel (+ the shared colorbar, if given) into a single image laid out in
 # `ncol` columns. `ids` = character vector of plot ids.
@@ -217,8 +214,6 @@ ui <- fluidPage(
       ::-webkit-scrollbar { width: 0px; background: transparent; }
       body { -ms-overflow-style: none; scrollbar-width: none; }
 
-      /* Force hide Plotly's modebar (the gray line with options) */
-      .plotly .modebar { display: none !important; }
 
       /* Restyle DataTables' own 'processing' indicator (the default blue pulsing
          dots) to match the app's green spinner. */
@@ -365,6 +360,17 @@ ui <- fluidPage(
         font-size: 11px; color: #2e7d32; font-family: monospace; }
       .assay-layer-strip .assay-block { display: inline-block; margin-right: 18px; }
 
+      /* Collapsible Data info panel (file name + summary cards + assays/layers). */
+      .data-info { margin: 4px 0 14px; }
+      .data-info > summary { cursor: pointer; font-weight: 600; color: #1a1a1a; padding: 7px 14px;
+        background: #fafafa; border: 1px solid #e6e6e6; border-left: 3px solid #39FF14;
+        border-radius: 6px; display: inline-block; list-style: none; user-select: none; }
+      .data-info > summary::-webkit-details-marker { display: none; }
+      .data-info > summary::before { content: '▸'; color: #2ecc0f; margin-right: 8px; }
+      .data-info[open] > summary::before { content: '▾'; }
+      .data-info > summary:hover { color: #2ecc0f; }
+      .data-info-body { margin-top: 10px; }
+
       /* Make each spinner-wrapped feature plot fill its (square) grid cell */
       #dynamic_feature_plots .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
       #dynamic_feature_plots .html-widget { width: 100% !important; height: 100% !important; }
@@ -373,6 +379,18 @@ ui <- fluidPage(
       /* Split-by-group panels: make the plotly widget fill its fixed square box. */
       .umap-split-cell .shiny-spinner-output-container { width: 100% !important; height: 100% !important; }
       .umap-split-cell .html-widget { width: 100% !important; height: 100% !important; }
+
+      /* ---- Landing / 'Get started' page (centred hero card) ---- */
+      .landing-wrap { display: flex; justify-content: center; align-items: center; min-height: 82vh; padding: 20px; }
+      .landing-card { background: #ffffff; border: 1px solid #e6e6e6; border-top: 4px solid #39FF14;
+        border-radius: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); padding: 40px 48px;
+        width: 100%; max-width: 460px; text-align: center; }
+      .landing-title { font-size: 36px; font-weight: 800; letter-spacing: -0.5px; color: #1a1a1a; margin: 0 0 8px; }
+      .landing-title span { color: #2ecc0f; }
+      .landing-sub { color: #667; font-size: 14px; line-height: 1.5; margin: 0 auto 26px; max-width: 340px; }
+      .landing-card .form-group { text-align: left; }
+      .landing-card .control-label { font-weight: 600; color: #333; }
+      .landing-card .shiny-input-container { width: 100% !important; }
     ")),
     tags$script(HTML("
       document.addEventListener('DOMContentLoaded', function() {
@@ -513,33 +531,47 @@ ui <- fluidPage(
     "))
   ),
 
-  titlePanel("scExplorer"),
-
-  # "Get started" controls -- hidden once a dataset is successfully loaded
-  # (output.data_ready is TRUE). conditionalPanel only hides them (CSS), so the
-  # inputs keep their values.
+  # Landing / "Get started" page -- a centred hero card, shown until a dataset is
+  # successfully loaded (output.data_ready). conditionalPanel only hides via CSS, so
+  # the inputs keep their values.
   conditionalPanel(
     condition = "!output.data_ready",
-    radioButtons("data_source", "Get started:",
-                 choices = c("Upload your own data" = "upload",
-                             "Use example data" = "example"),
-                 selected = character(0)),
-    conditionalPanel(
-      condition = "input.data_source == 'upload'",
-      fileInput("seurat_file", "Upload a Seurat object (.rds)", accept = ".rds")
-    )
+    div(class = "landing-wrap",
+        div(class = "landing-card",
+            div(class = "landing-title", "sc", tags$span("Explorer")),
+            div(class = "landing-sub",
+                "Explore any Seurat object in your browser: clusters, gene expression, markers and differential expression, no coding needed."),
+            radioButtons("data_source", "Get started:",
+                         choices = c("Upload your own data" = "upload",
+                                     "Use example data" = "example"),
+                         selected = character(0)),
+            conditionalPanel(
+              condition = "input.data_source == 'upload'",
+              fileInput("seurat_file", "Upload a Seurat object (.rds)", accept = ".rds")
+            )
+        ))
   ),
 
-  # Once data is loaded, show a short status line in place of the controls.
+  # Once data is loaded: title, then a collapsible "Data info" panel holding the
+  # file name, the summary cards, and the assays/layers strip (hidden by default).
   conditionalPanel(
     condition = "output.data_ready",
-    uiOutput("data_status"),
-    uiOutput("summary_cards")
+    titlePanel("scExplorer"),
+    tags$details(class = "data-info",
+      tags$summary("Data info"),
+      div(class = "data-info-body",
+          uiOutput("data_status"),
+          uiOutput("summary_cards")))
   ),
 
   # The whole app body (tabs + plots) is built on the server side once data is
-  # loaded, so nothing shows until a Seurat object is available.
-  withSpinner(uiOutput("app_body"), caption = "Reading the data...", color = "#39FF14")
+  # loaded. Kept inside the data-ready panel so the "Reading the data..." spinner
+  # never shows over the landing page -- the file uploader's own progress bar
+  # ("Uploaded the data. Reading...") is the feedback while the object loads.
+  conditionalPanel(
+    condition = "output.data_ready",
+    withSpinner(uiOutput("app_body"), caption = "Reading the data...", color = "#39FF14")
+  )
 )
 
 # =============================================================================
@@ -1088,7 +1120,7 @@ server <- function(input, output, session) {
           ),
           fluidRow(
             column(3, div(style = "margin-top: 5px;",
-                          actionButton("gmarker_compute", "Compute markers",
+                          actionButton("gmarker_compute", "Compute",
                                        style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
           )
         ),
@@ -1107,7 +1139,7 @@ server <- function(input, output, session) {
         tags$ol(
           tags$li("Choose a \"Plot type\": dot plot or violin."),
           tags$li("Pick the \"Group by\" column."),
-          tags$li("Dot plot: choose genes manually, or pick \"Top markers per group (auto)\" and click \"Compute markers\" (Wilcoxon). Violin: type the genes to show."),
+          tags$li("Dot plot: choose genes manually, or pick \"Top markers per group (auto)\" and click \"Compute markers\" (Wilcoxon). Violin: type the genes, then click \"Compute violins\"."),
           tags$li("Use the PNG button to save the plot."))),
       wellPanel(
         # Plot type is the FIRST thing to choose; everything below adapts to it.
@@ -1133,7 +1165,7 @@ server <- function(input, output, session) {
             fluidRow(
               column(3, numericInput("dot_top_n", "Top markers / group:", value = 3, min = 1, max = 15, width = "100%")),
               column(3, div(style = "margin-top: 25px;",
-                            actionButton("dot_compute", "Compute markers",
+                            actionButton("dot_compute", "Compute",
                                          style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
             )
           ),
@@ -1154,9 +1186,12 @@ server <- function(input, output, session) {
           fluidRow(
             column(3, selectInput("violin_gene_sort", "Sort genes by:", width = "100%",
                                   choices = GENE_SORT_CHOICES)),
-            column(9, selectizeInput("violin_genes", "Genes to show (violin):",
+            column(6, selectizeInput("violin_genes", "Genes to show (violin):",
                                      choices = NULL, multiple = TRUE, width = "100%",
-                                     options = list(placeholder = "Type or pick genes to show as violins...", sortField = list(list(field = "$order")))))
+                                     options = list(placeholder = "Type or pick genes to show as violins...", sortField = list(list(field = "$order"))))),
+            column(3, div(style = "margin-top: 25px;",
+                          actionButton("violin_compute", "Compute",
+                                       style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
           )
         )
       ),
@@ -1207,8 +1242,8 @@ server <- function(input, output, session) {
             tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
         wellPanel(
           fluidRow(column(12, radioButtons("gcontrast_method", "Method:", inline = TRUE,
-                                  choices = c("Per-cell test (exploratory)" = "percell",
-                                              "Pseudobulk DESeq2 (recommended for conditions)" = "pseudobulk"),
+                                  choices = c("Per-cell test" = "percell",
+                                              "Pseudobulk DESeq2" = "pseudobulk"),
                                   selected = "percell"))),
           fluidRow(
             column(4, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
@@ -1220,7 +1255,7 @@ server <- function(input, output, session) {
             condition = "input.gcontrast_method == 'percell'",
             fluidRow(
               column(3, div(style = "margin-top: 5px;",
-                            actionButton("gcontrast_compute", "Compute contrast",
+                            actionButton("gcontrast_compute", "Compute",
                                          style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
             )
           ),
@@ -1228,11 +1263,22 @@ server <- function(input, output, session) {
           conditionalPanel(
             condition = "input.gcontrast_method == 'pseudobulk'",
             fluidRow(
-              column(3, selectInput("gcontrast_pb_sample", "Sample / replicate column:", choices = grouping_choices, width = "100%")),
-              column(3, selectInput("gcontrast_pb_subset_col", "Restrict to (optional):", choices = c("(all cells)" = "", grouping_choices), width = "100%")),
-              column(3, uiOutput("gcontrast_pb_subset_level_ui")),
-              column(3, div(style = "margin-top: 25px;",
-                            actionButton("gcontrast_pb_compute", "Compute pseudobulk DE",
+              column(4, selectInput("gcontrast_pb_sample", "Sample / replicate column:", choices = grouping_choices, width = "100%"))
+            ),
+            # Restrict is a checkbox below all the options; ticking it reveals column + level.
+            fluidRow(
+              column(12, checkboxInput("gcontrast_pb_restrict", "Restrict to a subset (optional)", value = FALSE))
+            ),
+            conditionalPanel(
+              condition = "input.gcontrast_pb_restrict",
+              fluidRow(
+                column(4, selectInput("gcontrast_pb_subset_col", "Restrict to column:", choices = grouping_choices, width = "100%")),
+                column(4, uiOutput("gcontrast_pb_subset_level_ui"))
+              )
+            ),
+            fluidRow(
+              column(4, div(style = "margin-top: 5px;",
+                            actionButton("gcontrast_pb_compute", "Compute",
                                          style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
             )
           )
@@ -1275,7 +1321,6 @@ server <- function(input, output, session) {
       rng <- range(x, na.rm = TRUE)
       step <- signif(diff(rng) / 100, 2)
       return(tagList(
-        helpText("Type a value range to keep (others go grey); press Tab/Enter to apply:"),
         fluidRow(
           column(6, numericInput("cont_min", "Min:", value = rng[1], step = step)),
           column(6, numericInput("cont_max", "Max:", value = rng[2], step = step))
@@ -1285,7 +1330,7 @@ server <- function(input, output, session) {
     vals <- as.character(seu()@meta.data[[gv]])
     vals[is.na(vals)] <- "NA"
     vals <- sort_levels(vals)
-    checkboxGroupInput("categories_shown", "Show categories:", choices = vals, selected = vals, inline = TRUE)
+    checkboxGroupInput("categories_shown", "Show categories:", choices = vals, selected = vals, inline = FALSE)
   })
 
   # ---------------------------------------------------------------------------
@@ -1417,7 +1462,7 @@ server <- function(input, output, session) {
       yaxis = list(title = fr$ylab, zeroline = FALSE, scaleanchor = "x", scaleratio = 1, tick0 = 0, dtick = fr$dtick,
                    constrain = "domain", constraintoward = "middle", range = fr$rng),
       showlegend = showlg, legend = lg, margin = list(l = 46, r = 10, t = 36, b = 40)
-    ) %>% plotly::config(displayModeBar = FALSE)
+    ) %>% plotly::config(displaylogo = FALSE)
   }
 
   output$umap_plot <- renderPlotly({
@@ -1466,7 +1511,7 @@ server <- function(input, output, session) {
                      constrain = "domain", constraintoward = "middle", range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 40)
       )
-      return(plotly::config(p, displayModeBar = FALSE))
+      return(plotly::config(p, displaylogo = FALSE))
     }
 
     # ---- Categorical column: discrete colours + toggleable legend (below). ----
@@ -1512,7 +1557,7 @@ server <- function(input, output, session) {
                     y = 0.5, yanchor = "middle"),
       margin = list(l = 50, r = 10, t = 40, b = 40)
     )
-    plotly::config(p, displayModeBar = FALSE)
+    plotly::config(p, displaylogo = FALSE)
   })
 
   # Toggling a category recolours the EXISTING plot via plotly restyle
@@ -1605,7 +1650,7 @@ server <- function(input, output, session) {
       yaxis = list(title = axis_labels()[2], zeroline = FALSE, scaleanchor = "x", scaleratio = 1, tick0 = 0, dtick = umap_dtick(),
                    constrain = "domain", constraintoward = "middle", range = umap_range()),
       showlegend = showlg, legend = lg, margin = list(l = 44, r = 10, t = 34, b = 38)
-    ) %>% plotly::config(displayModeBar = FALSE)
+    ) %>% plotly::config(displaylogo = FALSE)
   }
 
   output$umap_split_grid <- renderUI({
@@ -1784,7 +1829,7 @@ server <- function(input, output, session) {
         paper_bgcolor = "rgba(0,0,0,0)",
         plot_bgcolor = "rgba(0,0,0,0)"
       ) %>%
-      plotly::config(displayModeBar = FALSE)
+      plotly::config(displaylogo = FALSE)
   })
 
   # ---------------------------------------------------------------------------
@@ -1906,7 +1951,7 @@ server <- function(input, output, session) {
                      range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 30)
       )
-      plotly::config(p, displayModeBar = FALSE)
+      plotly::config(p, displaylogo = FALSE)
     })
   })
 
@@ -1990,7 +2035,7 @@ server <- function(input, output, session) {
         yaxis = list(title = "Gene", autorange = "reversed"),   # first gene on top
         margin = list(l = 90, r = 10, t = 40, b = 100)
       ) %>%
-      plotly::config(displayModeBar = FALSE)
+      plotly::config(displaylogo = FALSE)
   })
 
   # Table: same matrix as a data frame (Gene column + one column per group level).
@@ -2131,7 +2176,7 @@ server <- function(input, output, session) {
                      categoryorder = "array", categoryarray = rev(d$groups)),
         margin = list(l = 130, r = 10, t = 50, b = 120)
       ) %>%
-      plotly::config(displayModeBar = FALSE)
+      plotly::config(displaylogo = FALSE)
   })
 
   # ---- Marker Plot: Violin variant --------------------------------------------
@@ -2154,7 +2199,9 @@ server <- function(input, output, session) {
 
   # One stacked row of violins per selected gene (x = group), sharing the group
   # axis. Cells are downsampled for responsiveness - a violin only needs the shape.
-  violin_data <- reactive({
+  # Gated behind the "Compute violins" button: drawing violins with all points is
+  # heavy, so it only renders on click (not on every gene change).
+  violin_data <- eventReactive(input$violin_compute, {
     req(input$dot_group_var)
     validate(need(length(input$violin_genes) > 0,
                   "Pick one or more genes above to show as violins."))
@@ -2204,7 +2251,7 @@ server <- function(input, output, session) {
                      x = 0, xref = "paper", xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
         margin = list(l = 90, r = 10, t = 50, b = 120)) %>%
-      plotly::config(displayModeBar = FALSE)
+      plotly::config(displaylogo = FALSE)
   })
 
   # ===========================================================================
@@ -2377,9 +2424,7 @@ server <- function(input, output, session) {
   })
 
   output$gmarker_table <- renderDT({
-    # Before the first compute, prompt rather than hanging on the spinner.
-    validate(need(isTRUE(input$gmarker_compute > 0),
-                  "Set the options above, then click 'Compute markers'."))
+    req(isTRUE(input$gmarker_compute > 0))   # blank until Compute is clicked
     a <- gmarker_res()
     # Stale-guard: the cached result belongs to the inputs it was computed with.
     # If any changed since, ask for a recompute instead of showing mislabeled data.
@@ -2445,8 +2490,7 @@ server <- function(input, output, session) {
   })
 
   output$gcontrast_table <- renderDT({
-    validate(need(isTRUE(input$gcontrast_compute > 0),
-                  "Set the options above, then click 'Compute contrast'."))
+    req(isTRUE(input$gcontrast_compute > 0))   # blank until Compute is clicked
     a <- gcontrast_res()
     validate(need(identical(a$group, input$gcontrast_group) &&
                   identical(a$target, input$gcontrast_target) &&
@@ -2469,7 +2513,7 @@ server <- function(input, output, session) {
   # Optional "restrict to a cell type / cluster" level picker.
   output$gcontrast_pb_subset_level_ui <- renderUI({
     col <- input$gcontrast_pb_subset_col
-    if (is.null(col) || !nzchar(col)) return(helpText("(no restriction)"))
+    if (is.null(col) || !nzchar(col)) return(NULL)
     selectInput("gcontrast_pb_subset_level", "Restrict to level:",
                 choices = sort_levels(seu()@meta.data[[col]]), width = "100%")
   })
@@ -2486,7 +2530,7 @@ server <- function(input, output, session) {
     cond <- as.character(md[[input$gcontrast_group]])
     samp <- as.character(md[[input$gcontrast_pb_sample]])
     keep <- cond %in% c(input$gcontrast_target, input$gcontrast_reference) & !is.na(samp)
-    sub_col <- input$gcontrast_pb_subset_col
+    sub_col <- if (isTRUE(input$gcontrast_pb_restrict)) input$gcontrast_pb_subset_col else ""
     if (!is.null(sub_col) && nzchar(sub_col) && !is.null(input$gcontrast_pb_subset_level))
       keep <- keep & !is.na(md[[sub_col]]) & as.character(md[[sub_col]]) == input$gcontrast_pb_subset_level
     validate(need(sum(keep) > 0, "No cells match the chosen groups / restriction."))
@@ -2531,8 +2575,7 @@ server <- function(input, output, session) {
   })
 
   output$gcontrast_pb_table <- renderDT({
-    validate(need(isTRUE(input$gcontrast_pb_compute > 0),
-                  "Set the options above, then click 'Compute pseudobulk DE'."))
+    req(isTRUE(input$gcontrast_pb_compute > 0))   # blank until Compute is clicked
     a <- gcontrast_pb_res()
     validate(need(identical(a$group, input$gcontrast_group) &&
                   identical(a$target, input$gcontrast_target) &&
