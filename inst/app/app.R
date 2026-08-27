@@ -3,20 +3,29 @@
 # =============================================================================
 #
 # WHAT IT DOES
-#   Load a Seurat .rds (upload or bundled example) and explore it in the browser:
-#     * Clusters / Metadata : UMAP coloured by a metadata column, with a
-#                             per-category show/hide filter.
-#     * Gene Expression     : one UMAP per chosen gene, coloured by expression.
-#     * Cluster Markers     : per-cluster marker-gene tables  (shown if present).
-#     * Contrasts           : differential-expression tables  (shown if present).
+#   Load a Seurat .rds (upload or bundled example) and explore it in the browser.
+#   Tabs (built in output$app_body once an object is loaded):
+#     * Clusters / Metadata    : a reduction (umap/pca/...) coloured by a metadata
+#                                column, with a per-category show/hide filter and an
+#                                optional "split by group" small-multiples view.
+#     * Gene Expression        : sub-tabs -- "Per-gene maps" (one UMAP per gene) and
+#                                "Aggregated (pseudobulk)" (heatmap + table per group).
+#     * Cluster Markers        : marker genes for a group vs the rest. scdrake
+#                                precomputed tables if present, else live FindMarkers.
+#     * Marker Plot            : a dot plot (or violins) of chosen genes across groups.
+#     * Differential expression: two groups A vs B -- per-cell FindMarkers, or a
+#                                pseudobulk DESeq2 path. Precomputed scdrake if present.
+#   The analysis is fixed to the RNA assay, Normalized (log) values, Wilcoxon test
+#   (falls back to SCT / DefaultAssay when RNA lacks a `data` layer -- see
+#   preferred_view_assay / default_de_assay).
 #
 # WHAT THE OBJECT NEEDS
-#   * A reduction named "umap"  (accessed via Embeddings(obj, "umap")).
-#   * meta.data columns to colour by. Every categorical column (factor /
-#     character / logical) plus low-cardinality numerics (e.g. cluster numbers)
-#     is offered; see `grouping_cols` in output$app_body to change the rule.
+#   * At least one 2D reduction (umap/tsne/pca/...) -- Embeddings(obj, <reduction>).
+#   * meta.data columns to colour / group by. Every categorical column plus
+#     low-cardinality / numeric-score columns is offered; see `grouping_cols` /
+#     `color_cols` in output$app_body to change the rule.
 #   * Optional obj@misc$cluster_markers / obj@misc$contrasts data frames
-#     (scdrake format) enable the last two tabs; they auto-hide when absent.
+#     (scdrake format) switch the DE tabs to instant precomputed tables.
 #   * Optional rowData SYMBOL/ENSEMBL columns give nicer gene labels.
 #
 # HOW A SHINY APP IS STRUCTURED (quick primer)
@@ -32,6 +41,10 @@
 #   plot sizing, expression colour gradient, default genes-per-row, ...).
 # =============================================================================
 
+# =============================================================================
+# GLOBAL HELPERS, CONSTANTS & PACKAGES  (shared by both `ui` and `server`)
+# =============================================================================
+
 # ---- Packages ----
 library(shiny)             # web-app framework
 library(Seurat)            # single-cell object (Embeddings, FetchData, ...)
@@ -41,21 +54,20 @@ library(plotly)            # interactive UMAPs + colorbars
 
 # Raise the upload size limit (default is 5MB; Seurat objects might be much bigger)
 options(shiny.maxRequestSize = 5 * 1024^3)  # 5 GB
-# The marker/contrast/aggregated tables render CLIENT-side (renderDT server = FALSE)
-# on purpose, so the DataTables "Download Excel" button exports ALL rows (not just
-# the current page). DT warns when a client-side table is large -- silence that
-# expected warning here.
+# Results tables are loaded into the browser in full (not one page at a time) so the
+# "Download Excel" button saves every row, not just the visible page. Loading a big
+# table this way can trigger a size warning, which the next line turns off.
 options(DT.warn.size = FALSE)
 
 # ---- Example data: read once per R session, reuse on every app (re)start ----
 # The example .rds is large, so instead of readRDS()-ing it every time the app
 # starts we cache the parsed object in the global environment. The first use in
-# an R session reads it; any later app restart in the SAME session reuses the
+# an R session reads it; any later app restart in the same session reuses the
 # in-memory object (no re-read). A full R restart clears memory and re-reads once.
 # WHERE "Use example data" LOADS FROM. The app tries these paths in order and
 # uses the first that exists.
 #
-# >>> OTHER USERS: change the FIRST path below to the absolute location of the
+# >>> other USERS: change the first path below to the absolute location of the
 # >>> example .rds on YOUR machine. Find it (in the bash terminal) with:
 # >>>     find ~ -name "seurat_example*.rds"
 # >>> If you leave it as-is it simply won't match on your system, and the app
@@ -100,7 +112,7 @@ sort_levels <- function(x) {
 # Marker Plot). ordered_gene_choices() interprets these values.
 GENE_SORT_CHOICES <- c("Alphabetical", "Highest average expression", "Lowest average expression")
 
-# Diverging blue -> white -> red colour scale used for expression on EVERY plot
+# Diverging blue -> white -> red colour scale used for expression on every plot
 # (Gene Expression, Aggregated Expression heatmap, Split by Group, and their
 # colorbars). TWEAK: edit these stops to re-theme the expression gradient app-wide.
 EXPR_COLORSCALE <- list(
@@ -111,7 +123,7 @@ EXPR_COLORSCALE <- list(
   c(1.00, "#B40426")    # high - red
 )
 
-# Colour limits for RAW layer values: non-negative layers (counts, data) start at
+# Colour limits for raw layer values: non-negative layers (counts, data) start at
 # 0; a layer with negatives (scale.data = z-scores) gets a symmetric range so 0
 # maps to white on the blue-white-red scale.
 expr_limits <- function(v) {
@@ -126,29 +138,14 @@ expr_limits <- function(v) {
   }
 }
 
-# Readable name for an assay layer
+# Readable name for an assay layer (the app uses "data" = Normalized (log)).
 layer_label <- function(L) switch(L,
   data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z)", L)
 
-# Labels for a "Data layer" dropdown
-LAYER_LABELS <- c(data = "Normalized (log)", counts = "Raw counts", scale.data = "Scaled (z-score)")
-
-# Named choices for a "Data layer" selector: the layers present in `assay_use`
-# of `seu_obj`, in preferred order (data, counts, scale.data), labelled by
-# LAYER_LABELS. Shared by every Data-layer dropdown in the app.
-layer_choices <- function(seu_obj, assay_use) {
-  lyrs <- tryCatch(SeuratObject::Layers(seu_obj[[assay_use]]), error = function(e) "data")
-  ord <- intersect(c("data", "counts", "scale.data"), lyrs)
-  if (length(ord) == 0) ord <- lyrs[1]
-  setNames(ord, ifelse(ord %in% names(LAYER_LABELS), LAYER_LABELS[ord], ord))
-}
-
 # ---- Download helpers -------------------------------------------------------
-# Tables: build a DT with a Excel download button. Uses the
-# DataTables Buttons extension; the .xlsx is generated in the browser via JSZip
-# (bundled with the DT package) -> no server-side Excel writer / no Java needed,
-# and the file opens in Excel / LibreOffice / Google Sheets alike. `filename` is
-# the .xlsx base name; `page = "all"` exports every row, not just the current page.
+# Build a results table with a "Download Excel" button. The Excel file is created in
+# the browser (no extra software needed) and opens in Excel, LibreOffice or Google
+# Sheets. `filename` is the saved file's base name; the download includes every row.
 dt_with_excel <- function(df, filename) {
   DT::datatable(
     df, rownames = FALSE, extensions = "Buttons",
@@ -185,19 +182,6 @@ plot_dl_all_btn <- function(ids, ncol, colorbar_id = NULL, filename = "plots",
 # Link to the full user guide (edit if you fork / rename the repo).
 GUIDE_URL <- "https://github.com/klazudiazz/scExplorer/blob/main/docs/USER_GUIDE.md"
 
-# Plain-language tooltips for the terms users most often stumble on, shown as a
-# small circled-i next to the control label (native browser tooltip -- no deps).
-INFO_ASSAY <- "Assay = WHICH data matrix. Assays can hold different genes and mean different things: RNA (raw counts), SCT (normalized), integrated (batch-corrected; not valid for DE), ADT (protein), etc. Pick the assay first, then a data layer within it."
-INFO_LAYER <- "Data layer = HOW the assay's values are transformed (same genes and cells): Normalized (log) is the usual expression, Raw counts are the integers, Scaled (z-score) is centered/scaled (variable genes only, has negatives)."
-INFO_TEST  <- "Statistical test for differential expression. Wilcoxon (default) and t / LR / bimod run on normalized values; Poisson uses raw counts; ROC reports an AUC 'power' instead of a p-value."
-INFO_RES   <- "A clustering column. The resolution sets HOW MANY clusters (higher = more, finer); the prefix (e.g. SCT vs integrated) is which assay's neighbor graph it was computed on. Colours the map by that clustering."
-INFO_RED_CMP <- "The two embeddings (reductions) to place side by side on the SAME cells, e.g. the standard UMAP vs a foundation-model embedding (scGPT/Geneformer). Both panels share colours; highlighting a group lights it up in both."
-
-# A small circled-i carrying a hover tooltip (native `title`, no JS).
-info_icon <- function(text) tags$span(class = "info-ic", title = text, "ⓘ")
-# A control label with the info icon appended (pass to a *Input's `label`).
-lbl <- function(text, info) tagList(text, info_icon(info))
-
 # A collapsible "How to use this tab" panel (native <details>, no JS), with a
 # link to the full guide appended after the body.
 help_details <- function(..., .summary = "How to use this tab", .guide = TRUE) {
@@ -207,6 +191,11 @@ help_details <- function(..., .summary = "How to use this tab", .guide = TRUE) {
              if (.guide) tags$p(tags$a(href = GUIDE_URL, target = "_blank", "Open the full user guide ↗"))))
 }
 
+# =============================================================================
+# UI: page layout -- the styling/JS in <head>, the centred landing card (shown
+#     until a dataset loads), the collapsible "Data info" panel, and the
+#     `app_body` outlet the server fills with tabs once an object is loaded.
+# =============================================================================
 ui <- fluidPage(
   tags$head(
     tags$style(HTML("
@@ -282,16 +271,6 @@ ui <- fluidPage(
       .btn-default:hover, .btn-default:focus { border-color: #39FF14; color: #2ecc0f; }
       .selectize-control.single .selectize-input.focus { border-color: #39FF14 !important; box-shadow: 0 0 0 1px #39FF14; }
 
-      /* Per-plot 'Download PNG' button (top-right corner, always visible). */
-      .png-dl-btn {
-        position: absolute; top: 4px; right: 4px; z-index: 10;
-        font-size: 11px; line-height: 1; padding: 3px 8px; cursor: pointer;
-        background: rgba(255,255,255,0.9); color: #1a1a1a;
-        border: 1px solid #39FF14; border-radius: 4px;
-        opacity: 0.85; transition: opacity 0.15s, background 0.15s;
-      }
-      .png-dl-btn:hover { opacity: 1; background: #39FF14; }
-
       /* 'Download all PNGs' button shown above a multi-panel grid. */
       .png-dl-all-btn {
         font-size: 13px; padding: 5px 14px; cursor: pointer; margin-bottom: 10px;
@@ -339,8 +318,7 @@ ui <- fluidPage(
         border: 2px solid #39FF14; font-weight: 600;
       }
 
-      /* In-app help: circled-i tooltip icon + 'How to use this tab' panel */
-      .info-ic { cursor: help; color: #2ecc0f; font-weight: 700; margin-left: 4px; font-size: 12px; }
+      /* In-app help: 'How to use this tab' collapsible panel */
       .tab-help { margin: 8px 0 12px; background: #fafafa; border: 1px solid #e6e6e6;
         border-left: 3px solid #39FF14; border-radius: 6px; padding: 6px 12px; }
       .tab-help > summary { cursor: pointer; font-weight: 600; color: #1a1a1a; outline: none; }
@@ -440,7 +418,7 @@ ui <- fluidPage(
       }
       // Indices of gradient traces (a numeric-coloured scattergl trace) whose
       // colorbar is currently hidden -- these are the panels that, in shared-scale
-      // mode, rely on the ONE colorbar drawn to the side.
+      // mode, rely on the one colorbar drawn to the side.
       function hiddenScaleTraces(gd) {
         var idx = [];
         (gd.data || []).forEach(function(tr, i) {
@@ -449,7 +427,7 @@ ui <- fluidPage(
         });
         return idx;
       }
-      // Export ONE plotly plot as a static PNG.
+      // Export one plotly plot as a static PNG.
       // If the panel's own colorbar is hidden (shared-scale mode), turn it on just
       // for the capture and restore it after, so every downloaded PNG has a scale
       // without changing what's on screen.
@@ -469,7 +447,7 @@ ui <- fluidPage(
           .then(function() { window.Plotly.restyle(gd, { 'marker.showscale': false }, hidden); })
           .catch(function() { window.Plotly.restyle(gd, { 'marker.showscale': false }, hidden); });
       };
-      // Export ALL displayed panels as ONE combined PNG: render each panel to an
+      // Export all displayed panels as one combined PNG: render each panel to an
       // image via Plotly (correct WebGL readback), then paint them onto a single
       // canvas in the grid layout (+ the shared colorbar on the right, if any).
       // ids = panel plot ids; ncol = panels per row; colorbarId = shared colorbar
@@ -706,7 +684,7 @@ server <- function(input, output, session) {
 
   # found_genes(): the subset of the user-selected genes that actually exist in
   # the object. shared_limits(): the pooled value range across those genes (of the
-  # chosen data layer), used by BOTH the individual plots and the single shared
+  # chosen data layer), used by both the individual plots and the single shared
   # colorbar so their scales match in "Same scale for all genes" mode.
   found_genes <- reactive({
     req(seu(), input$genes)
@@ -758,7 +736,7 @@ server <- function(input, output, session) {
   feature_layer <- make_layer_val("feature_layer")
 
   # Shared colour limits for "Same scale for all genes" mode: the pooled range of
-  # the RAW values (of the chosen layer) across the selected genes.
+  # the raw values (of the chosen layer) across the selected genes.
   shared_limits <- reactive({
     fg <- found_genes()
     req(length(fg) > 0)
@@ -771,7 +749,7 @@ server <- function(input, output, session) {
   # ---- Embedding (reduction) selection ----------------------------------------
   # The 2D+ reductions in the object (umap, tsne, pca, and foundation-model
   # embeddings like scgpt / geneformer if they were saved as reductions). Every
-  # embedding plot in the app draws from the ONE selected here.
+  # embedding plot in the app draws from the one selected here.
   available_reductions <- reactive({
     req(seu())
     reds <- tryCatch(SeuratObject::Reductions(seu()), error = function(e) names(seu()@reductions))
@@ -810,7 +788,7 @@ server <- function(input, output, session) {
   })
 
   # One common square axis window (padded full extent of the UMAP embedding),
-  # applied to BOTH axes of EVERY plot so all UMAPs are framed identically with
+  # applied to both axes of every plot so all UMAPs are framed identically with
   # the same x/y range and scale.
   umap_range <- reactive({
     emb <- umap_emb()[, 1:2]
@@ -820,7 +798,7 @@ server <- function(input, output, session) {
   })
 
   # A fixed, "nice" tick spacing for the UMAP axes (aiming for ~6 gridlines).
-  # Pinning it makes every colouring draw gridlines at the SAME values, instead
+  # Pinning it makes every colouring draw gridlines at the same values, instead
   # of plotly auto-choosing different spacing per plot from the pixel width.
   umap_dtick <- reactive({
     raw <- diff(umap_range()) / 6
@@ -916,8 +894,8 @@ server <- function(input, output, session) {
     # with many distinct values (nCount, nFeature, doublet_score, percent.mt, ...)
     # are excluded, because the UMAP assigns one colour per value and those would
     # produce thousands of categories.
-    # Grouping columns (Split / Aggregate / Markers / Contrasts) = REAL categories:
-    # factor/character/logical or low-cardinality numeric, and NOT a continuous
+    # Grouping columns (Split / Aggregate / Markers / Contrasts) = real categories:
+    # factor/character/logical or low-cardinality numeric, and not a continuous
     # column. Capped at `max_categories` distinct values so barcode / cell-name
     # columns (thousands of levels) are excluded - they'd make thousands of
     # panels/heatmap columns and trigger Shiny's "large number of options" warning.
@@ -933,7 +911,7 @@ server <- function(input, output, session) {
     grouping_choices <- setNames(grouping_cols, pretty_label(grouping_cols))
     grouping_choices <- grouping_choices[order(names(grouping_choices))]
 
-    # "Color UMAP by" = the grouping columns PLUS continuous columns (numeric, or
+    # "Color UMAP by" = the grouping columns plus continuous columns (numeric, or
     # numeric-like scores) which are drawn as a gradient (see is_continuous_col).
     # Still excludes huge text columns (barcodes) so the UMAP can't get thousands
     # of discrete colours.
@@ -949,7 +927,7 @@ server <- function(input, output, session) {
 
     # Embeddings (reductions) to offer -- only shown when the object has >1, so
     # the picker appears exactly when there's a choice (e.g. umap + a
-    # foundation-model embedding). Applies to EVERY embedding plot in the app.
+    # foundation-model embedding). Applies to every embedding plot in the app.
     red_choices <- available_reductions()
 
     # Assay layers present (counts / data / scale.data) for the Gene Expression
@@ -958,34 +936,28 @@ server <- function(input, output, session) {
     all_assays_ge <- tryCatch(SeuratObject::Assays(seu()), error = function(e) names(seu()@assays))
     def_assay_ge <- preferred_view_assay(seu())
 
-    has_markers <- !is.null(seu()@misc$cluster_markers)
-    has_contrasts <- !is.null(seu()@misc$contrasts)
+    # Always use the live-compute path (with a "Compute" button) for Cluster Markers
+    # and Differential expression -- so the example data behaves like uploaded data,
+    # even though it carries scdrake precomputed @misc tables. Set these back to
+    # !is.null(seu()@misc$cluster_markers / $contrasts) to show the precomputed tables.
+    has_markers <- FALSE
+    has_contrasts <- FALSE
 
     de_assays <- de_assay_choices()
     def_de_assay <- default_de_assay()
-
-    # DE tests offered by the generic Markers/Contrasts tabs.
-    # All built into Seurat and fast enough to auto-compute. (poisson uses raw
-    # counts; roc reports an AUC power instead of a p-value.)
-    # NOTE: the slow per-gene tests (negbinom, MAST, DESeq2) were removed for now
-    # -- they take minutes and these tabs auto-compute. Re-add here if wanted
-    # (the counts-slot logic below already handles negbinom/DESeq2).
-    de_test_choices <- c("Wilcoxon" = "wilcox", "Student's t" = "t", "ROC / AUC" = "roc",
-                         "Logistic regression" = "LR", "Likelihood ratio (bimod)" = "bimod",
-                         "Poisson (counts)" = "poisson")
 
     tabs <- list(
       tabPanel(
         "Clusters / Metadata",
         help_details(
-          tags$p("Colours the UMAP (one point per cell) by any metadata column, so you can see how cell types, conditions, clusters, or scores are laid out."),
+          tags$p("Colours the chosen embedding (one point per cell) by any metadata column, so you can see how cell types, conditions, clusters, or scores are laid out."),
           tags$ol(
-            tags$li("Pick a column in \"Color UMAP by\" to colour the map (clusterings are in this list too)."),
-            tags$li("Choose which embedding to plot on in \"Reduction (embedding)\" (for example umap or pca), when the object has more than one."),
-            tags$li("For a categorical column, tick or untick the categories in the sidebar to show or hide them."),
-            tags$li("For a numeric column (scores, QC), type a Min or Max to grey out cells outside that range."),
-            tags$li("To break the map out per group, tick \"Split by group\", pick a column, then choose which groups in \"Groups to show\" (starts empty; one panel per chosen group over a grey backdrop, up to 12)."),
-            tags$li("Hover a point to read its value; use the PNG button to save the plot."))),
+            tags$li("Choose which embedding to plot on in \"Reduction\" (for example umap or pca), when the object has more than one."),
+            tags$li("Pick a column in \"Color UMAP by\" to colour the map "),
+            tags$li("For a categorical column, tick or untick entries under \"Show categories\" to show or hide them on the map."),
+            tags$li("For a numeric column, type a Min or Max to grey out cells outside that range."),
+            tags$li("To break the map out per group, tick \"Split by group\", pick a column, then choose which groups in \"Groups to show\" "),
+            tags$li("Hover a point to read its value; hover the plot for its toolbar (the camera icon saves a PNG)."))),
         # Controls stacked vertically: Reduction, then Color UMAP by + its category
         # filter, then the Split-by option (revealed by a checkbox). Plot renders below.
         wellPanel(
@@ -1018,7 +990,7 @@ server <- function(input, output, session) {
       tabPanel(
         "Gene Expression",
         help_details(
-          tags$p("Explore gene expression two ways, using the sub tabs below (the smaller green buttons). Both use the RNA assay and Normalized (log) values. Each sub tab has its own \"How to use\" panel with steps."),
+          tags$p("Explore gene expression two ways, using the sub tabs below. Both use the RNA assay and Normalized (log) values. Each sub tab has its own \"How to use\" panel with steps."),
           tags$ul(
             tags$li("Per-gene maps: one UMAP per gene, coloured by expression."),
             tags$li("Aggregated (pseudobulk): the selected genes summarised per group as a heatmap and table."))),
@@ -1031,7 +1003,7 @@ server <- function(input, output, session) {
               tags$ol(
                 tags$li("Type gene symbols in the \"Gene(s):\" box."),
                 tags$li("Set \"Plots per row\" and \"Color scale\" (same scale for all genes to compare, or adjusted per gene)."),
-                tags$li("Save a panel with its PNG button, or all panels with \"Download all as one PNG\"."))),
+                tags$li("To save: use a panel’s toolbar (camera icon), or \"Download all as one PNG\" for the whole grid."))),
         wellPanel(
           fluidRow(
             column(4, selectInput("gene_sort", "Sort genes by:", width = "100%",
@@ -1059,7 +1031,7 @@ server <- function(input, output, session) {
                 tags$li("Pick the \"Aggregate by\" column (the groups)."),
                 tags$li("Type genes in the \"Gene(s):\" box."),
                 tags$li("Choose the \"Summary per group\" (mean, sum, or median)."),
-                tags$li("Save the heatmap with the PNG button, or the table with \"Download Excel\"."))),
+                tags$li("Save the heatmap with its toolbar (camera icon), or the table with \"Download Excel\"."))),
             wellPanel(
               fluidRow(
                 column(3, selectInput("agg_group_var", "Aggregate by:", choices = grouping_choices, width = "100%")),
@@ -1111,8 +1083,8 @@ server <- function(input, output, session) {
           tags$p("Finds genes that mark one group versus all other cells, computed live from the object. Uses the RNA assay, Normalized (log) values, and the Wilcoxon test."),
           tags$ol(
             tags$li("Pick the \"Grouping column\" and the group whose markers you want."),
-            tags$li("Click \"Compute markers\". It is heavy on large objects, so it does not run automatically."),
-            tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
+            tags$li("Click \"Compute\" (It may be heavy on large objects, so it does not run automatically)"),
+            tags$li("Type in the table's search box to filter; \"Download Excel\" exports the whole table"))),
         wellPanel(
           fluidRow(
             column(2, selectInput("gmarker_group", "Grouping column:", choices = grouping_choices, width = "100%")),
@@ -1135,14 +1107,16 @@ server <- function(input, output, session) {
     tabs <- c(tabs, list(tabPanel(
       "Marker Plot",
       help_details(
-        tags$p("Compares chosen genes across groups, as a dot plot or violins. Dot plot: dot size is the percent of cells in the group expressing the gene, colour is mean expression z scored per gene. Violin: the expression distribution per group, one row per gene. Uses the RNA assay and Normalized (log) values."),
+        tags$p("Compares chosen genes across groups, as a dot plot or violins. Uses the RNA assay and Normalized (log) values."),
         tags$ol(
-          tags$li("Choose a \"Plot type\": dot plot or violin."),
+          tags$li("Choose a \"Plot type\":",
+            tags$ul(
+              tags$li("Dot plot: dot size is the percent of cells in the group expressing the gene, colour is mean expression z scored per gene. Choose genes manually, or pick \"Top markers per group (auto)\", then click \"Compute\" (Wilcoxon)."),
+              tags$li("Violin: the expression distribution per group, one row per gene. Type the genes, then click \"Compute\"."))),
           tags$li("Pick the \"Group by\" column."),
-          tags$li("Dot plot: choose genes manually, or pick \"Top markers per group (auto)\" and click \"Compute markers\" (Wilcoxon). Violin: type the genes, then click \"Compute violins\"."),
-          tags$li("Use the PNG button to save the plot."))),
+          tags$li("Hover the plot for its toolbar (the camera icon saves a PNG)."))),
       wellPanel(
-        # Plot type is the FIRST thing to choose; everything below adapts to it.
+        # Plot type is the first thing to choose; everything below adapts to it.
         fluidRow(
           column(12, radioButtons("marker_plot_type", "Plot type:", inline = TRUE,
                                   choices = c("Dot plot" = "dot", "Violin" = "violin"), selected = "dot"))
@@ -1158,8 +1132,8 @@ server <- function(input, output, session) {
                                     choices = c("Top markers per group (auto)" = "auto",
                                                 "Choose manually" = "manual"), selected = "auto"))
           ),
-          # AUTO: find each group's top markers (gated behind a button -- it computes
-          # markers for EVERY group).
+          # auto: find each group's top markers (gated behind a button -- it computes
+          # markers for every group).
           conditionalPanel(
             condition = "input.dot_gene_mode == 'auto'",
             fluidRow(
@@ -1169,7 +1143,7 @@ server <- function(input, output, session) {
                                          style = "background-color: #fafafa; color: #000000; border: 3px solid #39FF14; font-weight: 600;")))
             )
           ),
-          # MANUAL: pick genes yourself (e.g. from the Cluster Markers table).
+          # manual: pick genes yourself (e.g. from the Cluster Markers table).
           conditionalPanel(
             condition = "input.dot_gene_mode == 'manual'",
             fluidRow(
@@ -1233,13 +1207,13 @@ server <- function(input, output, session) {
       tabs <- c(tabs, list(tabPanel(
         "Differential expression",
         help_details(
-          tags$p("Finds genes that differ between two groups you choose (target A versus reference B), for example one condition versus another. Unlike cluster markers (a group versus everyone else), this is one group versus one specific other group."),
+          tags$p("Finds genes that differ between two groups you choose (target A vs. reference B), for example one condition versus another. Unlike cluster markers (a group versus everyone else), this is one group versus one specific other group."),
           tags$ol(
-            tags$li("Choose a \"Method\": \"Per cell test\" is fast and exploratory; \"Pseudobulk DESeq2\" is recommended for comparing conditions across samples, because per cell tests inflate false positives there."),
+            tags$li("Choose a \"Method\": \"Per cell test\" is fast and exploratory; \"Pseudobulk DESeq2\" is recommended for comparing conditions across samples, because per cell tests may inflate false positives there."),
             tags$li("Pick the \"Grouping column\" that holds your two groups, then the target group (A) and the reference group (B)."),
-            tags$li("Per cell test uses the RNA assay, Normalized (log) values, and the Wilcoxon test. Pseudobulk: set the \"Sample / replicate column\" (it needs at least two samples per group), and optionally \"Restrict to\" one cell type; it sums raw RNA counts and runs DESeq2."),
-            tags$li("Click \"Compute contrast\" (or \"Compute pseudobulk DE\"). It does not run automatically."),
-            tags$li("Type in the table's search box to filter; \"Download Excel\" exports every row."))),
+            tags$li("Per cell test uses the RNA assay, Normalized (log) values, and the Wilcoxon test. Pseudobulk: set the \"Sample / replicate column\" (it needs at least two samples per group), and optionally tick \"Restrict to a subset\" to limit to one cell type or cluster; it sums raw RNA counts and runs DESeq2."),
+            tags$li("Click \"Compute\""),
+            tags$li("Type in the table's search box to filter; \"Download Excel\" to download the whole table"))),
         wellPanel(
           fluidRow(column(12, radioButtons("gcontrast_method", "Method:", inline = TRUE,
                                   choices = c("Per-cell test" = "percell",
@@ -1297,13 +1271,12 @@ server <- function(input, output, session) {
     do.call(tabsetPanel, tabs)
   })
 
-  # Which metadata column the Clusters/Metadata UMAP is coloured by. TWO controls
-  # can drive it and they hold DIFFERENT columns: "Color UMAP by" (non-clustering
+  # Which metadata column the Clusters/Metadata UMAP is coloured by. Two controls
+  # can drive it and they hold different columns: "Color UMAP by" (non-clustering
   # columns only) and the "Resolution / clustering" quick-pick (clustering columns
   # only). We colour by whichever the user changed most recently -- so clusterings
-  # appear ONLY in the Resolution picker, never duplicated in "Color UMAP by".
-  # The active colour column for the Clusters/Metadata UMAP (clusterings now live
-  # in "Color UMAP by" too, so there's no separate Resolution picker to sync with).
+  # appear only in the Resolution picker, never duplicated in "Color UMAP by".
+  # The active colour column for the Clusters/Metadata UMAP
   active_group <- reactive({
     req(input$group_var)
     input$group_var
@@ -1339,12 +1312,12 @@ server <- function(input, output, session) {
 
   # Turn a metadata column into categories for colouring. Categorical columns
   # (factor/character/logical, low-cardinality numeric) are used as-is; a
-  # CONTINUOUS numeric (>50 distinct values) is split into quantile RANGES so it
+  # continuous numeric (>50 distinct values) is split into quantile ranges so it
   # can be shown categorically (one colour per range) instead of per value.
   # Returns the per-cell values, the ordered level list (present levels only,
   # NA last), and whether it was binned.
   # TWEAK: change `length.out = 7` for a different number of ranges (6 here).
-  # A metadata column is treated as CONTINUOUS (coloured by a gradient) when its
+  # A metadata column is treated as continuous (coloured by a gradient) when its
   # values are numeric -- including numbers stored as character/factor, e.g.
   # prediction scores. Otherwise it's categorical (discrete colours + checkboxes).
   #   * clustering columns          -> always categorical
@@ -1362,8 +1335,8 @@ server <- function(input, output, session) {
     any(u != round(u)) || length(u) > 50                 # decimals, or many integers
   }
 
-  # Base data for the UMAP, in a fixed (seeded) random point order. Depends ONLY
-  # on the object + colouring column - NOT on which categories are ticked - so
+  # Base data for the UMAP, in a fixed (seeded) random point order. Depends only
+  # on the object + colouring column - not on which categories are ticked - so
   # that toggling categories doesn't rebuild it (the observer below just
   # recolours the existing plot in place). Branches on continuous vs categorical.
   umap_base <- reactive({
@@ -1406,65 +1379,6 @@ server <- function(input, output, session) {
     list(points = col, legend = disp)
   }
 
-  # Axis range / tick step / labels for an arbitrary embedding matrix (used by the
-  # compare view, which frames each reduction on its own scale).
-  red_frame <- function(emb) {
-    r <- range(emb[, 1:2], na.rm = TRUE); pad <- diff(r) * 0.03
-    rng <- c(r[1] - pad, r[2] + pad)
-    raw <- diff(rng) / 6; mag <- 10^floor(log10(raw)); nice <- c(1, 2, 2.5, 5, 10)
-    cn <- colnames(emb)
-    list(rng = rng, dtick = mag * nice[which.min(abs(nice - raw / mag))],
-         xlab = if (length(cn) >= 2) cn[1] else "Dim 1",
-         ylab = if (length(cn) >= 2) cn[2] else "Dim 2")
-  }
-  red_label <- function(r) if (tolower(r) %in% c("umap", "tsne", "pca")) toupper(r) else r
-
-  # Build a full UMAP plotly from a base (colouring) + a frame -- used by the
-  # side-by-side compare view. (The MAIN single plot has its own render with the
-  # restyle optimisation; this one just re-renders, which is fine for a 2-up view.)
-  build_umap_plot <- function(base, cats_shown, fr, title) {
-    df <- base$df
-    if (isTRUE(base$continuous)) {
-      full <- range(df$value, na.rm = TRUE)
-      lo <- if (is.null(input$cont_min) || is.na(input$cont_min)) full[1] else input$cont_min
-      hi <- if (is.null(input$cont_max) || is.na(input$cont_max)) full[2] else input$cont_max
-      in_rng <- !is.na(df$value) & df$value >= lo & df$value <= hi
-      out_df <- df[!in_rng, ]; in_df <- df[in_rng, ]
-      p <- plot_ly()
-      if (nrow(out_df) > 0)
-        p <- add_trace(p, data = out_df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
-                       marker = list(size = 3, color = "#E8E8E8"), text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
-      if (nrow(in_df) > 0)
-        p <- add_trace(p, data = in_df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
-                       marker = list(size = 4, color = ~value, colorscale = "Viridis", cmin = full[1], cmax = full[2],
-                                     colorbar = list(thickness = 12, len = 0.5, outlinewidth = 0,
-                                                     x = 1.02, xanchor = "left", y = 0.5, yanchor = "middle")),
-                       text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
-      showlg <- FALSE; lg <- NULL
-    } else {
-      cols <- umap_point_cols(base, cats_shown); df$col <- cols$points
-      p <- plot_ly(df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
-                   marker = list(size = 4, color = ~col), text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
-      for (cat in sort_levels(df$group)) {
-        idx <- which(df$group == cat)[1]
-        p <- add_trace(p, x = df$UMAP_1[idx], y = df$UMAP_2[idx], type = "scatter", mode = "markers",
-                       marker = list(size = 0.1, color = cols$legend[[cat]]), name = cat,
-                       showlegend = TRUE, hoverinfo = "skip", inherit = FALSE)
-      }
-      showlg <- TRUE; lg <- list(itemsizing = "constant", y = 0.5, yanchor = "middle")
-    }
-    p %>% plotly::layout(
-      hovermode = "closest",
-      title = list(text = title, x = 0, xref = "paper", xanchor = "left",
-                   font = list(size = 14, family = "Open Sans, verdana, arial, sans-serif")),
-      xaxis = list(title = fr$xlab, zeroline = FALSE, range = fr$rng, tick0 = 0, dtick = fr$dtick,
-                   constrain = "domain", constraintoward = "center"),
-      yaxis = list(title = fr$ylab, zeroline = FALSE, scaleanchor = "x", scaleratio = 1, tick0 = 0, dtick = fr$dtick,
-                   constrain = "domain", constraintoward = "middle", range = fr$rng),
-      showlegend = showlg, legend = lg, margin = list(l = 46, r = 10, t = 36, b = 40)
-    ) %>% plotly::config(displaylogo = FALSE)
-  }
-
   output$umap_plot <- renderPlotly({
     base <- umap_base()
     df <- base$df
@@ -1492,7 +1406,7 @@ server <- function(input, output, session) {
                        type = "scattergl", mode = "markers",
                        marker = list(size = 4, color = ~value, colorscale = "Viridis",
                                      cmin = full[1], cmax = full[2],
-                                     # Title on the SIDE (vertical, along the bar)
+                                     # Title on the side (vertical, along the bar)
                                      colorbar = list(title = list(text = pretty_label(gv), side = "right"),
                                                      thickness = 15, len = 0.5, outlinewidth = 0,
                                                      x = 1.02, xanchor = "left", y = 0.5, yanchor = "middle")),
@@ -1511,18 +1425,18 @@ server <- function(input, output, session) {
                      constrain = "domain", constraintoward = "middle", range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 40)
       )
-      return(plotly::config(p, displaylogo = FALSE))
+      return(plotly::config(p, displaylogo = FALSE, toImageButtonOptions = list(filename = safe_fname(paste0(embedding_label(), "_", pretty_label(gv))))))
     }
 
     # ---- Categorical column: discrete colours + toggleable legend (below). ----
-    # Initial colours reflect the current selection but without a reactive
-    # dependency on it (isolate) - the observer below updates them in place.
+    # Start from the current show/hide selection, but do not re-run this whole plot
+    # when it changes - a small watcher below just recolours the points instead.
     cols <- umap_point_cols(base, isolate(input$categories_shown))
     df$col <- cols$points
 
-    # A SINGLE marker trace (index 0) holds every point, so toggling a category
-    # is just a colour restyle - the plot never reloads. (plotly's `color=`
-    # would split into one trace per category and stack them, hiding one.)
+    # All points live in one layer, so hiding/showing a category just recolours it
+    # (the plot never reloads). Colouring by group instead would split the points
+    # into separate layers that stack on top of and hide each other.
     p <- plot_ly(
       df, x = ~UMAP_1, y = ~UMAP_2,
       type = "scattergl", mode = "markers",
@@ -1557,10 +1471,10 @@ server <- function(input, output, session) {
                     y = 0.5, yanchor = "middle"),
       margin = list(l = 50, r = 10, t = 40, b = 40)
     )
-    plotly::config(p, displaylogo = FALSE)
+    plotly::config(p, displaylogo = FALSE, toImageButtonOptions = list(filename = safe_fname(paste0(embedding_label(), "_", pretty_label(gv)))))
   })
 
-  # Toggling a category recolours the EXISTING plot via plotly restyle
+  # Toggling a category recolours the existing plot in place (fast; not redrawn)
   observeEvent(input$categories_shown, {
     req(active_group())
     base <- umap_base()
@@ -1589,8 +1503,8 @@ server <- function(input, output, session) {
     sort_levels(unique(v))
   })
 
-  # A "groups to show" picker (starts EMPTY): rendering every panel at once is a
-  # WebGL overload that freezes the tab, so the user opts into the groups to draw.
+  # A "groups to show" picker: drawing a panel for every group at once
+  # can overload the browser and freeze the tab, so the user picks which groups to show.
   output$umap_split_levels_ui <- renderUI({
     req(input$split_by, nzchar(input$split_by))
     selectizeInput("umap_split_show", "Groups to show:", choices = umap_split_all_levels(),
@@ -1633,7 +1547,7 @@ server <- function(input, output, session) {
     } else {
       # Category colours reflect the current show/hide selection (read once; split
       # panels don't live-restyle, so no reactive dependency on the checkboxes). No
-      # per-panel legend -- the grid shows ONE shared legend so the map fills the square.
+      # per-panel legend -- the grid shows one shared legend so the map fills the square.
       cols <- umap_point_cols(base, isolate(input$categories_shown))
       sub <- df[ing, ]; sub$col <- cols$points[ing]
       if (nrow(sub) > 0)
@@ -1650,16 +1564,16 @@ server <- function(input, output, session) {
       yaxis = list(title = axis_labels()[2], zeroline = FALSE, scaleanchor = "x", scaleratio = 1, tick0 = 0, dtick = umap_dtick(),
                    constrain = "domain", constraintoward = "middle", range = umap_range()),
       showlegend = showlg, legend = lg, margin = list(l = 44, r = 10, t = 34, b = 38)
-    ) %>% plotly::config(displaylogo = FALSE)
+    ) %>% plotly::config(displaylogo = FALSE, toImageButtonOptions = list(filename = safe_fname(paste0(embedding_label(), "_", pretty_label(input$split_by), "_", level))))
   }
 
   output$umap_split_grid <- renderUI({
     req(input$split_by, nzchar(input$split_by))
     levs <- umap_split_sel()
-    validate(need(length(levs) >= 1, "Pick one or more groups in \"Groups to show\" (in the sidebar)."))
+    req(length(levs) >= 1)   # blank until groups are picked
     validate(need(length(levs) <= umap_split_max,
                   paste0("Showing at most ", umap_split_max, " panels at once; pick fewer groups.")))
-    # Every panel is the SAME fixed size as the single (non-split) plot. Panels sit
+    # Every panel is the same fixed size as the single (non-split) plot. Panels sit
     # side by side and wrap to the next row when they don't fit, instead of shrinking.
     cells <- lapply(seq_along(levs), function(i) {
       id <- paste0("umap_split_", i)
@@ -1667,7 +1581,7 @@ server <- function(input, output, session) {
           plot_dl_btn(id, paste0("UMAP_", levs[i])),
           withSpinner(plotlyOutput(id, width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14"))
     })
-    # grid does NOT grow (flex:0 1 auto), so the shared legend sits snug on its right
+    # grid does not grow (flex:0 1 auto), so the shared legend sits snug on its right
     # instead of being pushed to the far edge. Panels wrap when they don't fit.
     grid <- div(style = "display:flex; flex-wrap:wrap; justify-content:center; gap:16px; flex:0 1 auto; min-width:0;", cells)
     # "Download all as one PNG" (composites the panels), shown when >1 panel.
@@ -1703,12 +1617,12 @@ server <- function(input, output, session) {
     })
   })
 
-  # Max Gene Expression panels drawn at once. Each gene is a full-resolution WebGL
-  # UMAP, and browsers cap live WebGL contexts (~8-16) TWEAK: raise cautiously.
+  # Most gene panels drawn at once. Each gene is a full interactive UMAP, and browsers
+  # can only show a limited number at once before slowing down. TWEAK: raise cautiously.
   feature_max_panels <- 12
 
   # ---- Square grid for Gene Expression ----
-  # Each plot is a square whose side is the SMALLER of the width available per
+  # Each plot is a square whose side is the smaller of the width available per
   # column and the height available per row (viewport-aware). Using the same
   # value for the column and row tracks makes every cell a true square (so
   # plotly's equal-scale axes render correctly, single plot included), and the
@@ -1716,22 +1630,15 @@ server <- function(input, output, session) {
   output$dynamic_feature_plots <- renderUI({
     specs <- plot_specs()
     n <- length(specs)
-    if (n == 0) {
-      # In "layers" mode a gene may be chosen but no layer ticked yet -> nudge
-      if (identical(input$compare_mode, "layers") && length(found_genes()) > 0)
-        return(helpText("Tick one or more layers under \"Layers to show\" to display them."))
-      return(NULL)
-    }
-    # Refuse to draw more than feature_max_panels WebGL UMAPs at once - past the
-    # browser's live-context ceiling the tab freezes (same guard Split by Group uses).
+    if (n == 0) return(NULL)
+    # Refuse to draw more than feature_max_panels interactive UMAPs at once - beyond
+    # what the browser can show, the tab freezes (the Split by group view has the same cap).
     validate(need(n <= feature_max_panels,
                   sprintf("That would draw %d plots at once (max %d), which can freeze the browser. Select fewer genes.",
                           n, feature_max_panels)))
 
-    # "layers" mode = one gene per layer, each with its own scale, so no single
-    # shared colorbar. Otherwise the shared colorbar shows in "same scale" mode.
-    layers_mode <- identical(input$compare_mode, "layers")
-    shared <- !layers_mode && identical(input$scale_mode, "shared")
+    # In "same scale" mode the panels share one colorbar shown to the right of the grid.
+    shared <- identical(input$scale_mode, "shared")
     ncol <- max(1, min(input$feature_ncol, n))
     nrow <- ceiling(n / ncol)
 
@@ -1741,7 +1648,7 @@ server <- function(input, output, session) {
     # plots use nearly the full page width - small side_offset.)
     #
     # The size is driven by the width available per column and CAPPED to one
-    # viewport height - it does NOT depend on the number of rows, so each plot
+    # viewport height - it does not depend on the number of rows, so each plot
     # keeps the same size no matter how many genes are added; the extra rows
     # simply extend the page and it scrolls down.
     gap <- 10
@@ -1772,14 +1679,14 @@ server <- function(input, output, session) {
 
     # In shared mode each plot's own colorbar is hidden; show one to the right.
     # Its column stretches to the full grid height and a one-cell-tall colorbar
-    # is centred in it, so the scale sits in the vertical middle of ALL the
+    # is centred in it, so the scale sits in the vertical middle of all the
     # plots no matter how many genes are added.
     body <- if (shared) {
       div(style = "display: flex; align-items: stretch; justify-content: center; gap: 15px;",
           grid_div,
           # Column stretches to full grid height; inner box is one cell tall and
           # centred, so the colorbar sits in the vertical middle of all plots.
-          # (height is set on this div's style, NOT on plotlyOutput, because the
+          # (height is set on this div's style, not on plotlyOutput, because the
           # output's height param rejects a min()/calc() expression.)
           div(style = paste0("width: ", cb_width, "px; display: flex; align-items: center; justify-content: center;"),
               div(style = paste0("width: 100%; height: ", cell, ";"),
@@ -1804,7 +1711,7 @@ server <- function(input, output, session) {
   output$shared_colorbar <- renderPlotly({
     req(identical(input$scale_mode, "shared"))
     lims <- shared_limits()
-    lab <- switch(feature_layer(), counts = "Counts", scale.data = "Scaled (z)", "Expression")
+    lab <- "Expression"                                    # layer is fixed to Normalized (log)
     plot_ly(
       x = c(0, 0), y = c(0, 1),
       type = "scatter", mode = "markers",
@@ -1829,7 +1736,7 @@ server <- function(input, output, session) {
         paper_bgcolor = "rgba(0,0,0,0)",
         plot_bgcolor = "rgba(0,0,0,0)"
       ) %>%
-      plotly::config(displaylogo = FALSE)
+      plotly::config(displaylogo = FALSE, toImageButtonOptions = list(filename = "expression_colorbar"))
   })
 
   # ---------------------------------------------------------------------------
@@ -1840,43 +1747,19 @@ server <- function(input, output, session) {
   # ---------------------------------------------------------------------------
   max_plots <- 50
 
-  # Assay layers present, in an order: data, counts, scale.data
-  # Now respects the Gene Expression assay selector.
-  available_layers <- reactive({
-    assay_use <- feature_assay_val()
-    al <- tryCatch(SeuratObject::Layers(seu()[[assay_use]]), error = function(e) NULL)
-    if (is.null(al) || length(al) == 0) al <- "data"
-    lo <- intersect(c("data", "counts", "scale.data"), al)
-    if (length(lo) == 0) lo <- al[1]
-    lo
-  })
-
-  # What each plot slot should show: a list of {gene, layer, title}.
-  #  * "genes" mode  -> one plot per selected gene, all in the chosen layer.
-  #  * "layers" mode -> one plot per CHOSEN layer (via "Layers to show"), of the
-  #    FIRST gene. Defaults to all available layers until the user narrows it.
+  # What each plot slot shows: a list of {gene, layer, title}, one plot per selected
+  # gene (all in the Normalized (log) layer). The title (e.g. "Malat1 · Normalized
+  # (log)") names the panel and its downloaded PNG.
   plot_specs <- reactive({
     fg <- found_genes()
     req(length(fg) > 0)
-    if (identical(input$compare_mode, "layers")) {
-      g <- fg[[1]]
-      avail <- available_layers()
-      # Only the layers the user ticked, in preferred order (data, counts,
-      # scale.data). Nothing ticked -> nothing rendered
-      keep <- avail[avail %in% input$feature_layers_show]
-      lapply(keep, function(L)
-        list(gene = g, layer = L, title = paste0(g, " · ", layer_label(L))))
-    } else {
-      layer <- feature_layer()
-      # Title shows the gene and the data layer, so a downloaded panel is self-
-      # describing (e.g. "Malat1 · Normalized (log)")
-      lapply(fg, function(g) list(gene = g, layer = layer,
-                                  title = paste0(g, " · ", layer_label(layer))))
-    }
+    layer <- feature_layer()
+    lapply(fg, function(g) list(gene = g, layer = layer,
+                                title = paste0(g, " · ", layer_label(layer))))
   })
 
   # One value-stable reactive per plot slot (adding a gene only invalidates the
-  # NEW slot - existing slots return the same spec, so their render is cached).
+  # new slot - existing slots return the same spec, so their render is cached).
   slot_spec <- lapply(1:max_plots, function(i) {
     force(i)
     reactive({
@@ -1893,7 +1776,7 @@ server <- function(input, output, session) {
       g <- spec$gene; layer <- spec$layer
 
       umap_coords <- umap_emb()
-      # RAW values of the slot's layer (counts / data / scale.data) - no z-scoring,
+      # raw values of the slot's layer (counts / data / scale.data) - no z-scoring,
       # so you literally see the layer's values (e.g. before vs after normalization).
       assay_use <- feature_assay_val()
       lmat <- GetAssayData(seu(), layer = layer, assay = assay_use)
@@ -1906,12 +1789,10 @@ server <- function(input, output, session) {
         check.names = FALSE
       )
 
-      # Colour limits. In "layers" mode each panel is a DIFFERENT layer (different
-      # scale), so every panel gets its own scale + colorbar. Otherwise: shared
-      # across genes (one colorbar) or per-gene. expr_limits() = 0..max, or a
-      # symmetric range for scale.data (which has negatives).
-      layers_mode <- identical(input$compare_mode, "layers")
-      if (!layers_mode && identical(input$scale_mode, "shared")) {
+      # Colour limits: in "same scale" mode all panels share one range and one
+      # colorbar (shown to the side); otherwise each panel gets its own. expr_limits()
+      # is 0..max (or symmetric around 0 for scaled values, which can be negative).
+      if (identical(input$scale_mode, "shared")) {
         lims <- shared_limits(); show_bar <- FALSE
       } else {
         lims <- expr_limits(plot_df$expression); show_bar <- TRUE
@@ -1919,7 +1800,7 @@ server <- function(input, output, session) {
 
       # Draw low-value points first so high-value ones sit on top.
       plot_df <- plot_df[order(plot_df$expression), ]
-      lab <- switch(layer, counts = "Counts", scale.data = "Scaled (z)", "Expression")
+      lab <- "Expression"                                  # layer is fixed to Normalized (log)
 
       # Hover reads the value straight from marker.color (the expression already
       # sent to plotly) via hovertemplate - so we don't ship a second ~19k-element
@@ -1951,7 +1832,7 @@ server <- function(input, output, session) {
                      range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 30)
       )
-      plotly::config(p, displaylogo = FALSE)
+      plotly::config(p, displaylogo = FALSE, toImageButtonOptions = list(filename = safe_fname(paste0("expression_", g))))
     })
   })
 
@@ -1968,10 +1849,10 @@ server <- function(input, output, session) {
   agg_layer <- make_layer_val("agg_layer")
 
   # agg_matrix(): the genes x group-levels matrix of aggregated expression, using
-  # the RAW values of the chosen assay/layer (no app-side z-scoring).
+  # the raw values of the chosen assay/layer (no app-side z-scoring).
   agg_matrix <- reactive({
     req(input$agg_group_var)
-    validate(need(length(input$agg_genes) > 0, "Select one or more genes to aggregate."))
+    req(length(input$agg_genes) > 0)   # blank until genes are picked
     assay_use <- agg_assay_val()
     layer_use <- agg_layer()
     full <- GetAssayData(seu(), layer = layer_use, assay = assay_use)   # genes x cells
@@ -2012,7 +1893,7 @@ server <- function(input, output, session) {
   # Gene Expression plots. Colour scale auto-fits the aggregated values.
   output$agg_heatmap <- renderPlotly({
     mat <- agg_matrix()
-    # Fix the colour range to the RAW aggregated values: 0..max for non-negative
+    # Fix the colour range to the raw aggregated values: 0..max for non-negative
     # layers (counts / data), symmetric about 0 for scale.data so 0 reads white.
     lims <- expr_limits(as.vector(mat))
     plot_ly(
@@ -2035,7 +1916,7 @@ server <- function(input, output, session) {
         yaxis = list(title = "Gene", autorange = "reversed"),   # first gene on top
         margin = list(l = 90, r = 10, t = 40, b = 100)
       ) %>%
-      plotly::config(displaylogo = FALSE)
+      plotly::config(displaylogo = FALSE, toImageButtonOptions = list(filename = "aggregated_expression"))
   })
 
   # Table: same matrix as a data frame (Gene column + one column per group level).
@@ -2044,7 +1925,7 @@ server <- function(input, output, session) {
     df <- data.frame(Gene = rownames(mat), round(mat, 3),
                      check.names = FALSE, row.names = NULL)
     dt_with_excel(df, "aggregated_expression")
-  }, server = FALSE)   # Excel button exports ALL rows, not just the current page
+  }, server = FALSE)   # Excel button exports all rows, not just the current page
 
   # ===========================================================================
   # Marker Plot tab: a dot plot of selected genes x a grouping column.
@@ -2062,22 +1943,22 @@ server <- function(input, output, session) {
                          choices = ordered_gene_choices(input$dot_gene_sort), server = TRUE)
   })
 
-  # AUTO mode: FindAllMarkers on the grouping column (each group vs the rest),
-  # computed only when "Compute markers" is clicked (it's heavier than the
+  # auto mode: FindAllMarkers on the grouping column (each group vs the rest),
+  # computed only when "Compute" is clicked (it's heavier than the
   # single-group Cluster Markers tab). Returns the raw results table (or an error :).
   dot_auto <- eventReactive(input$dot_compute, {
     req(input$dot_group_var)
-    grp <- input$dot_group_var; assay_use <- dot_assay_val(); test <- "wilcox"
+    grp <- input$dot_group_var; assay_use <- dot_assay_val()
     obj <- prepare_obj_for_de(seu(), assay_use)
     Seurat::Idents(obj) <- grp                         # use the grouping column as identities
     res <- tryCatch(
       suppressWarnings(Seurat::FindAllMarkers(
-        obj, only.pos = TRUE, test.use = test, assay = assay_use,
+        obj, only.pos = TRUE, test.use = "wilcox", assay = assay_use,
         min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE)),   # drop sparse / low-FC genes
       error = function(e) e
     )
     # Remember what this was computed for, so we can detect stale results below.
-    list(res = res, group = grp, assay = assay_use, test = test)
+    list(res = res, group = grp, assay = assay_use)
   })
 
   # The genes to plot: the manual picker, or the top-N markers per group from the
@@ -2090,20 +1971,19 @@ server <- function(input, output, session) {
       # the previous grouping's genes.
       validate(need(!is.null(a) &&
                     identical(a$group, input$dot_group_var) &&
-                    identical(a$assay, dot_assay_val()) &&
-                    identical(a$test, "wilcox"),
-                    "Click 'Compute markers' to find the top markers for the current grouping."))
+                    identical(a$assay, dot_assay_val()),
+                    "Click 'Compute' to find the top markers for the current grouping."))
       res <- a$res
       validate(need(!inherits(res, "error"),
                     paste("Could not compute markers:",
                           if (inherits(res, "error")) conditionMessage(res) else "")))
       validate(need(is.data.frame(res) && nrow(res) > 0, "No markers found for this grouping."))
       n <- if (is.null(input$dot_top_n) || is.na(input$dot_top_n)) 3 else input$dot_top_n
-      # Keep significant markers (when the test gives a p-value; ROC doesn't), so
-      # the top-N are real cluster markers, not high-FC-but-sparse junk genes.
+      # Keep significant markers (Wilcoxon adjusted p-value < 0.05), so the top-N
+      # are real cluster markers, not high-FC-but-sparse junk genes.
       if ("p_val_adj" %in% names(res)) res <- res[!is.na(res$p_val_adj) & res$p_val_adj < 0.05, ]
       validate(need(nrow(res) > 0,
-                    "No significant markers passed the filter. Try a different test or grouping."))
+                    "No significant markers passed the filter. Try a different grouping."))
       res <- res[order(res$cluster, -res$avg_log2FC), ]
       unique(unlist(by(res, res$cluster, function(d) head(d$gene, n))))   # top N per group, block-ordered
     } else {
@@ -2130,7 +2010,7 @@ server <- function(input, output, session) {
     req(input$dot_group_var)
     gsel <- dot_genes_final()
     validate(need(length(gsel) > 0,
-                  "Pick genes (manual mode) or click 'Compute markers' (auto mode)."))
+                  "Pick genes (manual mode) or click 'Compute' (auto mode)."))
     mm <- marker_gene_matrix(gsel)
     genes <- mm$genes; m <- mm$mat; grp <- mm$grp; groups <- mm$groups
 
@@ -2176,7 +2056,7 @@ server <- function(input, output, session) {
                      categoryorder = "array", categoryarray = rev(d$groups)),
         margin = list(l = 130, r = 10, t = 50, b = 120)
       ) %>%
-      plotly::config(displaylogo = FALSE)
+      plotly::config(displaylogo = FALSE, toImageButtonOptions = list(filename = "marker_dotplot"))
   })
 
   # ---- Marker Plot: Violin variant --------------------------------------------
@@ -2185,8 +2065,8 @@ server <- function(input, output, session) {
   })
 
   # Fill the violin gene picker with all genes (a searchable dropdown -- type to
-  # find any gene). Starts EMPTY so the user chooses which genes to show; keeps the
-  # user's own selection when it's already set (does NOT auto-fill any genes).
+  # find any gene). Starts empty so the user chooses which genes to show; keeps the
+  # user's own selection when it's already set (does not auto-fill any genes).
   observeEvent(list(seu(), input$marker_plot_type, input$violin_gene_sort), {
     req(seu(), identical(input$marker_plot_type, "violin"))
     sort_mode <- if (is.null(input$violin_gene_sort)) "Alphabetical" else input$violin_gene_sort
@@ -2199,12 +2079,10 @@ server <- function(input, output, session) {
 
   # One stacked row of violins per selected gene (x = group), sharing the group
   # axis. Cells are downsampled for responsiveness - a violin only needs the shape.
-  # Gated behind the "Compute violins" button: drawing violins with all points is
+  # Gated behind the "Compute" button: drawing violins with all points is
   # heavy, so it only renders on click (not on every gene change).
   violin_data <- eventReactive(input$violin_compute, {
-    req(input$dot_group_var)
-    validate(need(length(input$violin_genes) > 0,
-                  "Pick one or more genes above to show as violins."))
+    req(input$dot_group_var, length(input$violin_genes) > 0)   # blank until genes are picked
     mm <- marker_gene_matrix(head(input$violin_genes, 20))   # cap rows (stacked violins get tall)
     grp <- mm$grp
     keep <- seq_along(grp)
@@ -2251,7 +2129,7 @@ server <- function(input, output, session) {
                      x = 0, xref = "paper", xanchor = "left",
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
         margin = list(l = 90, r = 10, t = 50, b = 120)) %>%
-      plotly::config(displaylogo = FALSE)
+      plotly::config(displaylogo = FALSE, toImageButtonOptions = list(filename = "marker_violin"))
   })
 
   # ===========================================================================
@@ -2324,13 +2202,9 @@ server <- function(input, output, session) {
   # Format a FindMarkers() result for display: sort by adjusted p-value, prepend
   # a gene id column (+ a friendly label when rowData gives one), round numbers.
   format_generic_de <- function(df) {
-    # Sort by adjusted p-value when available; the ROC test has no p-value, so
-    # fall back to its "power" (higher = better).
-    if ("p_val_adj" %in% names(df)) {
-      df <- df[order(df$p_val_adj), , drop = FALSE]
-    } else if ("power" %in% names(df)) {
-      df <- df[order(df$power, decreasing = TRUE), , drop = FALSE]
-    }
+    # Markers use the Wilcoxon test, which gives an adjusted p-value: sort by it
+    # (most significant genes first).
+    if ("p_val_adj" %in% names(df)) df <- df[order(df$p_val_adj), , drop = FALSE]
     feat <- rownames(df)
     out <- data.frame(gene = feat, stringsAsFactors = FALSE, check.names = FALSE)
     lbl <- gene_lookup()$label[match(feat, gene_lookup()$value)]
@@ -2389,7 +2263,7 @@ server <- function(input, output, session) {
   # and data-layer selectors were removed. input$gmarker_layer / input$gcontrast_layer
   # are absent, so the slot logic below falls back to "data".
 
-  # Gated behind the "Compute markers" button. FindMarkers over the whole object
+  # Gated behind the "Compute" button. FindMarkers over the whole object
   # is heavy (seconds to minutes on large data) and Shiny is single-threaded, so
   # running it on every dropdown change would freeze the app.
   # eventReactive only recomputes on click; the result is stamped with the inputs
@@ -2401,26 +2275,17 @@ server <- function(input, output, session) {
 
     obj <- prepare_obj_for_de(seu(), assay_use)
 
-    # Use the user-chosen layer, falling back to auto-detection by test type.
-    slot <- if (!is.null(input$gmarker_layer) && nzchar(input$gmarker_layer)) {
-      input$gmarker_layer
-    } else if ("wilcox" %in% c("negbinom", "poisson", "DESeq2")) {
-      "counts"
-    } else {
-      "data"
-    }
+    # Markers run with the Wilcoxon test on the Normalized (log) values.
     res <- tryCatch(
-      # suppressWarnings: some tests (e.g. negbinom) emit one benign per-gene
-      # convergence warning each - hundreds of lines. Errors are still caught.
       suppressWarnings(
         Seurat::FindMarkers(obj, ident.1 = input$gmarker_cluster, group.by = input$gmarker_group,
-                            test.use = "wilcox", slot = slot, assay = assay_use)
+                            test.use = "wilcox", slot = "data", assay = assay_use)
       ),
       error = function(e) e
     )
     # Stamp what this was computed for, so an input change since can be detected.
     list(res = res, group = input$gmarker_group, cluster = input$gmarker_cluster,
-         assay = assay_use, layer = input$gmarker_layer, test = "wilcox")
+         assay = assay_use)
   })
 
   output$gmarker_table <- renderDT({
@@ -2430,10 +2295,8 @@ server <- function(input, output, session) {
     # If any changed since, ask for a recompute instead of showing mislabeled data.
     validate(need(identical(a$group, input$gmarker_group) &&
                   identical(a$cluster, input$gmarker_cluster) &&
-                  identical(a$assay, gmarker_assay_val()) &&
-                  identical(a$layer, input$gmarker_layer) &&
-                  identical(a$test, "wilcox"),
-                  "Inputs changed. Click 'Compute markers' to update the table."))
+                  identical(a$assay, gmarker_assay_val()),
+                  "Inputs changed. Click 'Compute' to update the table."))
     res <- a$res
     if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute markers:", conditionMessage(res))))
     out <- format_generic_de(res)
@@ -2455,7 +2318,7 @@ server <- function(input, output, session) {
 
   # Auto-computes whenever the groups or test change (cached until then, so the
   # search box only re-filters - no recompute).
-  # Gated behind the "Compute contrast" button (same reason as gmarker_res above:
+  # Gated behind the "Compute" button (same reason as gmarker_res above:
   # FindMarkers is heavy and Shiny is single-threaded). Only recomputes on click;
   # stamped with its inputs so the table can flag a stale selection.
   gcontrast_res <- eventReactive(input$gcontrast_compute, {
@@ -2466,27 +2329,17 @@ server <- function(input, output, session) {
 
     obj <- prepare_obj_for_de(seu(), assay_use)
 
-    # Use the user-chosen layer, falling back to auto-detection by test type.
-    slot <- if (!is.null(input$gcontrast_layer) && nzchar(input$gcontrast_layer)) {
-      input$gcontrast_layer
-    } else if ("wilcox" %in% c("negbinom", "poisson", "DESeq2")) {
-      "counts"
-    } else {
-      "data"
-    }
+    # The per-cell contrast runs with the Wilcoxon test on Normalized (log) values.
     res <- tryCatch(
-      # suppressWarnings: silence the benign per-gene convergence notes (e.g.
-      # negbinom's theta.ml "iteration limit reached"). Errors still caught.
       suppressWarnings(
         Seurat::FindMarkers(obj, ident.1 = input$gcontrast_target,
                             ident.2 = input$gcontrast_reference, group.by = input$gcontrast_group,
-                            test.use = "wilcox", slot = slot, assay = assay_use)
+                            test.use = "wilcox", slot = "data", assay = assay_use)
       ),
       error = function(e) e
     )
     list(res = res, group = input$gcontrast_group, target = input$gcontrast_target,
-         reference = input$gcontrast_reference, assay = assay_use,
-         layer = input$gcontrast_layer, test = "wilcox")
+         reference = input$gcontrast_reference, assay = assay_use)
   })
 
   output$gcontrast_table <- renderDT({
@@ -2495,10 +2348,8 @@ server <- function(input, output, session) {
     validate(need(identical(a$group, input$gcontrast_group) &&
                   identical(a$target, input$gcontrast_target) &&
                   identical(a$reference, input$gcontrast_reference) &&
-                  identical(a$assay, gcontrast_assay_val()) &&
-                  identical(a$layer, input$gcontrast_layer) &&
-                  identical(a$test, "wilcox"),
-                  "Inputs changed. Click 'Compute contrast' to update the table."))
+                  identical(a$assay, gcontrast_assay_val()),
+                  "Inputs changed. Click 'Compute' to update the table."))
     res <- a$res
     if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute contrast:", conditionMessage(res))))
     out <- format_generic_de(res)
@@ -2582,7 +2433,7 @@ server <- function(input, output, session) {
                   identical(a$reference, input$gcontrast_reference) &&
                   identical(a$sample, input$gcontrast_pb_sample) &&
                   identical(a$assay, gcontrast_assay_val()),
-                  "Inputs changed. Click 'Compute pseudobulk DE' to update the table."))
+                  "Inputs changed. Click 'Compute' to update the table."))
     res <- a$res
     if (inherits(res, "error")) validate(need(FALSE, paste("DESeq2 failed:", conditionMessage(res))))
     df <- data.frame(gene = rownames(res), res, row.names = NULL, check.names = FALSE)
