@@ -3,8 +3,7 @@
 **Interactive explorer for Seurat objects.**
 
 A Shiny app (`scExplorer`) that lets you upload any Seurat object `.rds` (or load
-a bundled example) and explore it in the browser - no coding required. Built to
-work with plain Seurat objects.
+a bundled example) and explore it in the browser.
 
 ## Documentation
 
@@ -13,32 +12,36 @@ option: what each control does, the information it gives, and what you'd use it 
 
 ## Features
 
-- **Clusters / Metadata** - UMAP coloured by any metadata column (clusters,
-  cell types, sample/batch, phase, QC scores...), with a resolution quick-pick,
-  per-category show/hide checkboxes, and a Min/Max filter for numeric columns.
-- **Gene Expression** - one UMAP per selected gene, with an **Assay** and
-  **Data layer** (raw counts / normalized / scaled) selector, a shared or
-  per-gene colour scale, and a "one gene across data layers" comparison mode.
-- **Cluster Markers** - searchable marker-gene tables for one group vs the rest;
-  precomputed (scdrake `@misc$cluster_markers`) or computed live from any object.
-- **Contrasts (DEA)** - searchable differential-expression tables between two
-  chosen groups; precomputed (`@misc$contrasts`) or computed live.
-- **Aggregated Expression** - a heatmap + table summarising selected genes
-  (Mean / Sum / Median) per level of a metadata column.
-- **Split by Group** - one gene shown as a separate expression UMAP per group
-  (optionally a two-way grid), on a shared scale.
-- **Downloads** - every plot exports to **PNG** (or all panels into one PNG), and
-  every table exports to **Excel** (`.xlsx`).
+The analysis is fixed to the **RNA assay**, **Normalized (log)** values and the
+**Wilcoxon** test (falling back to SCT / the object's default assay if RNA has no
+normalized layer).
+
+- **Clusters / Metadata** - a chosen reduction (`umap`, `pca`, ...) coloured by any
+  metadata column (clusters, cell types, sample/batch, phase, QC scores...), with
+  per-category show/hide checkboxes, a Min/Max filter for numeric columns, and an
+  optional **Split by group** view (one small-multiple panel per group).
+- **Gene Expression** - two sub-tabs: **Per-gene maps** (one UMAP per gene, on a
+  shared or per-gene colour scale) and **Aggregated (pseudobulk)** (a heatmap + table
+  summarising genes Mean / Sum / Median per group).
+- **Cluster Markers** - marker genes for one group vs the rest, computed live behind a
+  Compute button; searchable, exportable table.
+- **Marker Plot** - a dot plot (dot size = % of cells expressing, colour = z-scored
+  mean expression) or violins of chosen genes across a grouping column.
+- **Differential expression** - two chosen groups (target A vs reference B): a
+  **pseudobulk DESeq2** analysis (sums raw counts per sample - the recommended way,
+  and the default, for comparing conditions across samples) or a per-cell test.
+- **Downloads** - every plot has a toolbar (the camera icon saves a PNG), multi-panel
+  grids export all panels into one PNG, and every table exports to Excel (`.xlsx`).
 
 ## Installation
 
 ```r
 # install.packages("remotes")
-remotes::install_github("klazudiazz/scexplorer")
+remotes::install_github("klazudiazz/scExplorer")
 ```
 
 If the repository is **private**, pass a token:
-`remotes::install_github("klazudiazz/scexplorer", auth_token = "ghp_...")`.
+`remotes::install_github("klazudiazz/scExplorer", auth_token = "ghp_...")`.
 
 ## Usage
 
@@ -66,16 +69,27 @@ already running there. You can also disable the auto-open attempt with
 ## Dependencies
 
 Core packages used by the app: **shiny**, **Seurat**, **plotly**, **DT**,
-**shinycssloaders**.
+**shinycssloaders**. (Excel export is done in the browser by DT, so no extra Excel
+package is needed.)
 
-For the **Cluster Markers** / **Contrasts** tabs (differential expression via
-`Seurat::FindMarkers`), the app uses
-**[presto](https://github.com/immunogenomics/presto)** - Seurat picks it up
-automatically to make those tests substantially faster. Install it with:
+The **Differential expression** tab uses **pseudobulk DESeq2** by default, so
+**DESeq2** (Bioconductor) is required to run it:
 
 ```r
-remotes::install_github("immunogenomics/presto")
+# install.packages("BiocManager")
+BiocManager::install("DESeq2")
 ```
+
+Optional:
+
+- **Cluster Markers / Marker Plot / Differential expression (per-cell)** run
+  `Seurat::FindMarkers`. Installing
+  **[presto](https://github.com/immunogenomics/presto)** makes those tests
+  substantially faster (Seurat picks it up automatically):
+
+  ```r
+  remotes::install_github("immunogenomics/presto")
+  ```
 
 ## Preparing a Seurat object (e.g. from CellRanger)
 
@@ -105,16 +119,19 @@ Then upload `my_object.rds` in the app.
 
 ## What your Seurat object needs
 
-- A dimensionality reduction named **`umap`** (`Embeddings(obj, "umap")`).
-- One or more **`meta.data`** columns to colour/group by. The app automatically
-  offers suitable categorical columns (clusters, cell types, sample/batch...) and
-  numeric columns (shown as a gradient); very high-cardinality text columns
-  (e.g. cell barcodes) are excluded.
-- *(Optional)* `obj@misc$cluster_markers` / `obj@misc$contrasts` data frames
-  (scdrake format) enable the precomputed marker/contrast tables - otherwise those
-  tabs compute results live with `Seurat::FindMarkers`.
-- *(Optional)* `SYMBOL` / `ENSEMBL` columns in the assay's feature metadata for
-  nicer gene labels (falls back to the gene rowname otherwise).
+- At least one **dimensionality reduction** (`umap`, `tsne`, `pca`, ...). The
+  map-based views plot on it; if several are present a "Reduction" dropdown lets you
+  switch. A fresh object built straight from counts has none - run `RunPCA()` then
+  `RunUMAP()` first.
+- One or more **`meta.data`** columns to colour / group by. The app automatically
+  offers categorical columns (clusters, cell types, sample/batch...) and numeric
+  columns (shown as a gradient); very high-cardinality text columns (cell barcodes)
+  are excluded.
+- For gene expression and markers the app uses the **RNA** assay's **normalized
+  (`data`)** layer. If RNA has only `counts`, run `NormalizeData(obj, assay = "RNA")`;
+  otherwise the app falls back to the SCT / default assay.
+- *(Optional)* `SYMBOL` / `ENSEMBL` columns in the assay's feature metadata for nicer
+  gene labels (falls back to the gene rowname otherwise).
 
 ## Customising
 
@@ -126,7 +143,8 @@ colour gradient, table columns, and the example-data path.
 ## Notes
 
 - The bundled example lives at `inst/app/example_data/seurat_example.rds`
-  (small enough to commit). All other `.rds` files are git-ignored.
+  (~90 MB - GitHub accepts it but shows a large-file warning, and it is pulled on
+  every `install_github`). All other `.rds` files are git-ignored.
 - To regenerate the package help page after editing roxygen comments, run
   `devtools::document()`.
 
