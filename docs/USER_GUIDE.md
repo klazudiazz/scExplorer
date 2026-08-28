@@ -1,371 +1,431 @@
 # scExplorer - User Guide
 
-A walkthrough of every tab and every option in the app: what each control does,
-what information it gives you, and what you'd use it for. scExplorer is an
-upload-based browser app for exploring any Seurat object - no coding needed.
+scExplorer is an upload based browser app for exploring any Seurat object, no
+coding needed. This guide has two parts:
 
+- Part 1 - Documentation: a tour of every tab and control.
+- Part 2 - Use cases
 ---
 
-## Loading data (the "Get started" screen)
+# Part 1 - Documentation
 
-- Upload your own data → drag-and-drop or Browse a Seurat object saved as `.rds`.
-- Use example data → loads a small bundled demo object.
+## Loading data
 
-Once a valid Seurat object is read, the tabs appear. The uploader is only available
-*before* a dataset is loaded - to switch datasets, reload the page.
+On the start page a single card sits in the middle of the screen:
 
-### Summary cards
-Three cards summarise the object:
+- Upload your own data - drag and drop or Browse to, a Seurat object saved as a
+  `.rds` file.
+- Use example data - loads a small bundled demo object.
 
-| Card | What it shows |
-|---|---|
-| Cells | Number of cells (`ncol` of the object) |
-| Genes | Number of genes/features (`nrow`) |
-| Samples | Number of distinct samples/batches, detected from a sample/batch column (shows `-` if none found) |
 
-### Assays/layers strip
-Below the cards, a strip lists every assay and the layers it contains, e.g.:
+<p align="center">
+  <img src="images/01-start-page.png" width="620" alt="scExplorer start page">
+  <br><em>Figure 1. The start page: choose to upload a Seurat .rds or use the example data.</em>
+</p>
 
-> Assays/layers: RNA: `counts`  SCT: `counts` `data` `scale.data`  integrated: `data` `scale.data`
+### What the object needs
 
-This tells you at a glance which assays exist and which data layers are available in
-each - useful because the Assay/Data-layer menus throughout the app only offer what's
-actually present. (E.g. an RNA assay with only `counts` has never been normalized.)
+Any Seurat object works. Two things are required; everything else is optional.
 
----
+Required:
 
-## Downloading plots and tables (works on every tab)
+- A dimensionality reduction to plot on - a 2D embedding such as umap, tsne or pca
+  (or a foundation model embedding saved as a reduction). A fresh object built
+  straight from a count matrix has none yet, so run `RunPCA()` then `RunUMAP()` first.
+- Metadata columns to explore - cell type, condition, sample, clusters, numeric
+  scores. The more it has, the richer the colouring and grouping options.
 
-- Plots → PNG. Every plot has a ⬇ PNG button in its top-right corner. It saves
-  a static PNG named after the plot's on-screen title (e.g. `Malat1_·_Normalized_log.png`),
-  so files are self-describing.
-- Download all as one PNG. When a tab shows more than one panel (Gene Expression,
-  Split by Group), a ⬇ Download all as one PNG button appears above the grid. It
-  composites every panel (plus the shared colorbar) into a single image.
-- Tables → Excel. Every table (Cluster Markers, Contrasts, Aggregated) has a
-  Download Excel button that saves the entire table (all rows, respecting any
-  search filter) as an `.xlsx` - opens in Excel, LibreOffice, or Google Sheets.
+Optional:
 
----
+- Extra assays and layers - detected automatically; the app uses RNA / Normalized
+  (see the next section).
+- Precomputed marker or contrast tables - not needed. Markers and differential
+  expression are always computed live in the app.
 
-## Two concepts used across many tabs
+If your object has no reduction yet, run the standard Seurat pipeline once in R and
+save the result, then upload that `.rds`:
 
-In one line: the Assay is WHICH data, the Data layer is HOW it is transformed. They
-are two separate choices - you pick an assay first, then a layer within it (which is
-why the Data-layer menu changes when you switch assays: each assay carries its own
-layers). Assays can hold different genes and mean different things (raw RNA vs
-normalized SCT vs batch-corrected integrated vs a different modality like protein);
-layers are just versions of the SAME assay's matrix (raw counts, normalized, scaled).
+```r
+library(Seurat)
 
-### Assay
-Seurat objects can hold several assays (e.g. `RNA`, `SCT`, `integrated`, `ADT`).
-Where an Assay dropdown appears, it selects which assay's values to use. Each assay is
-a separate features x cells matrix - a different measurement or processing stage, and
-they can contain different genes. Notes:
+seu <- NormalizeData(seu)
+seu <- FindVariableFeatures(seu)
+seu <- ScaleData(seu)
+seu <- RunPCA(seu)
+seu <- FindNeighbors(seu, dims = 1:30)
+seu <- FindClusters(seu, resolution = 0.5)   # adds a clustering column
+seu <- RunUMAP(seu, dims = 1:30)             # adds the umap embedding the app plots on
 
-- It only appears when the object has more than one assay.
-- On Gene Expression it includes *all* assays (viewing any assay is harmless).
-- On Cluster Markers and Contrasts it excludes `integrated` - differential
-  expression on batch-corrected values is statistically invalid - and an explanatory
-  note is shown.
+saveRDS(seu, "my_object_for_scexplorer.rds")
+```
 
-### Data layer
-Each assay can store the same genes at different processing stages, as layers:
+This gives the app everything it needs: a umap reduction to plot on, a clustering
+column to colour by, and the normalized values it reads for expression and markers.
 
-| Layer | Label in app | What it is | Typical use |
-|---|---|---|---|
-| `data` | Normalized (log) | Log-normalized expression | The default for viewing and for most marker tests |
-| `counts` | Raw counts | Raw UMI counts | Count-based models (Poisson); seeing raw depth |
-| `scale.data` | Scaled (z-score) | Z-scored (mean 0, unit variance), variable features only | Comparing relative pattern; note many genes are absent here |
+## Data info panel
 
-Wherever a Data layer menu appears, the app shows the raw values of that layer
-(no extra z-scoring) - so you literally see the numbers at that stage.
+Under the title is a collapsible "Data info" bar; click it to open. Inside:
 
----
+- The loaded file name.
+- Three summary cards: Cells, Genes, and Samples (distinct samples or batches
+  detected from a sample/batch column; shows `-` if none).
+- An Assays/layers strip listing every assay and the layers it contains, for
+  example `RNA: counts data   SCT: counts data scale.data`.
+
+<p align="center">
+  <img src="images/02-data-info.png" width="1100" alt="Data info panel expanded">
+  <br><em>Figure 2. The Data info panel: file name, summary cards and the assays/layers strip.</em>
+</p>
+
+## What the analysis uses
+
+The app uses one consistent setup everywhere:
+
+- Assay: RNA. If the RNA assay has no normalized data layer, the app falls back
+  to SCT, then to the object's default assay.
+- Values: Normalized (log) expression.
+- Statistical test (markers and per cell differential expression): Wilcoxon.
+
+Pseudobulk differential expression instead uses raw RNA counts.
+The Assays/layers strip in Data info shows whether RNA is normalized.
+
+## Downloading plots and tables
+
+- Plots: hover over any plot and its toolbar appears top right. The camera icon
+  saves the plot as a PNG; the toolbar also has zoom, pan, box/lasso select,
+  autoscale and reset.
+- Download all as one PNG: when a tab shows several panels (Per gene maps, or the
+  Split by group view), a "Download all as one PNG" button composites every panel
+  into a single image.
+- Tables: every results table has a "Download Excel" button that saves all rows as
+  an `.xlsx`, plus a search box at its top right that filters all columns as you
+  type.
 
 ## 1. Clusters / Metadata
 
-The map of your cells: each point is one cell, positioned by the UMAP embedding, and
-coloured by a metadata column you choose.
+The map of your cells: each point is one cell, positioned by a dimensionality
+reduction and coloured by a metadata column you choose. Controls sit in a bar at
+the top and the plot renders below.
 
-| Option | What it does | Information / use |
-|---|---|---|
-| Resolution / clustering *(appears only if the object has clustering columns)* | Quick-pick a clustering column (e.g. `SCT_snn_res.0.1`), listed as `assay · res X (N clusters)` | Recolour the map by that clustering. Higher resolution = more, finer clusters; the points don't move, only their colours. Stays in sync with "Color UMAP by" (picking a clustering in either box updates the other). |
-| Color UMAP by | Colour cells by any metadata column (clusters, cell type, sample, phase, condition, QC scores…) | See structure and how any variable is distributed across the map. |
-| Show categories (checkboxes) *(categorical columns)* | Toggle individual categories on/off; unticked ones turn grey | Isolate one or a few groups - e.g. grey out everything except "T cells". Toggling is instant (no re-render). |
-| Min / Max boxes *(continuous columns)* | Grey out cells whose value falls outside the typed range | Focus on a value window - e.g. only cells with a QC score above a threshold. |
+| Control | What it does |
+|---|---|
+| Reduction | Which embedding to plot on (umap, pca or any reduction in the object). Appears when the object has more than one. Points are laid out by this. Colouring is separate. |
+| Color UMAP by | Colour cells by any metadata column - cell type, sample, condition, phase, clustering or a numeric score. |
+| Show categories (categorical columns) | Tick or untick each category to show or hide it. Hidden ones turn grey. |
+| Min / Max (numeric columns) | Type a value range to keep. Cells outside it turn grey. |
+| Split by group (checkbox) | Tick to break the map into small multiples, one panel per group. It reveals Split by (which column) and Groups to show (which groups get a panel). |
 
-Categorical vs continuous is auto-detected. Discrete labels (clusters, cell types)
-get distinct colours + the "Show categories" checkboxes. Numeric columns (counts, QC
-metrics, prediction scores - even numbers stored as text) get a viridis gradient +
-colorbar, exact hover value, and the Min/Max range filter. Clustering columns are
-always treated as categorical, however many clusters they have (a 60-cluster leiden
-result is 60 categories, not a scale).
+Categorical vs. numeric is auto detected. Categorical columns (clusters, cell types)
+get distinct colours plus the Show categories checkboxes. Numeric columns (scores,
+QC metrics) get a viridis gradient with a colorbar, exact hover value and the
+Min/Max filter. Clustering columns are always categorical, however many clusters
+they have.
 
-Category order. Wherever categories are listed (the legend, the "Show categories"
-checkboxes, and the group pickers on the other tabs), they are sorted naturally -
-numerically when the labels are numbers (so `0, 1, 2, …, 10, 11`, not `0, 1, 10, 11, 2`),
-otherwise alphabetically.
+<p align="center">
+  <img src="images/03a-clusters-metadata.png" width="700" alt="Clusters / Metadata controls">
+  <br><em>Figure 3a. The Clusters / Metadata controls.</em>
+</p>
 
-Used for: understanding the overall structure - what clusters/cell types exist, how
-they're arranged, and how any metadata variable maps onto them.
+<p align="center">
+  <img src="images/03b-clusters-metadata.png" width="700" alt="Clusters / Metadata coloured UMAP">
+  <br><em>Figure 3b. The resulting UMAP, coloured by a categorical column. </em>
+</p>
 
----
+Split by group: pick the Split by column, then choose the exact groups in Groups to
+show. 
+
+<p align="center">
+  <img src="images/04-split-by-group.png" width="700" alt="Split by group small multiples">
+  <br><em>Figure 4. Split by group: one panel per group over a shared grey backdrop.</em>
+</p>
+
+Category order: everywhere categories are listed they are sorted naturally,
+numerically when the labels are numbers (0, 1, 2, ..., 10, 11), otherwise
+alphabetically.
 
 ## 2. Gene Expression
 
-One UMAP per gene, coloured by that gene's expression on a diverging
-blue → white → red scale. Values are the raw values of the chosen data layer
-(no app-side z-scoring), so:
+Uses the RNA assay and Normalized (log) values. Two sub tabs (the smaller green
+buttons).
 
-- For Normalized (log) / Raw counts (non-negative): the scale runs 0 → max
-  (low = blue, high = red).
-- For Scaled (z-score): the scale is symmetric about 0 (blue = below average,
-  white = average, red = above average).
+### Per gene maps
 
-| Option | What it does | Information / use |
-|---|---|---|
-| Compare | Two modes (below) | Choose whether to compare *genes* or *layers*. |
-| &nbsp;&nbsp;• *Genes (in one data layer)* | One UMAP per selected gene, all in one layer | Compare several genes' expression patterns. |
-| &nbsp;&nbsp;• *One gene across data layers* | The first selected gene shown in each ticked layer, side by side | See the same gene as raw counts vs normalized vs scaled - a teaching tool for what normalization does. |
-| Assay *(if >1 assay)* | Which assay to read from | Compare RNA vs SCT vs integrated expression. |
-| Sort genes by | Orders the gene menu: Alphabetical, or Highest / Lowest average expression | Find the most/least expressed genes without knowing names. |
-| Gene(s) | Pick one or more genes | Each gene gets its own UMAP (in *genes* mode). |
-| Data layer *(genes mode)* | Which layer to show (Normalized / Raw counts / Scaled) | See values before/after normalization. |
-| Layers to show *(layers mode)* | Tick which layers to display for the first gene | Starts empty - tick the ones you want. (Rendering all at once is heavy; opt in to avoid slow-downs.) |
-| Plots per row | Grid width (1-4) | Layout only. |
-| Color scale → Same scale for all genes | All plots share one colorbar | Compare magnitude across genes (which is higher). |
-| Color scale → Scale adjusted per gene | Each plot uses its own range | See the pattern even for weakly-expressed genes. |
+One UMAP per gene, coloured by that gene's expression on a blue to white to red
+scale (low = blue, high = red).
 
-> Genes missing from `scale.data` (only variable features are scaled) show a short
-> message in that panel - expected, not an error.
+| Control | What it does |
+|---|---|
+| Sort genes by | Orders the gene menu: Alphabetical or Highest / Lowest average expression |
+| Gene(s) | Type one or more gene symbol. Each gets its own UMAP |
+| Plots per row | Grid width (1 to 4), layout only |
+| Color scale: Same scale for all genes | All plots share one colorbar - compare magnitude across genes |
+| Color scale: Scale adjusted per gene | Each plot uses its own range - see the pattern even for weakly expressed genes |
 
-> At most 12 gene panels are drawn at once. Each panel is a full interactive (WebGL)
-> UMAP, and browsers limit how many can be live before the tab freezes. If you pick
-> more than 12 genes the tab asks you to select fewer instead of drawing them.
 
-Used for: seeing *where* a gene is expressed - confirming a cluster's identity from
-a marker, or checking a gene of interest's activity across the map.
+<p align="center">
+  <img src="images/05-gene-expression-maps.png" width="700" alt="Per-gene expression maps">
+  <br><em>Figure 5. Per gene maps: one expression UMAP per selected gene.</em>
+</p>
 
----
+### Aggregated (pseudobulk)
+
+A compact overview: for each selected gene, one summary value per group, as a
+heatmap and a table.
+
+| Control | What it does |
+|---|---|
+| Aggregate by | Metadata column defining the groups (heatmap columns) |
+| Gene(s) | Genes become the heatmap rows |
+| Summary per group | Mean, Sum, or Median per group |
+
+<p align="center">
+  <img src="images/06-aggregated.png" width="700" alt="Aggregated expression heatmap">
+  <br><em>Figure 6. Aggregated: a gene by group heatmap plus the same numbers as a table.</em>
+</p>
 
 ## 3. Cluster Markers
 
-Genes that define each group - markers of one group vs *all other cells*. Two
-versions depending on the object:
+Genes that mark one group versus all other cells, computed live from the object.
+Uses the RNA assay, Normalized (log) values and the Wilcoxon test.
 
-A) Precomputed (scdrake objects with `@misc$cluster_markers`):
-
-| Option | Meaning |
+| Control | What it does |
 |---|---|
-| Clustering resolution | Which clustering the markers were computed on |
-| Test type | Which precomputed statistical test |
-| Cluster | Which cluster's markers to show |
-| Search in / Search | Filter the table by a chosen column (e.g. a gene symbol) |
+| Grouping column | The metadata column that defines the groups - a cell type column for markers per cell type, or a clustering for per cluster markers |
+| Group | Which group to find markers for (that group vs everyone else) |
+| Compute | Runs the computation. It does not run automatically |
 
-B) Computed live (any object):
+Set the grouping column and group, then click Compute. After it runs, the search box filters the results and Download Excel
+exports the whole table. Columns include avg_log2FC (how much higher in this group),
+pct.1 / pct.2 (fraction of cells expressing it in the group vs the rest), and
+p_val / p_val_adj (significance).
 
-| Option | Meaning / use |
-|---|---|
-| Grouping column | The metadata column that defines the groups - pick your cell-type column to get markers per cell type, or a clustering column for per-cluster markers |
-| Assay *(if >1)* | Which assay to test on (`integrated` excluded - invalid for DE) |
-| Data layer | Which layer the test reads (only the layers present in the assay are offered) |
-| Group / cluster | Which group to find markers for (that group vs everyone else) |
-| Test type | Statistical test (see the list below) |
-| Compute markers | Runs the computation. It does not run automatically - see the note below |
-| Search | Filter the results table |
+The table is sorted by fold change (avg_log2FC), so the strongest up-regulated markers
+sit at the top and down-regulated genes at the bottom. This is the same computation and
+ranking the Marker Plot dot plot uses, so the top of this table matches the genes the dot
+plot shows for each group. Click any column header to re-sort, for example by p_val_adj
+for significance order.
 
-Set the options, then click Compute markers. It is not automatic on purpose: the
-computation is heavy on large objects and would otherwise re-run on every dropdown
-change and freeze the app. After it runs, changing an option shows a "click Compute
-markers" prompt until you re-run; the Search box filters the existing results without
-recomputing. Table columns: `avg_log2FC` (how much higher
-in this group), `pct.1` / `pct.2` (fraction of cells expressing it, in the group vs the
-rest), `p_val` and `p_val_adj` (significance; very significant genes can display as `0`
-when they underflow double precision).
+<p align="center">
+  <img src="images/07-cluster-markers.png" width="700" alt="Cluster Markers table">
+  <br><em>Figure 7. Cluster Markers: the top marker genes for one group versus the rest.</em>
+</p>
 
-Used for: annotating cell types / clusters - "what genes make this group
-different?" → look them up to name it.
-
----
 
 ## 4. Marker Plot
 
-Marker genes across a grouping column, as either a dot plot or violins. The first thing
-you choose is the Plot type; the options below adapt to it. Group by, Assay and Data
-layer apply to both.
-
-| Option | What it does |
-|---|---|
-| Plot type | Dot plot or Violin (choose first) |
-| Group by | The metadata column for the groups (cell type, cluster, condition...) |
-| Assay *(if >1)* | Which assay to read |
-| Data layer | Which layer to use (Normalized / Raw counts / Scaled) |
+Chosen genes across a grouping column, as a dot plot or violins. Uses the RNA assay
+and Normalized (log) values. Choose the Plot type first; the controls adapt to it.
+Group by applies to both.
 
 ### Dot plot
 
-Genes on the x-axis, groups on the y-axis. Dot size = % of cells in the group that
-express the gene; dot colour = average expression z-scored per gene across groups
-(blue = low, red = high in that group) - so you see at a glance which group each marker
-is specific to.
+Genes on the x axis, groups on the y axis. Dot size = percent of cells in the group
+expressing the gene. Dot colour = mean expression z scored per gene across groups
+(blue = low, red = high in that group), so you see which group each marker is
+specific to.
 
-| Option | What it does |
-|---|---|
-| Genes: Top markers per group (auto) | Finds each group's top markers (group vs the rest) automatically |
-| &nbsp;&nbsp;• Top markers / group | How many top markers per group (e.g. 3) |
-| &nbsp;&nbsp;• Test type | Statistical test for the markers (Wilcoxon by default) |
-| &nbsp;&nbsp;• Compute markers | Runs the computation (gated behind a button - it's heavier than one group) |
-| Genes: Choose manually | Type genes yourself (e.g. copied from the Cluster Markers table) |
+- Genes: Top markers per group (auto) - finds each group's top markers
+  automatically (Wilcoxon), ranked by fold change. Set Top markers / group, then click
+  Compute. Only significant markers expressed in at least 25% of a group are kept. These
+  are the same top markers as the top rows of the Cluster Markers table (same computation).
+- Genes: Choose manually - type genes yourself.
 
-Auto mode notes:
-- Click Compute markers after you change the grouping, assay, or test - the plot tells
-  you when the genes are stale for the current grouping.
-- Only significant markers expressed in at least 25% of a group are kept, so the top
-  genes are real cluster markers rather than high-fold-change-but-sparse noise.
-- Changing "Top markers / group" re-slices instantly (no recompute).
+<p align="center">
+  <img src="images/08-marker-dotplot.png" width="700" alt="Marker dot plot">
+  <br><em>Figure 8. Marker dot plot: dot size is percent expressing, colour is z scored mean.</em>
+</p>
+<!-- SCREENSHOT 08-marker-dotplot.png : the Marker Plot tab, Plot type = Dot plot, with "Top markers per group (auto)" computed (or a manual gene set), showing the dot grid and colorbar. -->
 
 ### Violin
 
-One row of violins per gene (x = group), showing the expression distribution: the violin
-shape, an inner box (median and quartiles) and jittered individual cells. Pick the genes
-with the "Genes to show (violin)" box (a searchable dropdown of all genes, sorted by the
-"Sort genes by" option); it starts filled with your computed markers, if any. It is
-interactive - hover a point for a cell's exact value, hover the box for the quartile
-stats, drag to zoom, double-click to reset. Cells are downsampled for responsiveness.
+One row of violins per gene (x = group), showing the distribution: the violin
+shape, an inner box (median and quartiles), and jittered cells. Pick genes in the
+Genes to show box, then click Compute. Cells are downsampled for responsiveness.
 
-Used for: seeing each group's defining markers in one figure (dot plot), or the full
-expression distribution of chosen genes per group (violin) - e.g. spotting a bimodal or
-skewed gene.
+<p align="center">
+  <img src="images/09-marker-violin.png" width="700" alt="Marker violin plot">
+  <br><em>Figure 9. Marker violins: the per group distribution of each chosen gene.</em>
+</p>
+<!-- SCREENSHOT 09-marker-violin.png : the Marker Plot tab, Plot type = Violin, with a few genes chosen and computed, showing the stacked violin rows. -->
 
----
+## 5. Differential expression
 
-## 5. Contrasts (DEA)
+Genes that differ between two groups you choose (target A vs. reference B), for
+example one condition vs. another. Unlike Cluster Markers (a group vs everyone
+else), this is one group vs one specific other group.
 
-Differential expression between two groups you choose (A vs B) - a head-to-head
-comparison ("DEA" = Differential Expression Analysis). Precomputed or live:
-
-A) Precomputed (scdrake `@misc$contrasts`): Contrast (the A vs B pair),
-Test type, Search in / Search.
-
-B) Computed live (any object):
-
-| Option | Meaning / use |
+| Control | What it does |
 |---|---|
-| Grouping column | The metadata column to compare within |
-| Assay *(if >1)* | Assay to test on (`integrated` excluded) |
-| Data layer | Layer the test reads |
+| Method | Pseudobulk DESeq2 (default), or Per cell test |
+| Grouping column | The metadata column holding your two groups |
 | Target (A) | The first group |
 | Reference (B) | The group to compare against |
-| Test type | Statistical test |
-| Compute contrast | Runs the computation (not automatic, same as Cluster Markers) |
-| Search | Filter results |
 
-Set the options, then click Compute contrast. Like Cluster Markers it does not run
-automatically (the computation is heavy); after it runs, changing an option prompts a
-re-run, and Search filters the existing results without recomputing.
 
-Difference from Cluster Markers: Markers = one group vs *everyone else*;
-Contrasts = one group vs *one specific other group*.
+### Pseudobulk DESeq2
 
-Used for: condition comparisons (treated vs control), or one cell type vs another
-directly.
+To compare conditions across samples. It sums raw RNA counts
+per sample within each group, then runs DESeq2.
 
----
+| Control | What it does |
+|---|---|
+| Sample / replicate column | The column identifying your replicates (for example the sample or batch column). Needs at least two samples per group. |
+| Restrict to a subset (checkbox) | Tick to limit the test to one cell type or cluster. It reveals a column and level to restrict to. |
+| Compute | Runs DESeq2 |
 
-## The "Test type" options (Markers & Contrasts)
+Table: gene, log2FoldChange, pvalue, padj, baseMean (downloadable to Excel). A
+caption reports how many samples were found per group.
 
-All answer "which genes differ," with different statistics:
+Note on the sample column: pick the real replicate column. If you pick a column
+where one condition's cells are NA (for example a cell type column with cells
+unannotated in one condition), those cells are dropped and a group can come out
+empty.
 
-- Wilcoxon - the robust standard. Start here.
-- Student's t - assumes roughly normal data; faster, less robust.
-- ROC / AUC - ranks genes by how well they *classify* the group (reports an AUC
-  "power", no p-value). Good for clean markers.
-- Logistic regression (LR) - can account for covariates.
-- Likelihood ratio (bimod) - a single-cell-specific test.
-- Poisson (counts) - for raw UMI counts.
+<p align="center">
+  <img src="images/10-differential-expression.png" width="700" alt="Differential expression results">
+  <br><em>Figure 10. Differential expression: genes ranked by significance between two groups.</em>
+</p>
+<!-- SCREENSHOT 10-differential-expression.png : the Differential expression tab with a Method chosen, a grouping column and target/reference set, computed, showing the results table (log2FoldChange / padj columns). -->
 
-Standard tests (Wilcoxon/t/…) run on the normalized (`data`) layer; count models
-(Poisson) run on counts. Installing [presto](https://github.com/immunogenomics/presto)
-makes these substantially faster (Seurat uses it automatically). If an assay lacks a
-`data` layer, the app normalizes on the fly so the tests still run.
+### Per cell test
 
----
-
-## 6. Aggregated Expression
-
-A summary heatmap + table: for each selected gene, one value per group (a
-pseudobulk-style summary).
-
-| Option | What it does | Information / use |
-|---|---|---|
-| Aggregate by | Metadata column defining the groups (heatmap columns) | e.g. cluster, cell type, condition |
-| Sort genes by | Orders the gene menu | convenience |
-| Gene(s) | Genes = rows of the heatmap | your genes of interest |
-| Assay *(if >1)* | Which assay to read | choose the expression source |
-| Data layer | Which layer to summarise (raw values) | Normalized / Raw counts / Scaled |
-| Summary per group | Mean / Sum / Median per group | Mean = average level; Sum = total (pseudobulk); Median = robust middle |
-
-- Heatmap: genes (rows) × groups (columns) on the blue → white → red scale, with the
-  colour range pinned to the values (0→max for counts/data; symmetric for scale.data).
-  Its title states the summary, gene count, grouping column and layer.
-- Table: the same numbers (downloadable to Excel).
-
-Used for: comparing a panel of genes across conditions/clusters at a glance -
-"is this marker set higher in condition X?" - without scanning many separate UMAPs.
-
----
-
-## 7. Split by Group
-
-One gene shown as a separate expression UMAP per group - e.g. one panel per cell
-type, condition, or sample. Each panel shows only that group's cells (coloured by the
-gene's expression) over a grey backdrop of all cells, on a shared colour scale so
-panels are directly comparable. Values are the raw values of the chosen data layer
-(same colour meaning as Gene Expression).
-
-| Option | What it does | Information / use |
-|---|---|---|
-| Split by | Metadata column whose groups become the panels | e.g. cell type, condition, sample |
-| Then by (optional) | A second column to split again → a grid (e.g. cell type × condition) | leave "(none)" for a single split |
-| Sort genes by | Orders the gene menu | find genes quickly |
-| Gene | The single gene to show, split across the groups | one gene per view |
-| Panels per row | Grid width | layout only |
-| Assay *(if >1)* | Which assay to read | choose the expression source |
-| Data layer | Which layer's raw values to show | Normalized / Raw counts / Scaled |
-| Groups to show | Pick which "Split by" groups get a panel | starts empty - you choose which to compare |
-| Groups to show (secondary) | Appears when "Then by" is set - pick which of *its* groups to include | only the combinations you pick are drawn |
-
-- Panels are titled by the gene and group with the cell count, e.g.
-  `Malat1 · Immature B cell (n=2,213)`. A combination with no cells (e.g. a KO×celltype
-  that's unannotated) shows just the grey backdrop with `n=0`.
-- Both pickers start empty - nothing renders until you add groups.
-- Panel limit: at most 12 panels at once (each is a WebGL plot and browsers limit
-  how many can be live). Pick the few groups you actually want to compare.
-
-Used for: seeing how one gene's expression differs across groups - "is it higher
-in KO than WT?", "which cell types express it?" - same gene each time, panels differ only
-by which cells are shown.
-
----
+The fast, exploratory alternative. Uses the RNA assay, Normalized (log) values and
+the Wilcoxon test, treating each cell as a replicate. Pick the two groups and click
+Compute. For comparing conditions across samples it can inflate false positives, so
+Pseudobulk is the default and recommended choice there. Use the per cell test for a
+quick look, for cell type vs cell type comparisons, or when the data has no replicates.
 
 ## Quick reference - which tab for which question
 
 | Question | Tab |
 |---|---|
 | What clusters / cell types are there? | Clusters / Metadata |
-| Where is gene X expressed (and in which layer)? | Gene Expression |
+| How does one variable split across the map? | Clusters / Metadata (Split by group) |
+| Where is gene X expressed? | Gene Expression (Per gene maps) |
+| How does a gene panel compare across groups? | Gene Expression (Aggregated) |
 | What defines this cluster / cell type? | Cluster Markers |
-| Which markers are specific to each cell type (one figure)? | Marker Plot |
-| How do groups A and B differ (gene table)? | Contrasts (DEA) |
-| How does a gene panel compare across conditions? | Aggregated Expression |
-| How does one gene differ across groups/cell types? | Split by Group |
+| Which markers are specific to each group (one figure)? | Marker Plot |
+| How do groups A and B differ (gene table)? | Differential expression |
 
----
 
-## A note on colour scales
 
-- Expression plots (Gene Expression, Aggregated, Split) use a diverging
-  blue → white → red scale. For non-negative layers (counts/normalized) it runs
-  0 → max; for scaled (z-score) data it's symmetric about 0 (white = average).
-- Continuous metadata in Clusters / Metadata uses a viridis gradient.
-- Categorical metadata uses distinct discrete colours with a toggleable legend.
+# Part 2 - Use cases
+
+Four common workflows, each as numbered steps. They assume a dataset is already
+loaded (see Loading data).
+
+## Use case 1 - Find the marker genes that define your clusters
+
+Goal: see which genes are characteristic of each cluster.
+
+1. Open Clusters / Metadata and in "Color UMAP by" choose your clustering column to
+   see the clusters laid out on the map.
+2. Open Cluster Markers, set "Grouping column" to the same clustering, pick a cluster
+   in "Group", and click Compute.
+3. Read the top rows (sorted by fold change): genes with a high avg_log2FC and a high
+   pct.1 are that cluster's markers.
+4. Go to Gene Expression > Per gene maps, type a few of those genes, and confirm they
+   light up specifically on that cluster's location.
+5. Open Marker Plot, Plot type = Dot plot, set "Group by" to the clustering, choose
+   "Top markers per group (auto)", set Top markers / group to 3 to 5, and click
+   Compute to see every cluster's markers in one figure.
+
+<p align="center">
+  <img src="images/uc1a-markers-to-dotplot.png" width="720" alt="From cluster markers to the dot plot">
+  <br><em>Figure 11. Use case 1: cluster markers. </em>
+</p>
+<p align="center">
+  <img src="images/uc1b-markers-to-dotplot.png" width="720" alt="From cluster markers to the dot plot">
+  <br><em>Figure 12. Use case 1: cluster markers summarised as a dot plot.</em>
+</p>
+
+> Sample answer: for cluster 1 in the example data the top markers are NEFM, SYT16 and VAT1L -
+> the same genes at the top of the Cluster Markers table and as cluster 1's dots in the
+> dot plot.
+
+## Use case 2 - Check where your genes of interest are expressed
+
+Goal: see the expression pattern of specific genes across the map and across
+groups.
+
+1. Open Gene Expression > Per gene maps.
+2. Type your genes of interest in "Gene(s)". Each gets its own UMAP.
+3. Set "Plots per row" for a comfortable layout, and keep "Same scale for all
+   genes" to compare magnitude between genes (switch to "Scale adjusted per gene"
+   if a weakly expressed gene is hard to see).
+4. Read the maps: where a gene is red it is highly expressed. Hover any cell for
+   the exact value.
+5. For a compact numeric comparison, switch to the Aggregated (pseudobulk) sub tab,
+   set "Aggregate by" to a grouping column (for example cell type or condition),
+   type the same genes, and read the heatmap - one summary value per gene per group.
+6. Save what you need: the camera icon on a plot, "Download all as one PNG" for the
+   whole grid, or "Download Excel" for the aggregated table.
+
+<p align="center">
+  <img src="images/uc2a-gene-maps.png" width="720" alt="Gene of interest expression maps and heatmap">
+  <br><em>Figure 13. Use case 2: expression maps for genes of interest. </em>
+</p>
+<p align="center">
+  <img src="images/uc2b-gene-maps.png" width="720" alt="Gene of interest expression maps and heatmap">
+  <br><em>Figure 14. Use case 2: aggregated heatmap.</em>
+</p>
+
+> Sample answer: Both genes are expressed broadly and fairly uniformly across every cell type.  UMAPs are red almost everywhere and every column of the heatmap is coloured, with no cluster left blue. That is the signature of housekeeping genes (RPL41 is a ribosomal protein, UBA52 is a ubiquitin–ribosomal fusion), so this is expected: they are not specific to any population.
+
+## Use case 3 - Compare two conditions and find differentially expressed genes
+
+Goal: find genes that change between two conditions (for example treated vs
+control) in a statistically sound way.
+
+1. Open Differential expression. Method is set to "Pseudobulk DESeq2" by default,
+   the recommended choice for comparing conditions across samples.
+2. Set "Grouping column" to your condition column, then choose the Target (A) and
+   Reference (B) conditions.
+3. Set "Sample / replicate column" to your real replicate column (the one that
+   identifies each sample, for example orig.ident or batch). It needs at least two
+   samples per group; the caption confirms how many were found.
+4. Optional: tick "Restrict to a subset" and choose a cell type or cluster to run
+   the comparison within one population only.
+5. Click Compute. Read the table sorted by padj: log2FoldChange is the direction
+   and size of change (target vs reference), padj is the adjusted significance.
+6. For a quick, exploratory look you can switch Method to "Per cell test" instead,
+   but per cell tests treat each cell as a replicate and can inflate false positives
+   for condition comparisons, so trust the pseudobulk result for conclusions.
+7. Click Download Excel to export all genes for downstream work.
+
+<p align="center">
+  <img src="images/uc3-pseudobulk.png" width="720" alt="Pseudobulk differential expression setup and results">
+  <br><em>Figure 13. Use case 3: pseudobulk DESeq2 setup and the ranked results table.</em>
+</p>
+
+> Sample answer: Acinar vs. delta with Batch as the replicate column. Using Batch as the sample column, the two populations separate strongly and significantly. Genes up in acinar (positive log2FoldChange) are led by G0S2 (+5.08), HILPDA (+4.51), ANGPTL4 (+4.4) and PLIN2 (+4.17), a hypoxia and lipid/stress program; PEG10 (−2.96) is the top gene up in delta. All are highly significant (padj < 1e-41). Sort by padj for the most robust hits and by log2FoldChange for the largest changes (positive = higher in acinar, negative = higher in delta).
+
+
+## Use case 4 - See how a condition or cell type is distributed across the map
+
+Goal: compare where different groups of cells sit on the same embedding.
+
+1. Open Clusters / Metadata.
+2. In "Color UMAP by" choose the column you want the panels coloured by (for
+   example cell type, so each panel keeps the same colour key).
+3. Tick "Split by group".
+4. In "Split by" choose the column that separates your groups (for example
+   condition, or sample).
+5. In "Groups to show" pick the two or more groups you want to compare.
+6. Compare the panels side by side: each shows only that group's cells over a grey
+   backdrop of all cells, on the same axes, with one shared legend. This makes it
+   easy to spot a population that is present in one condition and missing in
+   another.
+7. Save the comparison with "Download all as one PNG".
+
+<p align="center">
+  <img src="images/uc4a-split.png" width="720" alt="Split by group comparison across conditions">
+  <br><em>Figure 14. Use case 4: The Clusters / Metadata controls. </em>
+</p>
+<p align="center">
+  <img src="images/uc4b-split.png" width="720" alt="Split by group comparison across conditions">
+  <br><em>Figure 15. Use case 4: the same map split by condition to compare cell distributions.</em>
+</p>
+
+> Sample answer: (map coloured by CellType, split by Batch: human1_lib1 vs human3_lib4.) 
+> Both donors contain the same cell types in the same map positions, so the two batches are well integrated (no batch effect). They differ only in composition: human3_lib4 (814 cells) has more alpha and acinar cells, while human1_lib1 (519 cells) is smaller and relatively richer in beta. So the samples share identity and structure but differ in the proportion of each cell type.

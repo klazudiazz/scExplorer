@@ -148,6 +148,49 @@ colour gradient, table columns, and the example-data path.
 - To regenerate the package help page after editing roxygen comments, run
   `devtools::document()`.
 
-## License
+## Citation
 
-MIT (c) 2026 Klaudia Zieba
+scExplorer was inspired by **scdrake**, a single-cell RNA-seq analysis pipeline, and
+it can read the cluster-marker and contrast tables that scdrake stores in a Seurat
+object's `@misc` slot. 
+
+- Kubovčiak J, Kolář M, Novotný J (2023). Scdrake: a reproducible and scalable
+  pipeline for scRNA-seq data analysis. *Bioinformatics Advances* 3(1):vbad089.
+  https://doi.org/10.1093/bioadv/vbad089
+
+Tools and data scExplorer relies on:
+
+**Software** (run `citation("<pkg>")` in R for the exact, version-correct reference):
+
+- **Seurat** (v5) - the single-cell framework the app is built on. Hao Y, et al.
+  (2024). Dictionary learning for integrative, multimodal and scalable single-cell
+  analysis. *Nature Biotechnology* 42:293-304.
+  https://doi.org/10.1038/s41587-023-01767-y
+- **DESeq2** - Love MI, Huber W, Anders S (2014). Moderated estimation of fold change
+  and dispersion for RNA-seq data with DESeq2. *Genome Biology* 15:550.
+  https://doi.org/10.1186/s13059-014-0550-8 (used for pseudobulk differential
+  expression).
+- **presto** - Korsunsky I et al. Fast Wilcoxon rank-sum test, which speeds up marker
+  detection when installed. https://github.com/immunogenomics/presto
+- **plotly** - Sievert C (2020). Interactive Web-Based Data Visualization with R,
+  plotly, and shiny. Chapman and Hall/CRC. https://plotly-r.com
+- **shiny** - Chang W, et al. (2026). shiny: Web Application Framework for R.
+  R package version 1.14.0. https://shiny.posit.co/
+- **DT** - Xie Y, Cheng J, Tan X, Aden-Buie G (2025). DT: A Wrapper of the JavaScript
+  Library 'DataTables'. R package version 0.34.0. https://github.com/rstudio/DT
+
+**Methods**
+
+- Squair JW et al. (2021). Confronting false discoveries in single-cell differential
+  expression. *Nature Communications* 12:5692.
+
+**Example data**
+
+The bundled example is the human pancreas dataset from:
+
+- Baron M et al. (2016). A Single-Cell Transcriptomic Map of the Human and Mouse
+  Pancreas Reveals Inter- and Intra-cell Population Structure. *Cell Systems*
+  3(4):346-360.
+
+obtained via CZ CELLxGENE Discover (Chan Zuckerberg Initiative,
+https://cellxgene.cziscience.com).

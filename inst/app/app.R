@@ -160,11 +160,10 @@ dt_with_excel <- function(df, filename) {
   )
 }
 
-# Plots: a small "PNG" button that exports a plotly plot as a static PNG entirely
-# in the browser (Plotly.downloadImage -> see the dlPlot() JS in tags$head).`id` = the plotlyOutput id, `fname` = PNG name.
+# safe_fname: turn a string into a safe file base name (for PNG / Excel names).
+# Per-plot PNG is handled by plotly's native modebar (the camera icon), so there
+# is no separate per-plot download button.
 safe_fname <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
-plot_dl_btn <- function(id, fname) NULL   # per-plot PNG now via plotly's native
-# modebar (camera icon); no-op keeps the many call sites unchanged.
 # "Download all as one PNG" button for a multi-panel grid: composites every
 # listed panel (+ the shared colorbar, if given) into a single image laid out in
 # `ncol` columns. `ids` = character vector of plot ids.
@@ -402,51 +401,6 @@ ui <- fluidPage(
         });
       });
 
-      // Turn any string into a safe file base name.
-      function pngSanitize(s) {
-        return String(s).replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'plot';
-      }
-      // Read a plotly plot's on-screen title so the PNG name matches what the
-      // user sees (falls back to the R-provided name if there's no title).
-      function pngName(gd, fallback) {
-        try {
-          var t = gd && gd.layout && gd.layout.title;
-          var txt = t ? (typeof t === 'string' ? t : t.text) : null;
-          if (txt) { return pngSanitize(txt); }
-        } catch (e) {}
-        return pngSanitize(fallback);
-      }
-      // Indices of gradient traces (a numeric-coloured scattergl trace) whose
-      // colorbar is currently hidden -- these are the panels that, in shared-scale
-      // mode, rely on the one colorbar drawn to the side.
-      function hiddenScaleTraces(gd) {
-        var idx = [];
-        (gd.data || []).forEach(function(tr, i) {
-          if (tr.marker && tr.marker.colorscale && Array.isArray(tr.marker.color)
-              && tr.marker.showscale === false) { idx.push(i); }
-        });
-        return idx;
-      }
-      // Export one plotly plot as a static PNG.
-      // If the panel's own colorbar is hidden (shared-scale mode), turn it on just
-      // for the capture and restore it after, so every downloaded PNG has a scale
-      // without changing what's on screen.
-      window.dlPlot = function(id, fallback) {
-        var el = document.getElementById(id);
-        if (!el) { return; }
-        var gd = el.classList.contains('js-plotly-plot') ? el : el.querySelector('.js-plotly-plot');
-        if (!gd || !window.Plotly) { return; }
-        var opts = { format: 'png', filename: pngName(gd, fallback), scale: 2 };
-        var hidden = hiddenScaleTraces(gd);
-        if (hidden.length === 0) {                         // already has a colorbar
-          window.Plotly.downloadImage(gd, opts);
-          return;
-        }
-        Promise.resolve(window.Plotly.restyle(gd, { 'marker.showscale': true }, hidden))
-          .then(function() { return window.Plotly.downloadImage(gd, opts); })
-          .then(function() { window.Plotly.restyle(gd, { 'marker.showscale': false }, hidden); })
-          .catch(function() { window.Plotly.restyle(gd, { 'marker.showscale': false }, hidden); });
-      };
       // Export all displayed panels as one combined PNG: render each panel to an
       // image via Plotly (correct WebGL readback), then paint them onto a single
       // canvas in the grid layout (+ the shared colorbar on the right, if any).
@@ -978,7 +932,6 @@ server <- function(input, output, session) {
           condition = "!input.split_on",
           div(style = "display: flex; justify-content: center; width: 100%; overflow: hidden;",
               div(id = "umap_plot_box", class = "plot-dl-wrap", style = "position: relative; width: calc(min(100vh - 340px, 60vw) + 260px); height: min(100vh - 340px, 60vw);",
-                  plot_dl_btn("umap_plot", "UMAP"),
                   withSpinner(plotlyOutput("umap_plot", width = "100%", height = "100%"), caption = "Rendering plot...", color = "#39FF14")))
         ),
         # Splitting: one UMAP panel per chosen group (up to 12).
@@ -1046,7 +999,6 @@ server <- function(input, output, session) {
               )
             ),
             div(class = "plot-dl-wrap", style = "position: relative;",
-                plot_dl_btn("agg_heatmap", "aggregated_expression"),
                 withSpinner(plotlyOutput("agg_heatmap", height = "600px"), caption = "Rendering plot...", color = "#39FF14")),
             tags$hr(),
             withSpinner(DTOutput("agg_table"), caption = "Loading table...", color = "#39FF14")
@@ -1172,14 +1124,12 @@ server <- function(input, output, session) {
       conditionalPanel(
         condition = "input.marker_plot_type == 'dot'",
         div(class = "plot-dl-wrap", style = "position: relative;",
-            plot_dl_btn("dot_plot", "marker_dotplot"),
             withSpinner(plotlyOutput("dot_plot", height = "600px"),
                         caption = "Computing markers / rendering...", color = "#39FF14"))
       ),
       conditionalPanel(
         condition = "input.marker_plot_type == 'violin'",
         div(class = "plot-dl-wrap", style = "position: relative; width: 100%;",
-            plot_dl_btn("violin_plot", "marker_violin"),
             withSpinner(uiOutput("violin_plot_ui"),
                         caption = "Computing markers / rendering...", color = "#39FF14"))
       )
@@ -1209,16 +1159,16 @@ server <- function(input, output, session) {
         help_details(
           tags$p("Finds genes that differ between two groups you choose (target A vs. reference B), for example one condition versus another. Unlike cluster markers (a group versus everyone else), this is one group versus one specific other group."),
           tags$ol(
-            tags$li("Choose a \"Method\": \"Per cell test\" is fast and exploratory; \"Pseudobulk DESeq2\" is recommended for comparing conditions across samples, because per cell tests may inflate false positives there."),
+            tags$li("Choose a \"Method\": \"Pseudobulk DESeq2\" (the default) is recommended for comparing conditions across samples; \"Per cell test\" is a fast, exploratory alternative, but it may inflate false positives for condition comparisons."),
             tags$li("Pick the \"Grouping column\" that holds your two groups, then the target group (A) and the reference group (B)."),
-            tags$li("Per cell test uses the RNA assay, Normalized (log) values, and the Wilcoxon test. Pseudobulk: set the \"Sample / replicate column\" (it needs at least two samples per group), and optionally tick \"Restrict to a subset\" to limit to one cell type or cluster; it sums raw RNA counts and runs DESeq2."),
+            tags$li("Pseudobulk: set the \"Sample / replicate column\" (it needs at least two samples per group), and optionally tick \"Restrict to a subset\" to limit to one cell type or cluster; it sums raw RNA counts and runs DESeq2. Per cell test uses the RNA assay, Normalized (log) values, and the Wilcoxon test."),
             tags$li("Click \"Compute\""),
             tags$li("Type in the table's search box to filter; \"Download Excel\" to download the whole table"))),
         wellPanel(
           fluidRow(column(12, radioButtons("gcontrast_method", "Method:", inline = TRUE,
-                                  choices = c("Per-cell test" = "percell",
-                                              "Pseudobulk DESeq2" = "pseudobulk"),
-                                  selected = "percell"))),
+                                  choices = c("Pseudobulk DESeq2" = "pseudobulk",
+                                              "Per-cell test" = "percell"),
+                                  selected = "pseudobulk"))),
           fluidRow(
             column(4, selectInput("gcontrast_group", "Grouping column:", choices = grouping_choices, width = "100%")),
             column(4, uiOutput("gcontrast_target_ui")),
@@ -1399,7 +1349,7 @@ server <- function(input, output, session) {
         p <- add_trace(p, data = out_df, x = ~UMAP_1, y = ~UMAP_2,
                        type = "scattergl", mode = "markers",
                        marker = list(size = 3, color = "#E8E8E8"),
-                       text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+                       text = ~tooltip, hovertemplate = "%{text}<extra></extra>", showlegend = FALSE)
       }
       if (nrow(in_df) > 0) {
         p <- add_trace(p, data = in_df, x = ~UMAP_1, y = ~UMAP_2,
@@ -1410,7 +1360,7 @@ server <- function(input, output, session) {
                                      colorbar = list(title = list(text = pretty_label(gv), side = "right"),
                                                      thickness = 15, len = 0.5, outlinewidth = 0,
                                                      x = 1.02, xanchor = "left", y = 0.5, yanchor = "middle")),
-                       text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+                       text = ~tooltip, hovertemplate = "%{text}<extra></extra>", showlegend = FALSE)
       }
       p <- plotly::layout(
         p, hovermode = "closest",
@@ -1419,10 +1369,10 @@ server <- function(input, output, session) {
                      font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
         xaxis = list(title = axis_labels()[1], zeroline = FALSE, range = umap_range(),
                      tick0 = 0, dtick = umap_dtick(),
-                     constrain = "domain", constraintoward = "center"),
+                     constrain = "range"),
         yaxis = list(title = axis_labels()[2], zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
                      tick0 = 0, dtick = umap_dtick(),
-                     constrain = "domain", constraintoward = "middle", range = umap_range()),
+                     constrain = "range", range = umap_range()),
         margin = list(l = 50, r = 10, t = 40, b = 40)
       )
       return(plotly::config(p, displaylogo = FALSE, toImageButtonOptions = list(filename = safe_fname(paste0(embedding_label(), "_", pretty_label(gv))))))
@@ -1441,7 +1391,7 @@ server <- function(input, output, session) {
       df, x = ~UMAP_1, y = ~UMAP_2,
       type = "scattergl", mode = "markers",
       marker = list(size = 4, color = ~col),   # TWEAK: UMAP point size
-      text = ~tooltip, hoverinfo = "text", showlegend = FALSE
+      text = ~tooltip, hovertemplate = "%{text}<extra></extra>", showlegend = FALSE
     )
 
     # Legend on the right
@@ -1450,7 +1400,7 @@ server <- function(input, output, session) {
       idx <- which(df$group == cat)[1]
       p <- add_trace(
         p, x = df$UMAP_1[idx], y = df$UMAP_2[idx],
-        type = "scatter", mode = "markers",
+        type = "scattergl", mode = "markers",
         marker = list(size = 0.1, color = cols$legend[[cat]]),
         name = cat, showlegend = TRUE, hoverinfo = "skip", inherit = FALSE
       )
@@ -1462,10 +1412,10 @@ server <- function(input, output, session) {
                    font = list(size = 15, family = "Open Sans, verdana, arial, sans-serif")),
       xaxis = list(title = axis_labels()[1], zeroline = FALSE, range = umap_range(),
                    tick0 = 0, dtick = umap_dtick(),
-                   constrain = "domain", constraintoward = "center"),
+                   constrain = "range"),
       yaxis = list(title = axis_labels()[2], zeroline = FALSE, scaleanchor = "x", scaleratio = 1,
                    tick0 = 0, dtick = umap_dtick(),
-                   constrain = "domain", constraintoward = "middle", range = umap_range()),
+                   constrain = "range", range = umap_range()),
       showlegend = TRUE,
       legend = list(title = list(text = pretty_label(gv)), itemsizing = "constant",
                     y = 0.5, yanchor = "middle"),
@@ -1528,8 +1478,10 @@ server <- function(input, output, session) {
     ing <- sval == level
     title <- paste0(pretty_label(sb), ": ", level, " (n=", sum(ing), ")")
     p <- plot_ly()
-    # Grey backdrop = all cells (context for sparse groups).
-    p <- add_trace(p, data = df, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
+    # Grey backdrop = the OTHER cells (context for sparse groups). Excludes this
+    # group's cells so they don't sit under a grey twin, which would let the
+    # no-hover backdrop win the hover instead of the coloured cell on top.
+    p <- add_trace(p, data = df[!ing, ], x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
                    marker = list(size = 3, color = "#E8E8E8"), hoverinfo = "skip", showlegend = FALSE)
     if (isTRUE(base$continuous)) {
       full <- range(df$value, na.rm = TRUE)
@@ -1542,7 +1494,7 @@ server <- function(input, output, session) {
                                      colorbar = list(title = list(text = pretty_label(active_group()), side = "right"),
                                                      thickness = 12, len = 0.5, outlinewidth = 0,
                                                      x = 1.02, xanchor = "left", y = 0.5, yanchor = "middle")),
-                       text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+                       text = ~tooltip, hovertemplate = "%{text}<extra></extra>", showlegend = FALSE)
       showlg <- FALSE; lg <- NULL
     } else {
       # Category colours reflect the current show/hide selection (read once; split
@@ -1552,7 +1504,7 @@ server <- function(input, output, session) {
       sub <- df[ing, ]; sub$col <- cols$points[ing]
       if (nrow(sub) > 0)
         p <- add_trace(p, data = sub, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers",
-                       marker = list(size = 4, color = ~col), text = ~tooltip, hoverinfo = "text", showlegend = FALSE)
+                       marker = list(size = 4, color = ~col), text = ~tooltip, hovertemplate = "%{text}<extra></extra>", showlegend = FALSE)
       showlg <- FALSE; lg <- NULL
     }
     p %>% plotly::layout(
@@ -1560,9 +1512,9 @@ server <- function(input, output, session) {
       title = list(text = title, x = 0, xref = "paper", xanchor = "left",
                    font = list(size = 13, family = "Open Sans, verdana, arial, sans-serif")),
       xaxis = list(title = axis_labels()[1], zeroline = FALSE, range = umap_range(), tick0 = 0, dtick = umap_dtick(),
-                   constrain = "domain", constraintoward = "center"),
+                   constrain = "range"),
       yaxis = list(title = axis_labels()[2], zeroline = FALSE, scaleanchor = "x", scaleratio = 1, tick0 = 0, dtick = umap_dtick(),
-                   constrain = "domain", constraintoward = "middle", range = umap_range()),
+                   constrain = "range", range = umap_range()),
       showlegend = showlg, legend = lg, margin = list(l = 44, r = 10, t = 34, b = 38)
     ) %>% plotly::config(displaylogo = FALSE, toImageButtonOptions = list(filename = safe_fname(paste0(embedding_label(), "_", pretty_label(input$split_by), "_", level))))
   }
@@ -1578,7 +1530,6 @@ server <- function(input, output, session) {
     cells <- lapply(seq_along(levs), function(i) {
       id <- paste0("umap_split_", i)
       div(class = "plot-dl-wrap umap-split-cell", style = "position: relative; flex: 0 0 auto; width: min(100vh - 340px, 60vw); aspect-ratio: 1 / 1;",
-          plot_dl_btn(id, paste0("UMAP_", levs[i])),
           withSpinner(plotlyOutput(id, width = "100%", height = "100%"), caption = "Rendering...", color = "#39FF14"))
     })
     # grid does not grow (flex:0 1 auto), so the shared legend sits snug on its right
@@ -1663,7 +1614,6 @@ server <- function(input, output, session) {
     plot_list <- lapply(seq_len(n), function(i) {
       id <- paste0("feature_plot_individual_", i)
       div(class = "plot-dl-wrap", style = "position: relative; width: 100%; height: 100%;",
-          plot_dl_btn(id, specs[[i]]$title),
           withSpinner(
             plotlyOutput(id, width = "100%", height = "100%"),
             caption = "Rendering plot...", color = "#39FF14"
@@ -1748,14 +1698,13 @@ server <- function(input, output, session) {
   max_plots <- 50
 
   # What each plot slot shows: a list of {gene, layer, title}, one plot per selected
-  # gene (all in the Normalized (log) layer). The title (e.g. "Malat1 · Normalized
-  # (log)") names the panel and its downloaded PNG.
+  # gene (all in the Normalized (log) layer). The title is just the gene name (the
+  # app always uses Normalized (log), so the layer label was dropped as redundant).
   plot_specs <- reactive({
     fg <- found_genes()
     req(length(fg) > 0)
     layer <- feature_layer()
-    lapply(fg, function(g) list(gene = g, layer = layer,
-                                title = paste0(g, " · ", layer_label(layer))))
+    lapply(fg, function(g) list(gene = g, layer = layer, title = g))
   })
 
   # One value-stable reactive per plot slot (adding a gene only invalidates the
@@ -2276,10 +2225,13 @@ server <- function(input, output, session) {
     obj <- prepare_obj_for_de(seu(), assay_use)
 
     # Markers run with the Wilcoxon test on the Normalized (log) values.
+    # min.pct / logfc.threshold match the Marker Plot dot plot's FindAllMarkers, so
+    # the two tabs compute the same numbers per gene and agree on the top markers.
     res <- tryCatch(
       suppressWarnings(
         Seurat::FindMarkers(obj, ident.1 = input$gmarker_cluster, group.by = input$gmarker_group,
-                            test.use = "wilcox", slot = "data", assay = assay_use)
+                            test.use = "wilcox", slot = "data", assay = assay_use,
+                            min.pct = 0.25, logfc.threshold = 0.25)
       ),
       error = function(e) e
     )
@@ -2300,6 +2252,11 @@ server <- function(input, output, session) {
     res <- a$res
     if (inherits(res, "error")) validate(need(FALSE, paste("Could not compute markers:", conditionMessage(res))))
     out <- format_generic_de(res)
+    # Sort by effect size (largest positive log2 fold change first) so the top rows
+    # are the strongest up-regulated markers - the SAME ranking the Marker Plot dot
+    # plot uses to pick its top genes, so the two tabs agree. Columns stay sortable
+    # (click p_val_adj to re-sort by significance); down-regulated genes sit at the bottom.
+    if ("avg_log2FC" %in% names(out)) out <- out[order(-out$avg_log2FC), , drop = FALSE]
     dt_with_excel(out, safe_fname(paste0("cluster_markers_", input$gmarker_cluster)))
   }, server = FALSE)
 
