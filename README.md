@@ -183,6 +183,7 @@ Tools and data scExplorer relies on:
 
 - Squair JW et al. (2021). Confronting false discoveries in single-cell differential
   expression. *Nature Communications* 12:5692.
+  https://doi.org/10.1038/s41467-021-25960-2
 
 **Example data**
 
@@ -190,7 +191,7 @@ The bundled example is the human pancreas dataset from:
 
 - Baron M et al. (2016). A Single-Cell Transcriptomic Map of the Human and Mouse
   Pancreas Reveals Inter- and Intra-cell Population Structure. *Cell Systems*
-  3(4):346-360.
+  3(4):346-360. https://doi.org/10.1016/j.cels.2016.08.011
 
 obtained via CZ CELLxGENE Discover (Chan Zuckerberg Initiative,
 https://cellxgene.cziscience.com).
